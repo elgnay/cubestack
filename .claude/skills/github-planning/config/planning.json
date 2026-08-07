@@ -1,0 +1,32 @@
+{
+  "labels": {
+    "types": {
+      "epic":    { "name": "type:epic",    "color": "5319e7", "description": "A large body of work that groups related issues" },
+      "feature": { "name": "type:feature", "color": "1d76db", "description": "A new user-facing capability" },
+      "bug":     { "name": "type:bug",     "color": "d73a4a", "description": "A defect or unexpected behavior" },
+      "chore":   { "name": "type:chore",   "color": "bfdadc", "description": "Maintenance, tooling, process, or housekeeping" },
+      "docs":    { "name": "type:docs",    "color": "0e8a16", "description": "Documentation or content changes" },
+      "test":    { "name": "type:test",    "color": "6f42c1", "description": "Test coverage, fixtures, or test infrastructure" }
+    },
+    "priorities": {
+      "P0": { "name": "priority:P0", "color": "b60205", "description": "Blocks release / production incident / must ship now" },
+      "P1": { "name": "priority:P1", "color": "d93f0b", "description": "High value, planned for the current milestone" },
+      "P2": { "name": "priority:P2", "color": "fbca04", "description": "Normal backlog, schedule as capacity allows" },
+      "P3": { "name": "priority:P3", "color": "e4e5e7", "description": "Low priority / nice-to-have" }
+    },
+    "estimates": {
+      "1":  { "name": "story-points:1",  "color": "0e8a16", "description": "Trivial" },
+      "2":  { "name": "story-points:2",  "color": "2cbe4e", "description": "Small" },
+      "3":  { "name": "story-points:3",  "color": "bfd4f2", "description": "Medium" },
+      "5":  { "name": "story-points:5",  "color": "fbca04", "description": "Large" },
+      "8":  { "name": "story-points:8",  "color": "d93f0b", "description": "X-large" },
+      "13": { "name": "story-points:13", "color": "b60205", "description": "Epic-scale" }
+    },
+    "status": {
+      "blocked": { "name": "status:blocked", "color": "d4c5f9", "description": "Has an open blocking dependency" }
+    }
+  },
+  "priority_order": ["P0", "P1", "P2", "P3"],
+  "estimate_scale": [1, 2, 3, 5, 8, 13],
+  "type_order": ["epic", "feature", "bug", "chore", "docs", "test"]
+}
