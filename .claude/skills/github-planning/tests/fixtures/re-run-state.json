@@ -1,7 +1,7 @@
 {
   "labels": [
-    { "name": "type:epic" }, { "name": "type:feature" }, { "name": "type:bug" },
-    { "name": "type:chore" }, { "name": "type:docs" }, { "name": "type:test" },
+    { "name": "feature" }, { "name": "epic" }, { "name": "story" },
+    { "name": "task" }, { "name": "bug" }, { "name": "doc" },
     { "name": "priority:P0" }, { "name": "priority:P1" }, { "name": "priority:P2" },
     { "name": "priority:P3" },
     { "name": "story-points:1" }, { "name": "story-points:2" }, { "name": "story-points:3" },

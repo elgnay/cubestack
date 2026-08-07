@@ -51,9 +51,13 @@ that file — never edit `scripts/gp`.**
 
 | Thing | Convention |
 |---|---|
-| Labels | `type:epic|feature|bug|chore|docs|test`, `priority:P0–P3`, `story-points:1,2,3,5,8,13`, `status:blocked` |
+| Hierarchy | **Feature** → **Epic** → **Story** → **Task**. Expressed as nested sub-issues via **chained `children`** (any issue can carry `children` referencing other issues, so Feature→Epic→Story becomes two levels of nesting). Task is a checkbox list inside the Story body. |
+| Labels | Bare labels for the hierarchy + work type: `feature`, `epic`, `story`, `task`, `bug`, `doc` (no `type:`/`level:` prefix). Plus `priority:P0–P3`, `story-points:1,2,3,5,8,13`, `status:blocked`. |
 | Milestones | Find-or-create by **exact title**; keep titles unique (GitHub allows duplicates — don't). Optional `due_on` + description. |
-| Epics | An issue with `type: epic`; its children are linked as **sub-issues**. |
+| Titles | Prefix grouping issues so the hierarchy is visible in flat lists: `Feature: …`, `Epic: …`, `Story: …`. Only **Story** issues carry `story_points`. |
+| Epics | An issue labeled `epic`; its children are linked as **sub-issues**. Any issue (Feature/Epic/…) can have `children` for multi-level nesting. |
+| Tasks | Technical sub-steps live as a checkbox list (`**Tasks:**`) in the Story body — GitHub renders a task list with progress. Promote to real sub-issues only if a Task needs its own assignee/visibility. |
+| Assignees | Default to the creating user (each issue lists the creator in `assignees`); change per issue in the manifest. Must be repo collaborators. |
 | Dependencies | `X depends_on D` ⇒ "X is blocked by D". `gp` creates the GitHub blocked-by edge. |
 | Estimates | Fibonacci story points (1–13). |
 | Repo | Inferred from the git remote; override with `<owner>/<repo>` or `--repo`. |
@@ -121,16 +125,22 @@ gp milestone <owner>/<repo> "<Milestone title>" --due 2026-09-30 --desc "Quarter
 A manifest's `milestone` block does the same automatically. `gp plan` reuses an
 open milestone with the same exact title; otherwise it creates one.
 
-### 7.3 Create epics and child issues
+### 7.3 Create features, epics, and child issues
 
-In the manifest, the epic lists its children, or each child declares its parent:
+Hierarchy is expressed by **chained `children`** — any issue can reference other
+manifest issues as children, so `Feature → Epic → Story` is two levels of nested
+GitHub sub-issues:
 
 ```json
+{ "title": "Feature: onboarding", "type": "feature", "children": ["Epic: onboarding"] },
 { "title": "Epic: onboarding", "type": "epic", "children": ["Onboard via OAuth"] },
-{ "title": "Onboard via OAuth", "type": "feature", "parent": "Epic: onboarding" }
+{ "title": "Onboard via OAuth", "type": "story", "story_points": 5 }
 ```
-`gp plan` creates the issues and links them as GitHub sub-issues. (An issue must
-not declare both `parent` and `children` — `gp validate` rejects it.)
+`gp plan` creates all of them and links each level (`Feature`→`Epic`, `Epic`→Story)
+as sub-issues. The `type` value is applied as a **bare label** (`feature`/`epic`/
+`story`/`task`/`bug`/`doc`). Only Story issues carry `story_points`; Features/Epics
+are grouping issues. (An issue must not declare both `parent` and `children` —
+`gp validate` rejects it. `children` titles must exist elsewhere in the manifest.)
 
 ### 7.4 Link dependencies (blocks / blocked by)
 
@@ -142,8 +152,9 @@ not declare both `parent` and `children` — `gp validate` rejects it.)
 
 ### 7.5 Assign labels, priorities, and assignees
 
-Per issue in the manifest: `type` (required), `priority` (default P2),
-`extra_labels` (any non-taxonomy labels, e.g. `"ux"`), `assignees`.
+Per issue in the manifest: `type` (required, one of `feature|epic|story|task|bug|doc`,
+applied as a bare label), `priority` (default P2), `extra_labels` (any non-taxonomy
+labels, e.g. `"ux"`), `assignees` (default to the creating user).
 `gp plan` ensures every label exists, then applies them in the same API call
 that creates the issue. Assignees must be repo collaborators or the API rejects
 the issue.
@@ -196,7 +207,7 @@ when they have open blockers.
     {
       "title": "Onboard via OAuth",
       "body_file": "docs/oauth.md",
-      "type": "feature",
+      "type": "story",
       "priority": "P0",
       "story_points": 5,
       "assignees": ["bob"],
@@ -207,11 +218,17 @@ when they have open blockers.
 }
 ```
 
-Fields: `title` (required), `type` (required, one of the taxonomy), `body` **or**
-`body_file` (relative to the manifest or `--body-dir`), `priority` (default P2),
-`story_points` (on-scale or null), `assignees`, `extra_labels`, `children`,
-`parent`, `depends_on`, and an optional per-issue `"milestone": null` to exclude
-that issue from the manifest milestone.
+Fields: `title` (required), `type` (required, one of `feature|epic|story|task|bug|doc`,
+applied as a bare label), `body` **or** `body_file` (relative to the manifest or
+`--body-dir`), `priority` (default P2), `story_points` (on-scale or null),
+`assignees` (default to the creating user), `extra_labels`, `children`, `parent`,
+`depends_on`, and an optional per-issue `"milestone": null` to exclude that issue
+from the manifest milestone.
+
+**Multi-level hierarchy:** `children` may be used on any issue and its titles must
+exist in the manifest, so `Feature` (children = Epics) → `Epic` (children = Stories)
+nests into two levels of GitHub sub-issues. Story bodies end with a `**Tasks:**`
+checkbox list for the Task level.
 
 Validate offline anytime: `gp validate <manifest.json>`.
 

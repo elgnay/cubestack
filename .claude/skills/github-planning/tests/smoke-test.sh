@@ -33,7 +33,8 @@ echo "$invalid_errs" | grep -q "depends_on" || fail "no unresolved depends_on er
 
 # 2. plan — fresh (empty) state: expect label ensures + creates + links
 out="$("$GP" plan --dry-run --state "$FIX/empty-state.json" "$FIX/plan.json")"
-echo "$out" | grep -q "ensure label: type:epic"          || fail "no label ensure"
+echo "$out" | grep -q "ensure label: epic"               || fail "no epic label ensure"
+echo "$out" | grep -q "ensure label: story"              || fail "no story label ensure"
 echo "$out" | grep -q "create issue: Epic: onboarding"   || fail "no issue create"
 echo "$out" | grep -q "create issue: Onboard via OAuth"  || fail "cross-milestone match not re-created"
 echo "$out" | grep -q "link sub-issue:"                  || fail "no sub-issue link"

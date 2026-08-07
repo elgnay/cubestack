@@ -225,6 +225,7 @@ find_or_create_milestone() {
   if [[ "$DRY_RUN" == "1" ]]; then
     printf '%s\n' "[dry-run] create milestone: '$title'"
     MS_RESULT="-1"
+    bump milestones_created
     return 0
   fi
   payload="$(jq -n --arg t "$title" --arg due "$(iso_due "$due")" --arg d "$desc" \
@@ -383,7 +384,7 @@ ms_for() {
 
 labels_for() {
   printf '%s' "$1" | jq -c \
-    '[ "type:" + .type,
+    '[ .type,
        "priority:" + (if .priority then .priority else "P2" end),
        (if .story_points != null then ("story-points:" + (.story_points|tostring)) else empty end),
        (.extra_labels[]? // empty) ]'
@@ -488,7 +489,7 @@ summary() {
 # release-notes rendering
 # --------------------------------------------------------------------------
 type_key() {
-  jq -r '([.labels[]?.name | select(startswith("type:"))] | .[0] // null | if . == null then "other" else sub("^type:";"") end)'
+  jq -r '([.labels[]?.name | select(. == "feature" or . == "epic" or . == "story" or . == "task" or . == "bug" or . == "doc")] | .[0] // "other")'
 }
 
 render_notes() {
@@ -506,14 +507,14 @@ render_notes() {
   set -- $totals
   total="${1:-0}"; closed="${2:-0}"; pts="${3:-0}"; ptsdone="${4:-0}"
   open=$((total - closed))
-  for t in epic feature bug chore docs test other; do
+  for t in feature epic story task bug doc other; do
     case "$t" in
-      epic) d="Epics";; feature) d="Features";; bug) d="Bug fixes";;
-      chore) d="Chores";; docs) d="Docs";; test) d="Tests";; other) d="Other";;
+      feature) d="Features";; epic) d="Epics";; story) d="Stories";; task) d="Tasks";;
+      bug) d="Bug fixes";; doc) d="Docs";; other) d="Other";;
     esac
     count="$(jq -r --argjson n "$msnum" --arg t "$t" '
       [.issues[] | select(.milestone.number == $n)] as $all |
-      [ $all[] | select( (([.labels[]?.name | select(startswith("type:"))] | .[0] // null | if . == null then "other" else sub("^type:";"") end) == $t)) ] | length' "$STATE")"
+      [ $all[] | select( (([.labels[]?.name | select(. == "feature" or . == "epic" or . == "story" or . == "task" or . == "bug" or . == "doc")] | .[0] // "other") == $t)) ] | length' "$STATE")"
     if [[ "$count" -gt 0 ]]; then
       printf '## %s\n\n' "$d"
       while IFS=$'\t' read -r num state ttl; do
@@ -524,7 +525,7 @@ render_notes() {
         fi
       done < <(jq -r --argjson n "$msnum" --arg t "$t" '
         [.issues[] | select(.milestone.number == $n)] as $all |
-        [ $all[] | select( (([.labels[]?.name | select(startswith("type:"))] | .[0] // null | if . == null then "other" else sub("^type:";"") end) == $t)) ] |
+        [ $all[] | select( (([.labels[]?.name | select(. == "feature" or . == "epic" or . == "story" or . == "task" or . == "bug" or . == "doc")] | .[0] // "other") == $t)) ] |
         sort_by(.number)[] | "\(.number)\t\(.state)\t\(.title)"' "$STATE")
       printf '\n'
     fi

@@ -15,8 +15,8 @@
     },
     {
       "title": "Onboard via OAuth",
-      "body_file": "docs/oauth.md",
-      "type": "feature",
+      "body": "Implement OAuth 2.0 login with Google and GitHub providers.\n\n**Acceptance criteria:**\n- [ ] Provider buttons render on the login screen\n- [ ] Token exchange returns a session cookie\n- [ ] Session refresh on expiry",
+      "type": "story",
       "priority": "P0",
       "story_points": 5,
       "assignees": ["bob"],
@@ -25,7 +25,7 @@
     {
       "title": "Onboarding email",
       "body": "Send a welcome email after signup.",
-      "type": "feature",
+      "type": "story",
       "priority": "P1",
       "story_points": 3,
       "depends_on": ["Onboard via OAuth"]
