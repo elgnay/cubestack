@@ -1,0 +1,15 @@
+name: Setup Go
+description: Install Go for a sub-project, using its go.mod as the version source
+
+inputs:
+  go-version-file:
+    description: Path to the sub-project go.mod, relative to the repo root
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Go
+      uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6.3.0
+      with:
+        go-version-file: ${{ inputs.go-version-file }}
