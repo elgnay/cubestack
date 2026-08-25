@@ -28,6 +28,9 @@ resources:
 - inferenceservice_admin_role.yaml
 - inferenceservice_editor_role.yaml
 - inferenceservice_viewer_role.yaml
+- devenvironment_admin_role.yaml
+- devenvironment_editor_role.yaml
+- devenvironment_viewer_role.yaml
 - modelversion_admin_role.yaml
 - modelversion_editor_role.yaml
 - modelversion_viewer_role.yaml

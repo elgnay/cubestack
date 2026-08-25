@@ -75,4 +75,24 @@ const (
 	// differs from status.profile.revision, usually from a same-name
 	// recreation. (InferenceService)
 	ConditionProfileDrifted ConditionType = "ProfileDrifted"
+
+	// ConditionPodScheduled indicates that the Pod has been scheduled.
+	// (DevEnvironment)
+	ConditionPodScheduled ConditionType = "PodScheduled"
+
+	// ConditionStorageReady indicates that the workspace PVC is Bound.
+	// (DevEnvironment)
+	ConditionStorageReady ConditionType = "StorageReady"
+
+	// ConditionBrandMatchValid indicates that gpuType matches the image brand
+	// (nvidia<->base-cuda, metax<->base-maca). (DevEnvironment)
+	ConditionBrandMatchValid ConditionType = "BrandMatchValid"
+
+	// ConditionComputeProfileReady indicates that the referenced ComputeProfile
+	// CRD exists. (DevEnvironment)
+	ConditionComputeProfileReady ConditionType = "ComputeProfileReady"
+
+	// ConditionTemplateRefReady indicates that the template referenced by
+	// spec.templateRef exists (provenance completeness only). (DevEnvironment)
+	ConditionTemplateRefReady ConditionType = "TemplateRefReady"
 )
