@@ -29,28 +29,45 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var devEnvironmentGVR = schema.GroupVersionResource{
-	Group:    "ai.cubestack.io",
-	Version:  "v1alpha1",
-	Resource: "devenvironments",
-}
-
 const (
+	testPortName        = "app"
+	testGPUType         = "nvidia"
 	testDevImage        = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
 	testComputeProfile  = "gpu-1-a100"
 	testDevStorageClass = "ceph-rbd"
 )
 
+// testAPIVersion derives from SchemeGroupVersion to avoid repeating the group
+// and version literals (goconst).
+var testAPIVersion = SchemeGroupVersion.Group + "/" + SchemeGroupVersion.Version
+
+var devEnvironmentGVR = schema.GroupVersionResource{
+	Group:    SchemeGroupVersion.Group,
+	Version:  SchemeGroupVersion.Version,
+	Resource: "devenvironments",
+}
+
+// rawDevEnvironment builds a DevEnvironment object map with a single copy of the
+// apiVersion/kind/metadata/spec keys shared by the raw-object rejection tables.
+func rawDevEnvironment(name string, spec map[string]any) map[string]any {
+	return map[string]any{
+		"apiVersion": testAPIVersion,
+		"kind":       "DevEnvironment",
+		"metadata":   map[string]any{"name": name, "namespace": testNamespace},
+		"spec":       spec,
+	}
+}
+
 func validDevEnvironment(name string) *DevEnvironment {
 	return &DevEnvironment{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "default"},
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 		Spec: DevEnvironmentSpec{
 			Type:    "jupyter",
 			Image:   testDevImage,
 			Running: true,
 			Resources: ResourcesSpec{
 				ComputeProfile: testComputeProfile,
-				GPUType:        "nvidia",
+				GPUType:        testGPUType,
 				GPUCount:       1,
 				CPU:            "16",
 				Memory:         "64Gi",
@@ -94,12 +111,12 @@ var _ = Describe("DevEnvironment", func() {
 
 		It("applies the documented defaults for omitted optional fields", func() {
 			de := &DevEnvironment{
-				ObjectMeta: metav1.ObjectMeta{Name: "de-defaults", Namespace: "default"},
+				ObjectMeta: metav1.ObjectMeta{Name: "de-defaults", Namespace: testNamespace},
 				Spec: DevEnvironmentSpec{
 					Image: testDevImage,
 					Resources: ResourcesSpec{
 						ComputeProfile: testComputeProfile,
-						GPUType:        "nvidia",
+						GPUType:        testGPUType,
 					},
 					Storage:    &StorageSpec{},
 					Network:    &NetworkSpec{},
@@ -121,6 +138,29 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(got.Spec.Lifecycle.IdleTimeout).To(Equal(int32(0)))
 			Expect(got.Spec.Scheduling.Priority).To(Equal("normal"))
 			Expect(got.Spec.Scheduling.Queue).To(Equal("default"))
+
+			Expect(k8sClient.Delete(ctx, got)).To(Succeed())
+		})
+
+		It("applies the http default to a PortSpec with an omitted type", func() {
+			de := &DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-port-default", Namespace: testNamespace},
+				Spec: DevEnvironmentSpec{
+					Image: testDevImage,
+					Resources: ResourcesSpec{
+						ComputeProfile: testComputeProfile,
+						GPUType:        testGPUType,
+					},
+					Ports: []PortSpec{{Name: testPortName, ContainerPort: 8080}},
+				},
+			}
+
+			Expect(k8sClient.Create(ctx, de)).To(Succeed())
+
+			got := &DevEnvironment{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
+			Expect(got.Spec.Ports).To(HaveLen(1))
+			Expect(got.Spec.Ports[0].Type).To(Equal(PortTypeHTTP))
 
 			Expect(k8sClient.Delete(ctx, got)).To(Succeed())
 		})
@@ -202,9 +242,21 @@ var _ = Describe("DevEnvironment", func() {
 			Entry("unsupported ports type",
 				"de-invalid-porttype",
 				func(s *DevEnvironmentSpec) {
-					s.Ports = []PortSpec{{Name: "app", Type: "ftp", ContainerPort: 8080}}
+					s.Ports = []PortSpec{{Name: testPortName, Type: "ftp", ContainerPort: 8080}}
 				},
 				"Unsupported value"),
+			Entry("containerPort below minimum",
+				"de-invalid-port-min",
+				func(s *DevEnvironmentSpec) {
+					s.Ports = []PortSpec{{Name: testPortName, ContainerPort: 0}}
+				},
+				"spec.ports"),
+			Entry("containerPort above maximum",
+				"de-invalid-port-max",
+				func(s *DevEnvironmentSpec) {
+					s.Ports = []PortSpec{{Name: testPortName, ContainerPort: 65536}}
+				},
+				"spec.ports"),
 			Entry("unsupported assetRef kind",
 				"de-invalid-assetkind",
 				func(s *DevEnvironmentSpec) {
@@ -231,21 +283,14 @@ var _ = Describe("DevEnvironment", func() {
 					"image": testDevImage,
 					"resources": map[string]any{
 						"computeProfile": testComputeProfile,
-						"gpuType":        "nvidia",
+						"gpuType":        testGPUType,
 					},
 				}
 				mutate(spec)
 
-				obj := map[string]any{
-					"apiVersion": "ai.cubestack.io/v1alpha1",
-					"kind":       "DevEnvironment",
-					"metadata":   map[string]any{"name": name, "namespace": "default"},
-					"spec":       spec,
-				}
-
 				dynClient := dynamic.NewForConfigOrDie(cfg)
-				_, err := dynClient.Resource(devEnvironmentGVR).Namespace("default").Create(
-					ctx, &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{})
+				_, err := dynClient.Resource(devEnvironmentGVR).Namespace(testNamespace).Create(
+					ctx, &unstructured.Unstructured{Object: rawDevEnvironment(name, spec)}, metav1.CreateOptions{})
 				Expect(err).To(HaveOccurred())
 				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected Invalid error, got: %v", err)
 				Expect(err.Error()).To(ContainSubstring(wantMessage))
@@ -277,22 +322,15 @@ var _ = Describe("DevEnvironment", func() {
 					"image": testDevImage,
 					"resources": map[string]any{
 						"computeProfile": testComputeProfile,
-						"gpuType":        "nvidia",
+						"gpuType":        testGPUType,
 						"gpuCount":       1,
 					},
 				}
 				mutate(spec)
 
-				obj := map[string]any{
-					"apiVersion": "ai.cubestack.io/v1alpha1",
-					"kind":       "DevEnvironment",
-					"metadata":   map[string]any{"name": name, "namespace": "default"},
-					"spec":       spec,
-				}
-
 				dynClient := dynamic.NewForConfigOrDie(cfg)
-				_, err := dynClient.Resource(devEnvironmentGVR).Namespace("default").Create(
-					ctx, &unstructured.Unstructured{Object: obj}, metav1.CreateOptions{})
+				_, err := dynClient.Resource(devEnvironmentGVR).Namespace(testNamespace).Create(
+					ctx, &unstructured.Unstructured{Object: rawDevEnvironment(name, spec)}, metav1.CreateOptions{})
 				Expect(err).To(HaveOccurred())
 				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected Invalid error, got: %v", err)
 				Expect(err.Error()).To(ContainSubstring(wantMessage))

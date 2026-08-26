@@ -54,9 +54,11 @@ spec:
                       type: string
                     mountPath:
                       description: MountPath is the mount path (e.g. /models).
+                      minLength: 1
                       type: string
                     name:
                       description: Name is the asset CRD name.
+                      minLength: 1
                       type: string
                   required:
                   - kind
@@ -108,10 +110,13 @@ spec:
                     containerPort:
                       description: ContainerPort is the in-container application port.
                       format: int32
+                      maximum: 65535
+                      minimum: 1
                       type: integer
                     name:
                       description: Name is the port identifier (unique, used for sub
                         path / status display).
+                      minLength: 1
                       type: string
                     type:
                       default: http
@@ -126,7 +131,6 @@ spec:
                   required:
                   - containerPort
                   - name
-                  - type
                   type: object
                 type: array
               resources:
@@ -638,6 +642,7 @@ spec:
                 properties:
                   name:
                     description: Name is the template CRD name.
+                    minLength: 1
                     type: string
                 required:
                 - name
@@ -661,13 +666,16 @@ spec:
                   properties:
                     mountPath:
                       description: MountPath is the mount path (e.g. /data, /models).
+                      minLength: 1
                       type: string
                     name:
                       description: Name is the volume identifier.
+                      minLength: 1
                       type: string
                     pvcName:
                       description: PVCName is the name of the referenced existing
                         PVC (P1, shared data volume).
+                      minLength: 1
                       type: string
                     readOnly:
                       description: ReadOnly indicates whether the volume is read-only

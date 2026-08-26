@@ -159,12 +159,15 @@ const (
 // VolumeMount is an extra data volume mount (referencing an existing PVC).
 type VolumeMount struct {
 	// Name is the volume identifier.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// PVCName is the name of the referenced existing PVC (P1, shared data volume).
+	// +kubebuilder:validation:MinLength=1
 	PVCName string `json:"pvcName"`
 
 	// MountPath is the mount path (e.g. /data, /models).
+	// +kubebuilder:validation:MinLength=1
 	MountPath string `json:"mountPath"`
 
 	// SubPath is the sub path (optional).
@@ -249,15 +252,19 @@ type LifecycleSpec struct {
 // PortSpec is an extra application port (P2, DEV-16).
 type PortSpec struct {
 	// Name is the port identifier (unique, used for sub path / status display).
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// Type is the exposure form: http (web over sub path) / tcp (port range +
 	// TCPRoute) / udp (needs UDPRoute experimental feature, P2 pending).
 	// +kubebuilder:validation:Enum=http;tcp;udp
 	// +kubebuilder:default=http
-	Type PortType `json:"type"`
+	// +optional
+	Type PortType `json:"type,omitempty"`
 
 	// ContainerPort is the in-container application port.
+	// +kubebuilder:validation:Minimum=1
+	// +kubebuilder:validation:Maximum=65535
 	ContainerPort int32 `json:"containerPort"`
 }
 
@@ -277,15 +284,18 @@ type AssetRef struct {
 	Kind string `json:"kind"`
 
 	// Name is the asset CRD name.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// MountPath is the mount path (e.g. /models).
+	// +kubebuilder:validation:MinLength=1
 	MountPath string `json:"mountPath"`
 }
 
 // TemplateRef is the source template reference.
 type TemplateRef struct {
 	// Name is the template CRD name.
+	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 }
 
