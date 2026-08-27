@@ -24,8 +24,8 @@ import (
 
 // DevEnvironmentSpec defines the desired state of DevEnvironment
 type DevEnvironmentSpec struct {
-	// Type is the container type (single choice): jupyter / ssh / vscode (P3).
-	// It decides the container main entry and the image (see section 6.1).
+	// Type is the container type (single choice): jupyter / ssh / vscode.
+	// It decides the container main entry and the image.
 	// +kubebuilder:validation:Enum=jupyter;ssh;vscode
 	// +kubebuilder:default=jupyter
 	// +optional
@@ -70,21 +70,21 @@ type DevEnvironmentSpec struct {
 	// +optional
 	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
 
-	// Ports are extra application ports (P2, DEV-16; not opened in P1).
+	// Ports are extra application ports.
 	// +optional
 	Ports []PortSpec `json:"ports,omitempty"`
 
-	// AssetRefs bind assets (P2: Model / Dataset CRD references, auto-mounted
-	// and updated with the version).
+	// AssetRefs bind assets (Model / Dataset CRD references, auto-mounted and
+	// updated with the version).
 	// +optional
 	AssetRefs []AssetRef `json:"assetRefs,omitempty"`
 
-	// TemplateRef is the source template reference (P2: provenance / label
-	// inheritance; resolved values are fixed into spec, see section 13.1).
+	// TemplateRef is the source template reference (provenance / label
+	// inheritance; resolved values are fixed into spec).
 	// +optional
 	TemplateRef *TemplateRef `json:"templateRef,omitempty"`
 
-	// Scheduling configures scheduling (P3: Kueue priority / queue).
+	// Scheduling configures scheduling (Kueue priority / queue).
 	// +optional
 	Scheduling *SchedulingSpec `json:"scheduling,omitempty"`
 }
@@ -132,9 +132,9 @@ type StorageSpec struct {
 	// +optional
 	StorageClassName string `json:"storageClassName,omitempty"`
 
-	// PVCRetention is the workspace PVC retention policy on environment delete
-	// (D14): retain=keep (default, prevents accidental deletion) / delete=remove
-	// with the environment.
+	// PVCRetention is the workspace PVC retention policy on environment delete:
+	// retain=keep (default, prevents accidental deletion) / delete=remove with
+	// the environment.
 	// +kubebuilder:validation:Enum=retain;delete
 	// +kubebuilder:default=retain
 	// +optional
@@ -162,7 +162,7 @@ type VolumeMount struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// PVCName is the name of the referenced existing PVC (P1, shared data volume).
+	// PVCName is the name of the referenced existing PVC (shared data volume).
 	// +kubebuilder:validation:MinLength=1
 	PVCName string `json:"pvcName"`
 
@@ -187,7 +187,7 @@ type SSHSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// KeysSecret is the SSH public key Secret reference (D13):
+	// KeysSecret is the SSH public key Secret reference:
 	// Secret.data[key] stores multi-line public keys (authorized_keys content),
 	// read by the controller and injected into the container; the plaintext is
 	// not stored in spec.
@@ -233,7 +233,7 @@ type RuntimeSpec struct {
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
-	// SecurityContext controls the container user (DEV-31): non-root by default
+	// SecurityContext controls the container user: non-root by default
 	// (runAsNonRoot=true, runAsUser=1000); running as root requires explicitly
 	// setting runAsUser=0 (and ensuring runAsNonRoot is not true).
 	// +optional
@@ -249,14 +249,14 @@ type LifecycleSpec struct {
 	IdleTimeout int32 `json:"idleTimeout,omitempty"`
 }
 
-// PortSpec is an extra application port (P2, DEV-16).
+// PortSpec is an extra application port.
 type PortSpec struct {
 	// Name is the port identifier (unique, used for sub path / status display).
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
 	// Type is the exposure form: http (web over sub path) / tcp (port range +
-	// TCPRoute) / udp (needs UDPRoute experimental feature, P2 pending).
+	// TCPRoute) / udp (needs UDPRoute experimental feature).
 	// +kubebuilder:validation:Enum=http;tcp;udp
 	// +kubebuilder:default=http
 	// +optional
@@ -299,7 +299,7 @@ type TemplateRef struct {
 	Name string `json:"name"`
 }
 
-// SchedulingSpec configures scheduling (P3).
+// SchedulingSpec configures scheduling.
 type SchedulingSpec struct {
 	// Priority is the priority: low / normal / high / urgent (with Kueue
 	// preemption).
@@ -348,7 +348,7 @@ type DevEnvironmentStatus struct {
 	StartTime *metav1.Time `json:"startTime,omitempty"`
 
 	// LastActivityTime is the last activity time, used for idle timeout
-	// determination (DEV-27 / DEV-02 display).
+	// determination.
 	// +optional
 	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
 
@@ -363,9 +363,8 @@ type DevEnvironmentStatus struct {
 	// +optional
 	TemplateGeneration int64 `json:"templateGeneration,omitempty"`
 
-	// AppEndpoints are the extra application port exposure addresses (P2,
-	// DEV-16): http type -> url (sub path); tcp / udp type -> endpoint
-	// (host:port).
+	// AppEndpoints are the extra application port exposure addresses:
+	// http type -> url (sub path); tcp / udp type -> endpoint (host:port).
 	// +optional
 	AppEndpoints []AppEndpoint `json:"appEndpoints,omitempty"`
 
@@ -377,8 +376,8 @@ type DevEnvironmentStatus struct {
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// AppEndpoint is an extra application port exposure address (P2, DEV-16,
-// corresponding to spec.ports).
+// AppEndpoint is an extra application port exposure address, corresponding to
+// spec.ports.
 type AppEndpoint struct {
 	// Name corresponds to spec.ports[].name.
 	Name string `json:"name"`

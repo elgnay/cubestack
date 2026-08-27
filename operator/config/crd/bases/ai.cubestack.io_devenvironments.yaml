@@ -41,8 +41,8 @@ spec:
             properties:
               assetRefs:
                 description: |-
-                  AssetRefs bind assets (P2: Model / Dataset CRD references, auto-mounted
-                  and updated with the version).
+                  AssetRefs bind assets (Model / Dataset CRD references, auto-mounted and
+                  updated with the version).
                 items:
                   description: AssetRef is an asset binding reference.
                   properties:
@@ -102,10 +102,9 @@ spec:
                     type: string
                 type: object
               ports:
-                description: Ports are extra application ports (P2, DEV-16; not opened
-                  in P1).
+                description: Ports are extra application ports.
                 items:
-                  description: PortSpec is an extra application port (P2, DEV-16).
+                  description: PortSpec is an extra application port.
                   properties:
                     containerPort:
                       description: ContainerPort is the in-container application port.
@@ -122,7 +121,7 @@ spec:
                       default: http
                       description: |-
                         Type is the exposure form: http (web over sub path) / tcp (port range +
-                        TCPRoute) / udp (needs UDPRoute experimental feature, P2 pending).
+                        TCPRoute) / udp (needs UDPRoute experimental feature).
                       enum:
                       - http
                       - tcp
@@ -352,7 +351,7 @@ spec:
                     type: array
                   securityContext:
                     description: |-
-                      SecurityContext controls the container user (DEV-31): non-root by default
+                      SecurityContext controls the container user: non-root by default
                       (runAsNonRoot=true, runAsUser=1000); running as root requires explicitly
                       setting runAsUser=0 (and ensuring runAsNonRoot is not true).
                     properties:
@@ -546,8 +545,7 @@ spec:
                     type: object
                 type: object
               scheduling:
-                description: 'Scheduling configures scheduling (P3: Kueue priority
-                  / queue).'
+                description: Scheduling configures scheduling (Kueue priority / queue).
                 properties:
                   priority:
                     default: normal
@@ -576,7 +574,7 @@ spec:
                     type: boolean
                   keysSecret:
                     description: |-
-                      KeysSecret is the SSH public key Secret reference (D13):
+                      KeysSecret is the SSH public key Secret reference:
                       Secret.data[key] stores multi-line public keys (authorized_keys content),
                       read by the controller and injected into the container; the plaintext is
                       not stored in spec.
@@ -618,9 +616,9 @@ spec:
                   pvcRetention:
                     default: retain
                     description: |-
-                      PVCRetention is the workspace PVC retention policy on environment delete
-                      (D14): retain=keep (default, prevents accidental deletion) / delete=remove
-                      with the environment.
+                      PVCRetention is the workspace PVC retention policy on environment delete:
+                      retain=keep (default, prevents accidental deletion) / delete=remove with
+                      the environment.
                     enum:
                     - retain
                     - delete
@@ -637,8 +635,8 @@ spec:
                 type: object
               templateRef:
                 description: |-
-                  TemplateRef is the source template reference (P2: provenance / label
-                  inheritance; resolved values are fixed into spec, see section 13.1).
+                  TemplateRef is the source template reference (provenance / label
+                  inheritance; resolved values are fixed into spec).
                 properties:
                   name:
                     description: Name is the template CRD name.
@@ -650,8 +648,8 @@ spec:
               type:
                 default: jupyter
                 description: |-
-                  Type is the container type (single choice): jupyter / ssh / vscode (P3).
-                  It decides the container main entry and the image (see section 6.1).
+                  Type is the container type (single choice): jupyter / ssh / vscode.
+                  It decides the container main entry and the image.
                 enum:
                 - jupyter
                 - ssh
@@ -674,7 +672,7 @@ spec:
                       type: string
                     pvcName:
                       description: PVCName is the name of the referenced existing
-                        PVC (P1, shared data volume).
+                        PVC (shared data volume).
                       minLength: 1
                       type: string
                     readOnly:
@@ -699,13 +697,12 @@ spec:
             properties:
               appEndpoints:
                 description: |-
-                  AppEndpoints are the extra application port exposure addresses (P2,
-                  DEV-16): http type -> url (sub path); tcp / udp type -> endpoint
-                  (host:port).
+                  AppEndpoints are the extra application port exposure addresses:
+                  http type -> url (sub path); tcp / udp type -> endpoint (host:port).
                 items:
                   description: |-
-                    AppEndpoint is an extra application port exposure address (P2, DEV-16,
-                    corresponding to spec.ports).
+                    AppEndpoint is an extra application port exposure address, corresponding to
+                    spec.ports.
                   properties:
                     endpoint:
                       description: Endpoint is the host:port access address for the
@@ -794,7 +791,7 @@ spec:
               lastActivityTime:
                 description: |-
                   LastActivityTime is the last activity time, used for idle timeout
-                  determination (DEV-27 / DEV-02 display).
+                  determination.
                 format: date-time
                 type: string
               nodeName:
