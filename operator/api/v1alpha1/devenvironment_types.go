@@ -22,35 +22,47 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
+// DevEnvironmentType is the container type.
+type DevEnvironmentType string
+
+const (
+	DevEnvironmentTypeJupyter DevEnvironmentType = "jupyter"
+	DevEnvironmentTypeSSH     DevEnvironmentType = "ssh"
+	DevEnvironmentTypeVSCode  DevEnvironmentType = "vscode"
+)
+
 // DevEnvironmentSpec defines the desired state of DevEnvironment
 type DevEnvironmentSpec struct {
 	// Type is the container type (single choice): jupyter / ssh / vscode.
 	// It decides the container main entry and the image.
 	// +kubebuilder:validation:Enum=jupyter;ssh;vscode
-	// +kubebuilder:default=jupyter
+	// +kubebuilder:default=ssh
 	// +optional
-	Type string `json:"type,omitempty"`
+	Type DevEnvironmentType `json:"type,omitempty"`
 
-	// Image is the development image, pulled from Harbor. Supports the
-	// base-cuda (NVIDIA) / base-maca (Moore Threads) series.
+	// Image is the development image, pulled from any accessible container
+	// image registry.
 	// +kubebuilder:validation:MinLength=1
 	Image string `json:"image"`
 
-	// Running is the desired running state: true=Running (replicas 1),
-	// false=Stopped (replicas 0).
-	// +kubebuilder:default=true
+	// Running is the desired running state: true=Running, false=Stopped.
+	// +kubebuilder:default=false
 	// +optional
 	Running bool `json:"running,omitempty"`
 
 	// Resources is the compute / resource configuration.
 	Resources ResourcesSpec `json:"resources"`
 
-	// Storage is the workspace storage (a workspace volume created with the
-	// environment and mounted to $HOME by default).
+	// Storage is the workspace storage: a PVC created with the environment and
+	// mounted at the workspace path (default /workspace). Omit it to avoid
+	// creating a managed workspace PVC; to use an existing PVC as the workspace,
+	// mount it via spec.volumes at the workspace path (e.g. /workspace).
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
 
-	// Volumes are extra data volume mounts (referencing existing PVCs).
+	// Volumes are data volume mounts referencing existing PVCs. If spec.storage
+	// is omitted, mount an existing PVC at the workspace path (e.g. /workspace)
+	// to use it as the environment's workspace.
 	// +optional
 	Volumes []VolumeMount `json:"volumes,omitempty"`
 
@@ -73,35 +85,24 @@ type DevEnvironmentSpec struct {
 	// Ports are extra application ports.
 	// +optional
 	Ports []PortSpec `json:"ports,omitempty"`
-
-	// AssetRefs bind assets (Model / Dataset CRD references, auto-mounted and
-	// updated with the version).
-	// +optional
-	AssetRefs []AssetRef `json:"assetRefs,omitempty"`
-
-	// TemplateRef is the source template reference (provenance / label
-	// inheritance; resolved values are fixed into spec).
-	// +optional
-	TemplateRef *TemplateRef `json:"templateRef,omitempty"`
-
-	// Scheduling configures scheduling (Kueue priority / queue).
-	// +optional
-	Scheduling *SchedulingSpec `json:"scheduling,omitempty"`
 }
+
+// GPUType is the GPU vendor.
+type GPUType string
+
+const (
+	GPUTypeNVIDIA GPUType = "nvidia"
+	GPUTypeMetaX  GPUType = "metax"
+)
 
 // ResourcesSpec is the compute / resource configuration.
 type ResourcesSpec struct {
-	// ComputeProfile is the compute profile name, referencing a ComputeProfile
-	// CRD; the materialization source of cpu/memory (copied on first
-	// reconcile), keeping provenance.
-	// +kubebuilder:validation:MinLength=1
-	ComputeProfile string `json:"computeProfile"`
-
 	// GPUType is the GPU vendor: nvidia / metax. It decides the GPU extended
 	// resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
 	// +kubebuilder:validation:Enum=nvidia;metax
-	// +kubebuilder:validation:MinLength=1
-	GPUType string `json:"gpuType"`
+	// +kubebuilder:default=nvidia
+	// +optional
+	GPUType GPUType `json:"gpuType,omitempty"`
 
 	// GPUCount is the number of GPU cards.
 	// +kubebuilder:default=1
@@ -109,13 +110,11 @@ type ResourcesSpec struct {
 	// +optional
 	GPUCount int32 `json:"gpuCount,omitempty"`
 
-	// CPU is the number of CPU cores (materialized from ComputeProfile on first
-	// reconcile; user can override afterwards).
+	// CPU is the CPU limit in cores.
 	// +optional
 	CPU string `json:"cpu,omitempty"`
 
-	// Memory is the memory size (materialized from ComputeProfile on first
-	// reconcile; user can override afterwards).
+	// Memory is the memory limit.
 	// +optional
 	Memory string `json:"memory,omitempty"`
 }
@@ -123,27 +122,33 @@ type ResourcesSpec struct {
 // StorageSpec is the workspace storage configuration.
 type StorageSpec struct {
 	// Size is the workspace PVC capacity.
-	// +kubebuilder:default="100Gi"
+	// +kubebuilder:default="10Gi"
 	// +optional
 	Size string `json:"size,omitempty"`
 
-	// StorageClassName is the workspace storage class; a CephFS / NFS
-	// StorageClass yields an RWX workspace.
+	// StorageClassName is the workspace storage class. The workspace PVC is
+	// created with an access mode compatible with this class (ReadWriteOnce by
+	// default).
 	// +optional
 	StorageClassName string `json:"storageClassName,omitempty"`
 
-	// PVCRetention is the workspace PVC retention policy on environment delete:
-	// retain=keep (default, prevents accidental deletion) / delete=remove with
-	// the environment.
+	// PVCRetention is the workspace PVC retention policy, applied only when the
+	// environment is deleted. Stopping the environment does not delete the PVC:
+	// stopping scales the workload to zero but the workspace data survives
+	// stop/start regardless of this field.
+	// retain=keep the PVC (default, prevents accidental data loss on deletion)
+	// / delete=remove the PVC together with the environment.
 	// +kubebuilder:validation:Enum=retain;delete
 	// +kubebuilder:default=retain
 	// +optional
 	PVCRetention PVCRetentionPolicy `json:"pvcRetention,omitempty"`
 
-	// MountPath is the mount path (optional); by default the controller
-	// materializes it from whether the environment runs as root:
-	// non-root (runAsNonRoot=true / runAsUser!=0) -> /home; root (runAsUser=0)
-	// -> /root.
+	// MountPath is the path where the workspace PVC is mounted; defaults to
+	// /workspace. The platform's base images set the container home/working
+	// directory to this path, so user data persists across restarts. Custom
+	// images must either align their home to this path or override mountPath
+	// with the image's home directory.
+	// +kubebuilder:default="/workspace"
 	// +optional
 	MountPath string `json:"mountPath,omitempty"`
 }
@@ -156,13 +161,13 @@ const (
 	PVCRetentionDelete PVCRetentionPolicy = "delete"
 )
 
-// VolumeMount is an extra data volume mount (referencing an existing PVC).
+// VolumeMount is a data volume mount referencing an existing PVC.
 type VolumeMount struct {
 	// Name is the volume identifier.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// PVCName is the name of the referenced existing PVC (shared data volume).
+	// PVCName is the name of the referenced existing PVC.
 	// +kubebuilder:validation:MinLength=1
 	PVCName string `json:"pvcName"`
 
@@ -181,16 +186,17 @@ type VolumeMount struct {
 
 // SSHSpec configures SSH access.
 type SSHSpec struct {
-	// Enabled enables SSH access for jupyter / vscode types (runs sshd inside
-	// the container); the ssh type always has it enabled.
+	// Enabled exposes SSH access to the environment: the controller opens the
+	// SSH endpoint. It does not start an sshd server — SSH only works if the
+	// image itself runs one. The ssh container type always has SSH exposed.
 	// +kubebuilder:default=false
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// KeysSecret is the SSH public key Secret reference:
-	// Secret.data[key] stores multi-line public keys (authorized_keys content),
-	// read by the controller and injected into the container; the plaintext is
-	// not stored in spec.
+	// KeysSecret is the SSH public key Secret reference. If specified, the
+	// controller uses the provided Secret (Secret.data[key] holds multi-line
+	// public keys, i.e. authorized_keys content); otherwise the controller
+	// generates and manages one. The plaintext is never stored in spec.
 	// +optional
 	KeysSecret *corev1.SecretKeySelector `json:"keysSecret,omitempty"`
 }
@@ -202,9 +208,8 @@ type NetworkSpec struct {
 	// +optional
 	RDMAEnabled bool `json:"rdmaEnabled,omitempty"`
 
-	// RDMAType is the RDMA network type: infiniband (requires IB switches + a
-	// subnet manager) / roce (RoCEv2, reuses lossless ethernet); effective when
-	// rdmaEnabled=true.
+	// RDMAType is the RDMA network type: infiniband (requires IB switches) /
+	// roce (RoCEv2, reuses lossless ethernet); effective when rdmaEnabled=true.
 	// +kubebuilder:validation:Enum=infiniband;roce
 	// +kubebuilder:default=roce
 	// +optional
@@ -234,10 +239,26 @@ type RuntimeSpec struct {
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
 	// SecurityContext controls the container user: non-root by default
-	// (runAsNonRoot=true, runAsUser=1000); running as root requires explicitly
-	// setting runAsUser=0 (and ensuring runAsNonRoot is not true).
+	// (runAsUser=1000); set runAsUser=0 to run as root. The controller enforces
+	// the non-root default and injects any capabilities the environment needs
+	// (e.g. RDMA); capability and privileged settings are not user-settable.
 	// +optional
-	SecurityContext *corev1.SecurityContext `json:"securityContext,omitempty"`
+	SecurityContext *RuntimeSecurityContext `json:"securityContext,omitempty"`
+}
+
+// RuntimeSecurityContext is the user-settable subset of the container security
+// context. Privileged, capability, and escalation settings are not exposed to
+// users and are injected by the controller as needed (e.g. RDMA); the
+// controller also enforces the non-root default based on RunAsUser.
+type RuntimeSecurityContext struct {
+	// RunAsUser is the user ID to run the container as. Non-root by default;
+	// set 0 to run as root.
+	// +optional
+	RunAsUser *int64 `json:"runAsUser,omitempty"`
+
+	// RunAsGroup is the group ID to run the container as.
+	// +optional
+	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 }
 
 // LifecycleSpec configures the lifecycle.
@@ -256,7 +277,7 @@ type PortSpec struct {
 	Name string `json:"name"`
 
 	// Type is the exposure form: http (web over sub path) / tcp (port range +
-	// TCPRoute) / udp (needs UDPRoute experimental feature).
+	// TCPRoute) / udp (UDPRoute).
 	// +kubebuilder:validation:Enum=http;tcp;udp
 	// +kubebuilder:default=http
 	// +optional
@@ -277,118 +298,79 @@ const (
 	PortTypeUDP  PortType = "udp"
 )
 
-// AssetRef is an asset binding reference.
-type AssetRef struct {
-	// Kind is the asset kind.
-	// +kubebuilder:validation:Enum=Model;Dataset
-	Kind string `json:"kind"`
+// PhaseName is the running phase of the environment.
+type PhaseName string
 
-	// Name is the asset CRD name.
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
+const (
+	PhasePending     PhaseName = "Pending"
+	PhaseRunning     PhaseName = "Running"
+	PhaseStopped     PhaseName = "Stopped"
+	PhaseFailed      PhaseName = "Failed"
+	PhaseTerminating PhaseName = "Terminating"
+)
 
-	// MountPath is the mount path (e.g. /models).
-	// +kubebuilder:validation:MinLength=1
-	MountPath string `json:"mountPath"`
-}
+// Phase describes the current running phase of the environment.
+type Phase struct {
+	// Name is the current phase.
+	// +kubebuilder:validation:Enum=Pending;Running;Stopped;Failed;Terminating
+	Name PhaseName `json:"name"`
 
-// TemplateRef is the source template reference.
-type TemplateRef struct {
-	// Name is the template CRD name.
-	// +kubebuilder:validation:MinLength=1
-	Name string `json:"name"`
-}
-
-// SchedulingSpec configures scheduling.
-type SchedulingSpec struct {
-	// Priority is the priority: low / normal / high / urgent (with Kueue
-	// preemption).
-	// +kubebuilder:validation:Enum=low;normal;high;urgent
-	// +kubebuilder:default=normal
+	// LastTransitionTime is the time the current phase was reached.
 	// +optional
-	Priority string `json:"priority,omitempty"`
+	LastTransitionTime *metav1.Time `json:"lastTransitionTime,omitempty"`
 
-	// Queue is the Kueue LocalQueue name.
-	// +kubebuilder:default=default
+	// Reason explains the current phase, e.g. the error when Failed.
 	// +optional
-	Queue string `json:"queue,omitempty"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // DevEnvironmentStatus defines the observed state of DevEnvironment.
 type DevEnvironmentStatus struct {
-	// Phase is the running phase.
-	// +kubebuilder:validation:Enum=Pending;Running;Stopped;Failed;Terminating
+	// ObservedGeneration is the generation of the most recent spec the
+	// controller has reconciled. If it is less than metadata.generation, the
+	// status may be stale.
 	// +optional
-	Phase string `json:"phase,omitempty"`
+	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
 
-	// Reason is the current status reason, recording the error on failure.
+	// Phase describes the current running phase.
 	// +optional
-	Reason string `json:"reason,omitempty"`
+	Phase *Phase `json:"phase,omitempty"`
 
-	// URL is the Jupyter / Web access address (path-routed via the gateway IP,
-	// e.g. http://<gw-ip>:80/dev/<ns>/<env>/).
+	// SSHKeysSecret is the Secret holding the SSH keys in use: the user-provided
+	// one from spec.ssh.keysSecret, or a controller-generated one. It is
+	// recorded in status so the user can retrieve generated keys.
 	// +optional
-	URL string `json:"url,omitempty"`
-
-	// SSHEndpoint is the SSH connection address (gateway TCP port range),
-	// format ssh://user@<gw-ip>:<env-ssh-port>.
-	// +optional
-	SSHEndpoint string `json:"sshEndpoint,omitempty"`
-
-	// PodName is the associated Pod name (empty when Stopped).
-	// +optional
-	PodName string `json:"podName,omitempty"`
-
-	// NodeName is the scheduled node name.
-	// +optional
-	NodeName string `json:"nodeName,omitempty"`
-
-	// StartTime is the start time.
-	// +optional
-	StartTime *metav1.Time `json:"startTime,omitempty"`
+	SSHKeysSecret *corev1.SecretKeySelector `json:"sshKeysSecret,omitempty"`
 
 	// LastActivityTime is the last activity time, used for idle timeout
 	// determination.
 	// +optional
 	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
 
-	// ComputeProfileGeneration is the generation of the materialized source
-	// ComputeProfile (audit provenance / drift detection; written on first
-	// materialization).
+	// Endpoints are the access addresses of the environment: the web (Jupyter)
+	// URL, the SSH address, and any extra application port exposures.
 	// +optional
-	ComputeProfileGeneration int64 `json:"computeProfileGeneration,omitempty"`
+	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
-	// TemplateGeneration is the generation of the source template (only when
-	// spec.templateRef exists; audit provenance).
-	// +optional
-	TemplateGeneration int64 `json:"templateGeneration,omitempty"`
-
-	// AppEndpoints are the extra application port exposure addresses:
-	// http type -> url (sub path); tcp / udp type -> endpoint (host:port).
-	// +optional
-	AppEndpoints []AppEndpoint `json:"appEndpoints,omitempty"`
-
-	// Conditions: PodScheduled / StorageReady / BrandMatchValid /
-	// ComputeProfileReady / TemplateRefReady / Ready (type constants below).
+	// Conditions: PodScheduled / StorageReady / BrandMatchValid / Ready (type
+	// constants below).
 	// +listType=map
 	// +listMapKey=type
 	// +optional
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
 }
 
-// AppEndpoint is an extra application port exposure address, corresponding to
-// spec.ports.
-type AppEndpoint struct {
-	// Name corresponds to spec.ports[].name.
+// Endpoint describes an access address of the environment: the web (Jupyter)
+// URL, the SSH address, or an extra application port exposure.
+type Endpoint struct {
+	// Name identifies the endpoint: "jupyter", "ssh", or the spec.ports[].name
+	// for an extra application port.
 	Name string `json:"name"`
 
-	// URL is the sub path access address for the http type.
-	// +optional
-	URL string `json:"url,omitempty"`
-
-	// Endpoint is the host:port access address for the tcp / udp type.
-	// +optional
-	Endpoint string `json:"endpoint,omitempty"`
+	// Address is the access address: a URL for web (e.g.
+	// http://<gw-ip>:80/dev/<ns>/<env>/), or a host:port for SSH and tcp/udp
+	// ports (e.g. ssh://user@<gw-ip>:<port>).
+	Address string `json:"address"`
 }
 
 // +kubebuilder:object:root=true

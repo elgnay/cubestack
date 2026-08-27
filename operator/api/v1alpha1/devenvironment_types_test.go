@@ -31,9 +31,7 @@ import (
 
 const (
 	testPortName        = "app"
-	testGPUType         = "nvidia"
 	testDevImage        = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
-	testComputeProfile  = "gpu-1-a100"
 	testDevStorageClass = "ceph-rbd"
 )
 
@@ -62,15 +60,14 @@ func validDevEnvironment(name string) *DevEnvironment {
 	return &DevEnvironment{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 		Spec: DevEnvironmentSpec{
-			Type:    "jupyter",
+			Type:    DevEnvironmentTypeJupyter,
 			Image:   testDevImage,
 			Running: true,
 			Resources: ResourcesSpec{
-				ComputeProfile: testComputeProfile,
-				GPUType:        testGPUType,
-				GPUCount:       1,
-				CPU:            "16",
-				Memory:         "64Gi",
+				GPUType:  GPUTypeNVIDIA,
+				GPUCount: 1,
+				CPU:      "16",
+				Memory:   "64Gi",
 			},
 			Storage: &StorageSpec{
 				Size:             "200Gi",
@@ -113,15 +110,11 @@ var _ = Describe("DevEnvironment", func() {
 			de := &DevEnvironment{
 				ObjectMeta: metav1.ObjectMeta{Name: "de-defaults", Namespace: testNamespace},
 				Spec: DevEnvironmentSpec{
-					Image: testDevImage,
-					Resources: ResourcesSpec{
-						ComputeProfile: testComputeProfile,
-						GPUType:        testGPUType,
-					},
-					Storage:    &StorageSpec{},
-					Network:    &NetworkSpec{},
-					Lifecycle:  &LifecycleSpec{},
-					Scheduling: &SchedulingSpec{},
+					Image:     testDevImage,
+					Resources: ResourcesSpec{},
+					Storage:   &StorageSpec{},
+					Network:   &NetworkSpec{},
+					Lifecycle: &LifecycleSpec{},
 				},
 			}
 
@@ -129,15 +122,15 @@ var _ = Describe("DevEnvironment", func() {
 
 			got := &DevEnvironment{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
-			Expect(got.Spec.Type).To(Equal("jupyter"))
-			Expect(got.Spec.Running).To(BeTrue())
+			Expect(got.Spec.Type).To(Equal(DevEnvironmentTypeSSH))
+			Expect(got.Spec.Running).To(BeFalse())
+			Expect(got.Spec.Resources.GPUType).To(Equal(GPUTypeNVIDIA))
 			Expect(got.Spec.Resources.GPUCount).To(Equal(int32(1)))
-			Expect(got.Spec.Storage.Size).To(Equal("100Gi"))
+			Expect(got.Spec.Storage.Size).To(Equal("10Gi"))
 			Expect(got.Spec.Storage.PVCRetention).To(Equal(PVCRetentionRetain))
+			Expect(got.Spec.Storage.MountPath).To(Equal("/workspace"))
 			Expect(got.Spec.Network.RDMAType).To(Equal(RDMATypeRoCE))
 			Expect(got.Spec.Lifecycle.IdleTimeout).To(Equal(int32(0)))
-			Expect(got.Spec.Scheduling.Priority).To(Equal("normal"))
-			Expect(got.Spec.Scheduling.Queue).To(Equal("default"))
 
 			Expect(k8sClient.Delete(ctx, got)).To(Succeed())
 		})
@@ -146,12 +139,9 @@ var _ = Describe("DevEnvironment", func() {
 			de := &DevEnvironment{
 				ObjectMeta: metav1.ObjectMeta{Name: "de-port-default", Namespace: testNamespace},
 				Spec: DevEnvironmentSpec{
-					Image: testDevImage,
-					Resources: ResourcesSpec{
-						ComputeProfile: testComputeProfile,
-						GPUType:        testGPUType,
-					},
-					Ports: []PortSpec{{Name: testPortName, ContainerPort: 8080}},
+					Image:     testDevImage,
+					Resources: ResourcesSpec{},
+					Ports:     []PortSpec{{Name: testPortName, ContainerPort: 8080}},
 				},
 			}
 
@@ -170,10 +160,7 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(k8sClient.Create(ctx, de)).To(Succeed())
 
 			now := metav1.Now()
-			de.Status.Phase = "Running"
-			de.Status.PodName = "dev-llm-alice-0"
-			de.Status.NodeName = "gpu-node-1"
-			de.Status.StartTime = &now
+			de.Status.Phase = &Phase{Name: PhaseRunning, LastTransitionTime: &now, Reason: "pod running"}
 			de.Status.Conditions = []metav1.Condition{{
 				Type:               ConditionReady,
 				Status:             metav1.ConditionTrue,
@@ -185,8 +172,9 @@ var _ = Describe("DevEnvironment", func() {
 
 			got := &DevEnvironment{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
-			Expect(got.Status.Phase).To(Equal("Running"))
-			Expect(got.Status.NodeName).To(Equal("gpu-node-1"))
+			Expect(got.Status.Phase.Name).To(Equal(PhaseRunning))
+			Expect(got.Status.Phase.Reason).To(Equal("pod running"))
+			Expect(got.Status.Phase.LastTransitionTime).NotTo(BeNil())
 			Expect(got.Status.Conditions).To(HaveLen(1))
 			Expect(got.Status.Conditions[0].Type).To(Equal(ConditionReady))
 
@@ -211,21 +199,13 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-empty-image",
 				func(s *DevEnvironmentSpec) { s.Image = "" },
 				"spec.image"),
-			Entry("empty computeProfile",
-				"de-invalid-empty-computeprofile",
-				func(s *DevEnvironmentSpec) { s.Resources.ComputeProfile = "" },
-				"spec.resources.computeProfile"),
-			Entry("empty gpuType",
-				"de-invalid-empty-gputype",
-				func(s *DevEnvironmentSpec) { s.Resources.GPUType = "" },
-				"spec.resources.gpuType"),
 			Entry("unsupported type",
 				"de-invalid-type",
-				func(s *DevEnvironmentSpec) { s.Type = "docker" },
+				func(s *DevEnvironmentSpec) { s.Type = DevEnvironmentType("docker") },
 				"Unsupported value"),
 			Entry("unsupported gpuType",
 				"de-invalid-gputype",
-				func(s *DevEnvironmentSpec) { s.Resources.GPUType = "amd" },
+				func(s *DevEnvironmentSpec) { s.Resources.GPUType = GPUType("amd") },
 				"Unsupported value"),
 			Entry("unsupported pvcRetention",
 				"de-invalid-retention",
@@ -257,21 +237,6 @@ var _ = Describe("DevEnvironment", func() {
 					s.Ports = []PortSpec{{Name: testPortName, ContainerPort: 65536}}
 				},
 				"spec.ports"),
-			Entry("unsupported assetRef kind",
-				"de-invalid-assetkind",
-				func(s *DevEnvironmentSpec) {
-					s.AssetRefs = []AssetRef{{Kind: "ModelX", Name: "m", MountPath: "/models"}}
-				},
-				"Unsupported value"),
-			Entry("unsupported scheduling priority",
-				"de-invalid-priority",
-				func(s *DevEnvironmentSpec) {
-					if s.Scheduling == nil {
-						s.Scheduling = &SchedulingSpec{}
-					}
-					s.Scheduling.Priority = "critical"
-				},
-				"Unsupported value"),
 		)
 
 		// Required fields are enforced as "the key must be present", so an empty
@@ -282,8 +247,7 @@ var _ = Describe("DevEnvironment", func() {
 				spec := map[string]any{
 					"image": testDevImage,
 					"resources": map[string]any{
-						"computeProfile": testComputeProfile,
-						"gpuType":        testGPUType,
+						"gpuType": GPUTypeNVIDIA,
 					},
 				}
 				mutate(spec)
@@ -303,14 +267,6 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-missing-resources",
 				func(s map[string]any) { delete(s, "resources") },
 				"spec.resources"),
-			Entry("missing computeProfile",
-				"de-invalid-missing-computeprofile",
-				func(s map[string]any) { delete(s["resources"].(map[string]any), "computeProfile") },
-				"spec.resources.computeProfile"),
-			Entry("missing gpuType",
-				"de-invalid-missing-gputype",
-				func(s map[string]any) { delete(s["resources"].(map[string]any), "gpuType") },
-				"spec.resources.gpuType"),
 		)
 
 		// gpuCount is an omitempty int32, so a zero value is dropped by the typed
@@ -321,9 +277,8 @@ var _ = Describe("DevEnvironment", func() {
 				spec := map[string]any{
 					"image": testDevImage,
 					"resources": map[string]any{
-						"computeProfile": testComputeProfile,
-						"gpuType":        testGPUType,
-						"gpuCount":       1,
+						"gpuType":  GPUTypeNVIDIA,
+						"gpuCount": 1,
 					},
 				}
 				mutate(spec)

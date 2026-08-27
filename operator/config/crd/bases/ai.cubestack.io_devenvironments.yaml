@@ -39,37 +39,10 @@ spec:
           spec:
             description: spec defines the desired state of DevEnvironment
             properties:
-              assetRefs:
-                description: |-
-                  AssetRefs bind assets (Model / Dataset CRD references, auto-mounted and
-                  updated with the version).
-                items:
-                  description: AssetRef is an asset binding reference.
-                  properties:
-                    kind:
-                      description: Kind is the asset kind.
-                      enum:
-                      - Model
-                      - Dataset
-                      type: string
-                    mountPath:
-                      description: MountPath is the mount path (e.g. /models).
-                      minLength: 1
-                      type: string
-                    name:
-                      description: Name is the asset CRD name.
-                      minLength: 1
-                      type: string
-                  required:
-                  - kind
-                  - mountPath
-                  - name
-                  type: object
-                type: array
               image:
                 description: |-
-                  Image is the development image, pulled from Harbor. Supports the
-                  base-cuda (NVIDIA) / base-maca (Moore Threads) series.
+                  Image is the development image, pulled from any accessible container
+                  image registry.
                 minLength: 1
                 type: string
               lifecycle:
@@ -93,9 +66,8 @@ spec:
                   rdmaType:
                     default: roce
                     description: |-
-                      RDMAType is the RDMA network type: infiniband (requires IB switches + a
-                      subnet manager) / roce (RoCEv2, reuses lossless ethernet); effective when
-                      rdmaEnabled=true.
+                      RDMAType is the RDMA network type: infiniband (requires IB switches) /
+                      roce (RoCEv2, reuses lossless ethernet); effective when rdmaEnabled=true.
                     enum:
                     - infiniband
                     - roce
@@ -121,7 +93,7 @@ spec:
                       default: http
                       description: |-
                         Type is the exposure form: http (web over sub path) / tcp (port range +
-                        TCPRoute) / udp (needs UDPRoute experimental feature).
+                        TCPRoute) / udp (UDPRoute).
                       enum:
                       - http
                       - tcp
@@ -135,17 +107,8 @@ spec:
               resources:
                 description: Resources is the compute / resource configuration.
                 properties:
-                  computeProfile:
-                    description: |-
-                      ComputeProfile is the compute profile name, referencing a ComputeProfile
-                      CRD; the materialization source of cpu/memory (copied on first
-                      reconcile), keeping provenance.
-                    minLength: 1
-                    type: string
                   cpu:
-                    description: |-
-                      CPU is the number of CPU cores (materialized from ComputeProfile on first
-                      reconcile; user can override afterwards).
+                    description: CPU is the CPU limit in cores.
                     type: string
                   gpuCount:
                     default: 1
@@ -154,28 +117,22 @@ spec:
                     minimum: 1
                     type: integer
                   gpuType:
+                    default: nvidia
                     description: |-
                       GPUType is the GPU vendor: nvidia / metax. It decides the GPU extended
                       resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
                     enum:
                     - nvidia
                     - metax
-                    minLength: 1
                     type: string
                   memory:
-                    description: |-
-                      Memory is the memory size (materialized from ComputeProfile on first
-                      reconcile; user can override afterwards).
+                    description: Memory is the memory limit.
                     type: string
-                required:
-                - computeProfile
-                - gpuType
                 type: object
               running:
-                default: true
-                description: |-
-                  Running is the desired running state: true=Running (replicas 1),
-                  false=Stopped (replicas 0).
+                default: false
+                description: 'Running is the desired running state: true=Running,
+                  false=Stopped.'
                 type: boolean
               runtime:
                 description: Runtime customizes the container runtime.
@@ -352,216 +309,22 @@ spec:
                   securityContext:
                     description: |-
                       SecurityContext controls the container user: non-root by default
-                      (runAsNonRoot=true, runAsUser=1000); running as root requires explicitly
-                      setting runAsUser=0 (and ensuring runAsNonRoot is not true).
+                      (runAsUser=1000); set runAsUser=0 to run as root. The controller enforces
+                      the non-root default and injects any capabilities the environment needs
+                      (e.g. RDMA); capability and privileged settings are not user-settable.
                     properties:
-                      allowPrivilegeEscalation:
-                        description: |-
-                          AllowPrivilegeEscalation controls whether a process can gain more
-                          privileges than its parent process. This bool directly controls if
-                          the no_new_privs flag will be set on the container process.
-                          AllowPrivilegeEscalation is true always when the container is:
-                          1) run as Privileged
-                          2) has CAP_SYS_ADMIN
-                          Note that this field cannot be set when spec.os.name is windows.
-                        type: boolean
-                      appArmorProfile:
-                        description: |-
-                          appArmorProfile is the AppArmor options to use by this container. If set, this profile
-                          overrides the pod's appArmorProfile.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        properties:
-                          localhostProfile:
-                            description: |-
-                              localhostProfile indicates a profile loaded on the node that should be used.
-                              The profile must be preconfigured on the node to work.
-                              Must match the loaded name of the profile.
-                              Must be set if and only if type is "Localhost".
-                            type: string
-                          type:
-                            description: |-
-                              type indicates which kind of AppArmor profile will be applied.
-                              Valid options are:
-                                Localhost - a profile pre-loaded on the node.
-                                RuntimeDefault - the container runtime's default profile.
-                                Unconfined - no AppArmor enforcement.
-                            type: string
-                        required:
-                        - type
-                        type: object
-                      capabilities:
-                        description: |-
-                          The capabilities to add/drop when running containers.
-                          Defaults to the default set of capabilities granted by the container runtime.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        properties:
-                          add:
-                            description: Added capabilities
-                            items:
-                              description: Capability represent POSIX capabilities
-                                type
-                              type: string
-                            type: array
-                            x-kubernetes-list-type: atomic
-                          drop:
-                            description: Removed capabilities
-                            items:
-                              description: Capability represent POSIX capabilities
-                                type
-                              type: string
-                            type: array
-                            x-kubernetes-list-type: atomic
-                        type: object
-                      privileged:
-                        description: |-
-                          Run container in privileged mode.
-                          Processes in privileged containers are essentially equivalent to root on the host.
-                          Defaults to false.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        type: boolean
-                      procMount:
-                        description: |-
-                          procMount denotes the type of proc mount to use for the containers.
-                          The default value is Default which uses the container runtime defaults for
-                          readonly paths and masked paths.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        type: string
-                      readOnlyRootFilesystem:
-                        description: |-
-                          Whether this container has a read-only root filesystem.
-                          Default is false.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        type: boolean
                       runAsGroup:
-                        description: |-
-                          The GID to run the entrypoint of the container process.
-                          Uses runtime default if unset.
-                          May also be set in PodSecurityContext.  If set in both SecurityContext and
-                          PodSecurityContext, the value specified in SecurityContext takes precedence.
-                          Note that this field cannot be set when spec.os.name is windows.
+                        description: RunAsGroup is the group ID to run the container
+                          as.
                         format: int64
                         type: integer
-                      runAsNonRoot:
-                        description: |-
-                          Indicates that the container must run as a non-root user.
-                          If true, the Kubelet will validate the image at runtime to ensure that it
-                          does not run as UID 0 (root) and fail to start the container if it does.
-                          If unset or false, no such validation will be performed.
-                          May also be set in PodSecurityContext.  If set in both SecurityContext and
-                          PodSecurityContext, the value specified in SecurityContext takes precedence.
-                        type: boolean
                       runAsUser:
                         description: |-
-                          The UID to run the entrypoint of the container process.
-                          Defaults to user specified in image metadata if unspecified.
-                          May also be set in PodSecurityContext.  If set in both SecurityContext and
-                          PodSecurityContext, the value specified in SecurityContext takes precedence.
-                          Note that this field cannot be set when spec.os.name is windows.
+                          RunAsUser is the user ID to run the container as. Non-root by default;
+                          set 0 to run as root.
                         format: int64
                         type: integer
-                      seLinuxOptions:
-                        description: |-
-                          The SELinux context to be applied to the container.
-                          If unspecified, the container runtime will allocate a random SELinux context for each
-                          container.  May also be set in PodSecurityContext.  If set in both SecurityContext and
-                          PodSecurityContext, the value specified in SecurityContext takes precedence.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        properties:
-                          level:
-                            description: Level is SELinux level label that applies
-                              to the container.
-                            type: string
-                          role:
-                            description: Role is a SELinux role label that applies
-                              to the container.
-                            type: string
-                          type:
-                            description: Type is a SELinux type label that applies
-                              to the container.
-                            type: string
-                          user:
-                            description: User is a SELinux user label that applies
-                              to the container.
-                            type: string
-                        type: object
-                      seccompProfile:
-                        description: |-
-                          The seccomp options to use by this container. If seccomp options are
-                          provided at both the pod & container level, the container options
-                          override the pod options.
-                          Note that this field cannot be set when spec.os.name is windows.
-                        properties:
-                          localhostProfile:
-                            description: |-
-                              localhostProfile indicates a profile defined in a file on the node should be used.
-                              The profile must be preconfigured on the node to work.
-                              Must be a descending path, relative to the kubelet's configured seccomp profile location.
-                              Must be set if type is "Localhost". Must NOT be set for any other type.
-                            type: string
-                          type:
-                            description: |-
-                              type indicates which kind of seccomp profile will be applied.
-                              Valid options are:
-
-                              Localhost - a profile defined in a file on the node should be used.
-                              RuntimeDefault - the container runtime default profile should be used.
-                              Unconfined - no profile should be applied.
-                            type: string
-                        required:
-                        - type
-                        type: object
-                      windowsOptions:
-                        description: |-
-                          The Windows specific settings applied to all containers.
-                          If unspecified, the options from the PodSecurityContext will be used.
-                          If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence.
-                          Note that this field cannot be set when spec.os.name is linux.
-                        properties:
-                          gmsaCredentialSpec:
-                            description: |-
-                              GMSACredentialSpec is where the GMSA admission webhook
-                              (https://github.com/kubernetes-sigs/windows-gmsa) inlines the contents of the
-                              GMSA credential spec named by the GMSACredentialSpecName field.
-                            type: string
-                          gmsaCredentialSpecName:
-                            description: GMSACredentialSpecName is the name of the
-                              GMSA credential spec to use.
-                            type: string
-                          hostProcess:
-                            description: |-
-                              HostProcess determines if a container should be run as a 'Host Process' container.
-                              All of a Pod's containers must have the same effective HostProcess value
-                              (it is not allowed to have a mix of HostProcess containers and non-HostProcess containers).
-                              In addition, if HostProcess is true then HostNetwork must also be set to true.
-                            type: boolean
-                          runAsUserName:
-                            description: |-
-                              The UserName in Windows to run the entrypoint of the container process.
-                              Defaults to the user specified in image metadata if unspecified.
-                              May also be set in PodSecurityContext. If set in both SecurityContext and
-                              PodSecurityContext, the value specified in SecurityContext takes precedence.
-                            type: string
-                        type: object
                     type: object
-                type: object
-              scheduling:
-                description: Scheduling configures scheduling (Kueue priority / queue).
-                properties:
-                  priority:
-                    default: normal
-                    description: |-
-                      Priority is the priority: low / normal / high / urgent (with Kueue
-                      preemption).
-                    enum:
-                    - low
-                    - normal
-                    - high
-                    - urgent
-                    type: string
-                  queue:
-                    default: default
-                    description: Queue is the Kueue LocalQueue name.
-                    type: string
                 type: object
               ssh:
                 description: SSH configures SSH access.
@@ -569,15 +332,16 @@ spec:
                   enabled:
                     default: false
                     description: |-
-                      Enabled enables SSH access for jupyter / vscode types (runs sshd inside
-                      the container); the ssh type always has it enabled.
+                      Enabled exposes SSH access to the environment: the controller opens the
+                      SSH endpoint. It does not start an sshd server — SSH only works if the
+                      image itself runs one. The ssh container type always has SSH exposed.
                     type: boolean
                   keysSecret:
                     description: |-
-                      KeysSecret is the SSH public key Secret reference:
-                      Secret.data[key] stores multi-line public keys (authorized_keys content),
-                      read by the controller and injected into the container; the plaintext is
-                      not stored in spec.
+                      KeysSecret is the SSH public key Secret reference. If specified, the
+                      controller uses the provided Secret (Secret.data[key] holds multi-line
+                      public keys, i.e. authorized_keys content); otherwise the controller
+                      generates and manages one. The plaintext is never stored in spec.
                     properties:
                       key:
                         description: The key of the secret to select from.  Must be
@@ -603,50 +367,46 @@ spec:
                 type: object
               storage:
                 description: |-
-                  Storage is the workspace storage (a workspace volume created with the
-                  environment and mounted to $HOME by default).
+                  Storage is the workspace storage: a PVC created with the environment and
+                  mounted at the workspace path (default /workspace). Omit it to avoid
+                  creating a managed workspace PVC; to use an existing PVC as the workspace,
+                  mount it via spec.volumes at the workspace path (e.g. /workspace).
                 properties:
                   mountPath:
+                    default: /workspace
                     description: |-
-                      MountPath is the mount path (optional); by default the controller
-                      materializes it from whether the environment runs as root:
-                      non-root (runAsNonRoot=true / runAsUser!=0) -> /home; root (runAsUser=0)
-                      -> /root.
+                      MountPath is the path where the workspace PVC is mounted; defaults to
+                      /workspace. The platform's base images set the container home/working
+                      directory to this path, so user data persists across restarts. Custom
+                      images must either align their home to this path or override mountPath
+                      with the image's home directory.
                     type: string
                   pvcRetention:
                     default: retain
                     description: |-
-                      PVCRetention is the workspace PVC retention policy on environment delete:
-                      retain=keep (default, prevents accidental deletion) / delete=remove with
-                      the environment.
+                      PVCRetention is the workspace PVC retention policy, applied only when the
+                      environment is deleted. Stopping the environment does not delete the PVC:
+                      stopping scales the workload to zero but the workspace data survives
+                      stop/start regardless of this field.
+                      retain=keep the PVC (default, prevents accidental data loss on deletion)
+                      / delete=remove the PVC together with the environment.
                     enum:
                     - retain
                     - delete
                     type: string
                   size:
-                    default: 100Gi
+                    default: 10Gi
                     description: Size is the workspace PVC capacity.
                     type: string
                   storageClassName:
                     description: |-
-                      StorageClassName is the workspace storage class; a CephFS / NFS
-                      StorageClass yields an RWX workspace.
+                      StorageClassName is the workspace storage class. The workspace PVC is
+                      created with an access mode compatible with this class (ReadWriteOnce by
+                      default).
                     type: string
-                type: object
-              templateRef:
-                description: |-
-                  TemplateRef is the source template reference (provenance / label
-                  inheritance; resolved values are fixed into spec).
-                properties:
-                  name:
-                    description: Name is the template CRD name.
-                    minLength: 1
-                    type: string
-                required:
-                - name
                 type: object
               type:
-                default: jupyter
+                default: ssh
                 description: |-
                   Type is the container type (single choice): jupyter / ssh / vscode.
                   It decides the container main entry and the image.
@@ -656,11 +416,13 @@ spec:
                 - vscode
                 type: string
               volumes:
-                description: Volumes are extra data volume mounts (referencing existing
-                  PVCs).
+                description: |-
+                  Volumes are data volume mounts referencing existing PVCs. If spec.storage
+                  is omitted, mount an existing PVC at the workspace path (e.g. /workspace)
+                  to use it as the environment's workspace.
                 items:
-                  description: VolumeMount is an extra data volume mount (referencing
-                    an existing PVC).
+                  description: VolumeMount is a data volume mount referencing an existing
+                    PVC.
                   properties:
                     mountPath:
                       description: MountPath is the mount path (e.g. /data, /models).
@@ -672,7 +434,7 @@ spec:
                       type: string
                     pvcName:
                       description: PVCName is the name of the referenced existing
-                        PVC (shared data volume).
+                        PVC.
                       minLength: 1
                       type: string
                     readOnly:
@@ -695,41 +457,10 @@ spec:
           status:
             description: status defines the observed state of DevEnvironment
             properties:
-              appEndpoints:
-                description: |-
-                  AppEndpoints are the extra application port exposure addresses:
-                  http type -> url (sub path); tcp / udp type -> endpoint (host:port).
-                items:
-                  description: |-
-                    AppEndpoint is an extra application port exposure address, corresponding to
-                    spec.ports.
-                  properties:
-                    endpoint:
-                      description: Endpoint is the host:port access address for the
-                        tcp / udp type.
-                      type: string
-                    name:
-                      description: Name corresponds to spec.ports[].name.
-                      type: string
-                    url:
-                      description: URL is the sub path access address for the http
-                        type.
-                      type: string
-                  required:
-                  - name
-                  type: object
-                type: array
-              computeProfileGeneration:
-                description: |-
-                  ComputeProfileGeneration is the generation of the materialized source
-                  ComputeProfile (audit provenance / drift detection; written on first
-                  materialization).
-                format: int64
-                type: integer
               conditions:
                 description: |-
-                  Conditions: PodScheduled / StorageReady / BrandMatchValid /
-                  ComputeProfileReady / TemplateRefReady / Ready (type constants below).
+                  Conditions: PodScheduled / StorageReady / BrandMatchValid / Ready (type
+                  constants below).
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -788,51 +519,94 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              endpoints:
+                description: |-
+                  Endpoints are the access addresses of the environment: the web (Jupyter)
+                  URL, the SSH address, and any extra application port exposures.
+                items:
+                  description: |-
+                    Endpoint describes an access address of the environment: the web (Jupyter)
+                    URL, the SSH address, or an extra application port exposure.
+                  properties:
+                    address:
+                      description: |-
+                        Address is the access address: a URL for web (e.g.
+                        http://<gw-ip>:80/dev/<ns>/<env>/), or a host:port for SSH and tcp/udp
+                        ports (e.g. ssh://user@<gw-ip>:<port>).
+                      type: string
+                    name:
+                      description: |-
+                        Name identifies the endpoint: "jupyter", "ssh", or the spec.ports[].name
+                        for an extra application port.
+                      type: string
+                  required:
+                  - address
+                  - name
+                  type: object
+                type: array
               lastActivityTime:
                 description: |-
                   LastActivityTime is the last activity time, used for idle timeout
                   determination.
                 format: date-time
                 type: string
-              nodeName:
-                description: NodeName is the scheduled node name.
-                type: string
-              phase:
-                description: Phase is the running phase.
-                enum:
-                - Pending
-                - Running
-                - Stopped
-                - Failed
-                - Terminating
-                type: string
-              podName:
-                description: PodName is the associated Pod name (empty when Stopped).
-                type: string
-              reason:
-                description: Reason is the current status reason, recording the error
-                  on failure.
-                type: string
-              sshEndpoint:
+              observedGeneration:
                 description: |-
-                  SSHEndpoint is the SSH connection address (gateway TCP port range),
-                  format ssh://user@<gw-ip>:<env-ssh-port>.
-                type: string
-              startTime:
-                description: StartTime is the start time.
-                format: date-time
-                type: string
-              templateGeneration:
-                description: |-
-                  TemplateGeneration is the generation of the source template (only when
-                  spec.templateRef exists; audit provenance).
+                  ObservedGeneration is the generation of the most recent spec the
+                  controller has reconciled. If it is less than metadata.generation, the
+                  status may be stale.
                 format: int64
                 type: integer
-              url:
+              phase:
+                description: Phase describes the current running phase.
+                properties:
+                  lastTransitionTime:
+                    description: LastTransitionTime is the time the current phase
+                      was reached.
+                    format: date-time
+                    type: string
+                  name:
+                    description: Name is the current phase.
+                    enum:
+                    - Pending
+                    - Running
+                    - Stopped
+                    - Failed
+                    - Terminating
+                    type: string
+                  reason:
+                    description: Reason explains the current phase, e.g. the error
+                      when Failed.
+                    type: string
+                required:
+                - name
+                type: object
+              sshKeysSecret:
                 description: |-
-                  URL is the Jupyter / Web access address (path-routed via the gateway IP,
-                  e.g. http://<gw-ip>:80/dev/<ns>/<env>/).
-                type: string
+                  SSHKeysSecret is the Secret holding the SSH keys in use: the user-provided
+                  one from spec.ssh.keysSecret, or a controller-generated one. It is
+                  recorded in status so the user can retrieve generated keys.
+                properties:
+                  key:
+                    description: The key of the secret to select from.  Must be a
+                      valid secret key.
+                    type: string
+                  name:
+                    default: ""
+                    description: |-
+                      Name of the referent.
+                      This field is effectively required, but due to backwards compatibility is
+                      allowed to be empty. Instances of this type with an empty value here are
+                      almost certainly wrong.
+                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                    type: string
+                  optional:
+                    description: Specify whether the Secret or its key must be defined
+                    type: boolean
+                required:
+                - key
+                type: object
+                x-kubernetes-map-type: atomic
             type: object
         required:
         - spec

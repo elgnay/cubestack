@@ -11,18 +11,17 @@ spec:
 
   # Compute / resources
   resources:
-    computeProfile: gpu-1-a100
     gpuType: nvidia
     gpuCount: 1
-    cpu: "16"                  # materialized from computeProfile
+    cpu: "16"
     memory: "64Gi"
 
   # Workspace storage
   storage:
     size: 200Gi
-    storageClassName: ceph-rbd   # or cephfs (RWX workspace)
+    storageClassName: standard   # workspace storage class
     pvcRetention: retain         # retain / delete
-    mountPath: /home             # optional; default materialized from runAsNonRoot (non-root -> /home, root -> /root)
+    mountPath: /workspace        # workspace mount path (default); base images set HOME here
 
   # Extra data volumes (referencing existing PVCs)
   volumes:

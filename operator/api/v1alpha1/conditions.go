@@ -87,12 +87,4 @@ const (
 	// ConditionBrandMatchValid indicates that gpuType matches the image brand
 	// (nvidia<->base-cuda, metax<->base-maca). (DevEnvironment)
 	ConditionBrandMatchValid ConditionType = "BrandMatchValid"
-
-	// ConditionComputeProfileReady indicates that the referenced ComputeProfile
-	// CRD exists. (DevEnvironment)
-	ConditionComputeProfileReady ConditionType = "ComputeProfileReady"
-
-	// ConditionTemplateRefReady indicates that the template referenced by
-	// spec.templateRef exists (provenance completeness only). (DevEnvironment)
-	ConditionTemplateRefReady ConditionType = "TemplateRefReady"
 )
