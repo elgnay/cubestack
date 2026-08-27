@@ -1,0 +1,53 @@
+apiVersion: ai.cubestack.io/v1alpha1
+kind: DevEnvironment
+metadata:
+  name: dev-llm-alice
+  namespace: project-llm
+spec:
+  # Core (flat) fields
+  type: jupyter                # container type: jupyter / ssh / vscode
+  image: harbor.local/ai-images/base-cuda:11.8-pytorch2.2
+  running: true                # desired running state
+
+  # Compute / resources
+  resources:
+    gpuType: nvidia
+    gpuCount: 1
+    cpu: "16"
+    memory: "64Gi"
+
+  # Workspace storage
+  storage:
+    size: 200Gi
+    storageClassName: standard   # workspace storage class
+    pvcRetention: retain         # retain / delete
+    mountPath: /workspace        # workspace mount path (default); base images set HOME here
+
+  # Extra data volumes (referencing existing PVCs)
+  volumes:
+    - name: shared-dataset
+      pvcName: dataset-llm-shared
+      mountPath: /data
+      readOnly: true
+
+  # SSH access
+  ssh:
+    enabled: true                # enable extra SSH for jupyter/vscode types
+    keysSecret:
+      name: dev-alice-ssh-keys   # Secret.data[keys] holds multi-line public keys (authorized_keys content)
+      key: keys
+
+  # Network
+  network:
+    rdmaEnabled: false
+    rdmaType: roce               # infiniband / roce
+
+  # Container runtime customization
+  runtime:
+    env:
+      - name: MODEL_REPO
+        value: /models/llama3-8b
+
+  # Lifecycle
+  lifecycle:
+    idleTimeout: 3600            # auto-shutdown after 1 hour idle
