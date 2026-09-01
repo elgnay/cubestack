@@ -55,7 +55,6 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -442,14 +441,14 @@ func desiredResources(env *aiv1alpha1.DevEnvironment) corev1.ResourceRequirement
 // the user explicitly requests root (runAsUser=0), which disables runAsNonRoot
 // (design §9.2).
 func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext {
-	runAsNonRoot := ptr.To(true)
+	runAsNonRoot := ptr(true)
 	runAsUser := int64(1000)
 	runAsGroup := int64(1000)
 	if rt != nil && rt.SecurityContext != nil {
 		if rt.SecurityContext.RunAsUser != nil {
 			runAsUser = *rt.SecurityContext.RunAsUser
 			if runAsUser == 0 {
-				runAsNonRoot = ptr.To(false)
+				runAsNonRoot = ptr(false)
 			}
 		}
 		if rt.SecurityContext.RunAsGroup != nil {
@@ -458,8 +457,8 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 	}
 	return &corev1.SecurityContext{
 		RunAsNonRoot: runAsNonRoot,
-		RunAsUser:    ptr.To(runAsUser),
-		RunAsGroup:   ptr.To(runAsGroup),
+		RunAsUser:    ptr(runAsUser),
+		RunAsGroup:   ptr(runAsGroup),
 	}
 }
 
@@ -573,7 +572,7 @@ func (r *DevEnvironmentReconciler) desiredVolumeClaimTemplates(env *aiv1alpha1.D
 		},
 	}
 	if env.Spec.Storage.StorageClassName != "" {
-		pvc.Spec.StorageClassName = ptr.To(env.Spec.Storage.StorageClassName)
+		pvc.Spec.StorageClassName = ptr(env.Spec.Storage.StorageClassName)
 	}
 	return []corev1.PersistentVolumeClaim{pvc}
 }
@@ -1069,8 +1068,8 @@ func (r *DevEnvironmentReconciler) desiredHTTPRoute(env *aiv1alpha1.DevEnvironme
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
 		rules = append(rules, gatewayv1.HTTPRouteRule{
 			Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{
-				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
-				Value: ptr.To(fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name)),
+				Type:  ptr(gatewayv1.PathMatchPathPrefix),
+				Value: ptr(fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name)),
 			}}},
 			BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: serviceBackendRef(env.Name, mainContainerPort(env.Spec.Type))}},
 		})
@@ -1081,8 +1080,8 @@ func (r *DevEnvironmentReconciler) desiredHTTPRoute(env *aiv1alpha1.DevEnvironme
 		}
 		rules = append(rules, gatewayv1.HTTPRouteRule{
 			Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{
-				Type:  ptr.To(gatewayv1.PathMatchPathPrefix),
-				Value: ptr.To(fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, p.Name)),
+				Type:  ptr(gatewayv1.PathMatchPathPrefix),
+				Value: ptr(fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, p.Name)),
 			}}},
 			BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: serviceBackendRef(env.Name, p.ContainerPort)}},
 		})
@@ -1125,13 +1124,13 @@ func tcpRouteName(env *aiv1alpha1.DevEnvironment, port int32) string {
 // explicit defaults so the stored route spec compares equal across reconciles.
 func gatewayParentRef(gw *gatewayv1.Gateway, sectionName string) gatewayv1.ParentReference {
 	ref := gatewayv1.ParentReference{
-		Group:     ptr.To(gatewayv1.Group(gatewayAPIGroup)),
-		Kind:      ptr.To(gatewayv1.Kind(gatewayKind)),
-		Namespace: ptr.To(gatewayv1.Namespace(gw.Namespace)),
+		Group:     ptr(gatewayv1.Group(gatewayAPIGroup)),
+		Kind:      ptr(gatewayv1.Kind(gatewayKind)),
+		Namespace: ptr(gatewayv1.Namespace(gw.Namespace)),
 		Name:      gatewayv1.ObjectName(gw.Name),
 	}
 	if sectionName != "" {
-		ref.SectionName = ptr.To(gatewayv1.SectionName(sectionName))
+		ref.SectionName = ptr(gatewayv1.SectionName(sectionName))
 	}
 	return ref
 }
@@ -1142,12 +1141,12 @@ func gatewayParentRef(gw *gatewayv1.Gateway, sectionName string) gatewayv1.Paren
 func serviceBackendRef(serviceName string, port int32) gatewayv1.BackendRef {
 	return gatewayv1.BackendRef{
 		BackendObjectReference: gatewayv1.BackendObjectReference{
-			Group: ptr.To(gatewayv1.Group("")),
-			Kind:  ptr.To(gatewayv1.Kind(serviceKind)),
+			Group: ptr(gatewayv1.Group("")),
+			Kind:  ptr(gatewayv1.Kind(serviceKind)),
 			Name:  gatewayv1.ObjectName(serviceName),
-			Port:  ptr.To(port),
+			Port:  ptr(port),
 		},
-		Weight: ptr.To(int32(1)),
+		Weight: ptr(int32(1)),
 	}
 }
 
