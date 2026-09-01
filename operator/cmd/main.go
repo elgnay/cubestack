@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
 	"github.com/suanova/cubestack/internal/controller"
@@ -211,6 +212,20 @@ func main() {
 		GatewayNamespace: gatewayNamespace,
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "InferenceService")
+		os.Exit(1)
+	}
+	if err = (&controller.DevEnvironmentReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+		Config: controller.DevEnvironmentControllerConfig{
+			GatewayName:       "cubestack-gateway",
+			GatewayNamespace:  "cubestack-system",
+			HTTPPort:          80,
+			SSHPortRangeStart: 20000,
+			SSHPortRangeEnd:   20999,
+		},
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "DevEnvironment")
 		os.Exit(1)
 	}
 

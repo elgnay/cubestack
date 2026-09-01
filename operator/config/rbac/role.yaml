@@ -8,6 +8,7 @@ rules:
   - ""
   resources:
   - configmaps
+  - secrets
   - services
   verbs:
   - create
@@ -23,12 +24,22 @@ rules:
   - persistentvolumeclaims
   verbs:
   - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
   - get
   - list
   - watch
 - apiGroups:
   - ai.cubestack.io
   resources:
+  - devenvironments
   - inferenceruntimeprofiles
   - inferenceservices
   - modelversions
@@ -39,6 +50,13 @@ rules:
 - apiGroups:
   - ai.cubestack.io
   resources:
+  - devenvironments/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ai.cubestack.io
+  resources:
+  - devenvironments/status
   - inferenceruntimeprofiles/status
   - inferenceservices/status
   - modelversions/status
@@ -50,6 +68,28 @@ rules:
   - apps
   resources:
   - deployments
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - gateways
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  - tcproutes
   verbs:
   - create
   - delete
@@ -74,6 +114,18 @@ rules:
   - leaderworkerset.x-k8s.io
   resources:
   - leaderworkersets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - networking.k8s.io
+  resources:
+  - networkpolicies
   verbs:
   - create
   - delete
