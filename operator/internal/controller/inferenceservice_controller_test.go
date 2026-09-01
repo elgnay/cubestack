@@ -627,6 +627,19 @@ var _ = Describe("InferenceService controller", func() {
 			return isvc.Name
 		}
 
+		// dropProfileAssets clears the profile's assets, retrying when the
+		// runtime-profile controller's concurrent status write 409s the update:
+		// fetch-then-update is a race, since the controller bumps the
+		// resourceVersion between the test's Get and Update.
+		dropProfileAssets := func(name string) {
+			Eventually(func(g Gomega) {
+				irp := &aiv1alpha1.InferenceRuntimeProfile{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, irp)).To(Succeed())
+				irp.Spec.Assets = nil
+				g.Expect(k8sClient.Update(ctx, irp)).To(Succeed())
+			}, "10s", "100ms").Should(Succeed())
+		}
+
 		It("creates the asset ConfigMap copy with labels, annotations and ownerRef", func() {
 			name := provisionBase("isvc-provision-cm")
 			defer func() {
@@ -718,10 +731,7 @@ var _ = Describe("InferenceService controller", func() {
 			// Recreate the profile with the same name but no assets (envtest
 			// has no VAP, so the update is allowed; in production this is
 			// delete + recreate, which is equivalent for the controller).
-			irp := &aiv1alpha1.InferenceRuntimeProfile{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, irp)).To(Succeed())
-			irp.Spec.Assets = nil
-			Expect(k8sClient.Update(ctx, irp)).To(Succeed())
+			dropProfileAssets(name)
 
 			Eventually(func() bool {
 				err := k8sClient.Get(ctx, client.ObjectKey{Name: name + "-" + testAssetName, Namespace: testNamespace}, &corev1.ConfigMap{})
@@ -761,10 +771,7 @@ var _ = Describe("InferenceService controller", func() {
 
 			// Drop the asset so cleanup has an orphan to chase: the owned copy
 			// must be deleted, the foreign ConfigMap must stay.
-			irp := &aiv1alpha1.InferenceRuntimeProfile{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name}, irp)).To(Succeed())
-			irp.Spec.Assets = nil
-			Expect(k8sClient.Update(ctx, irp)).To(Succeed())
+			dropProfileAssets(name)
 
 			Eventually(func(g Gomega) {
 				err := k8sClient.Get(ctx, client.ObjectKey{Name: name + "-" + testAssetName, Namespace: testNamespace}, &corev1.ConfigMap{})
