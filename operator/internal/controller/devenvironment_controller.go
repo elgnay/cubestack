@@ -39,6 +39,7 @@ import (
 	"encoding/binary"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"slices"
 	"strconv"
 	"strings"
@@ -179,8 +180,16 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	desired.Status.ObservedGeneration = env.Generation
 
 	// 1. Brand match gate: gpuType must match the image brand. A mismatch is a
-	// hard failure — nothing is provisioned (design §4.2).
+	// hard failure — nothing is provisioned (design §4.2). An environment that
+	// was running before the image or gpuType changed is withdrawn so the Failed
+	// phase reflects reality: the workload is stopped and the routes removed.
 	if reason := brandMismatchReason(&env); reason != "" {
+		if err := r.stopCompute(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.deleteRoutes(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
 		setBrandMatchValidCondition(&desired.Status.Conditions, false, reasonBrandMismatch, reason)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionStorageReady)
@@ -243,6 +252,24 @@ func (r *DevEnvironmentReconciler) updateStatusIfChanged(ctx context.Context, en
 	return nil
 }
 
+// stopCompute scales the environment's StatefulSet to zero so a Failed
+// environment no longer runs a workload while the workspace PVC survives. A
+// missing or foreign StatefulSet is left alone.
+func (r *DevEnvironmentReconciler) stopCompute(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
+	sts := &appsv1.StatefulSet{}
+	if err := r.Get(ctx, client.ObjectKey{Name: env.Name, Namespace: env.Namespace}, sts); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if err := ensureDevEnvOwned(sts, env); err != nil {
+		return nil
+	}
+	if sts.Spec.Replicas != nil && *sts.Spec.Replicas == 0 {
+		return nil
+	}
+	sts.Spec.Replicas = ptr(int32(0))
+	return r.Update(ctx, sts)
+}
+
 // cleanup runs when the environment is being deleted: it reports the
 // Terminating phase, deletes the managed resources, removes the workspace PVC
 // only when pvcRetention=delete (design §7), and drops the finalizer.
@@ -259,6 +286,16 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshSecretName(env), Namespace: env.Namespace}},
 	} {
+		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		// A same-name resource owned by someone else must never be deleted.
+		if err := ensureDevEnvOwned(obj, env); err != nil {
+			continue
+		}
 		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -268,9 +305,20 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 	}
 
 	// The workspace PVC survives by default: the StatefulSet retains it on
-	// delete. Remove it only when pvcRetention=delete.
+	// delete. Remove it only when pvcRetention=delete. The PVC's controller
+	// owner is the StatefulSet (created via volumeClaimTemplate), so ownership
+	// is verified by the environment label instead of a controller ownerRef.
 	if env.Spec.Storage != nil && env.Spec.Storage.PVCRetention == aiv1alpha1.PVCRetentionDelete {
 		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: workspacePVCName(env), Namespace: env.Namespace}}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			return err
+		}
+		if pvc.Labels[devEnvironmentLabelKey] != env.Name {
+			return nil
+		}
 		if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -300,6 +348,9 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 		return err
 	}
 	for i := range hrs.Items {
+		if err := ensureDevEnvOwned(&hrs.Items[i], env); err != nil {
+			continue
+		}
 		if err := r.Delete(ctx, &hrs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -312,6 +363,9 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 		return err
 	}
 	for i := range trs.Items {
+		if err := ensureDevEnvOwned(&trs.Items[i], env); err != nil {
+			continue
+		}
 		if err := r.Delete(ctx, &trs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
 			return err
 		}
@@ -1217,17 +1271,20 @@ func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1a
 // web URL, the SSH address, and the extra http/tcp exposures.
 func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus, gwIP string, ports map[string]int32) {
 	cfg := r.defaultedConfig()
+	// JoinHostPort brackets a literal IPv6 gateway address ([::1]:80); a plain
+	// fmt "%s:%d" would produce an invalid URL.
+	httpHostPort := net.JoinHostPort(gwIP, strconv.Itoa(int(cfg.HTTPPort)))
 	status.Endpoints = nil
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 			Name:    string(env.Spec.Type),
-			Address: fmt.Sprintf("http://%s:%d/dev/%s/%s/", gwIP, cfg.HTTPPort, env.Namespace, env.Name),
+			Address: "http://" + httpHostPort + fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name),
 		})
 	}
 	if sshExposed(env) {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 			Name:    sshPortName,
-			Address: fmt.Sprintf("ssh://%s@%s:%d", sshEndpointUser, gwIP, ports[sshPortName]),
+			Address: fmt.Sprintf("ssh://%s@%s", sshEndpointUser, net.JoinHostPort(gwIP, strconv.Itoa(int(ports[sshPortName])))),
 		})
 	}
 	for _, p := range env.Spec.Ports {
@@ -1235,12 +1292,12 @@ func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment
 		case aiv1alpha1.PortTypeHTTP:
 			status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 				Name:    p.Name,
-				Address: fmt.Sprintf("http://%s:%d/dev/%s/%s/port/%s/", gwIP, cfg.HTTPPort, env.Namespace, env.Name, p.Name),
+				Address: "http://" + httpHostPort + fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, p.Name),
 			})
 		case aiv1alpha1.PortTypeTCP:
 			status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 				Name:    p.Name,
-				Address: fmt.Sprintf("%s:%d", gwIP, ports[p.Name]),
+				Address: net.JoinHostPort(gwIP, strconv.Itoa(int(ports[p.Name]))),
 			})
 		}
 	}

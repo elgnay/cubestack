@@ -271,6 +271,58 @@ var _ = Describe("DevEnvironment controller", func() {
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
 		})
+
+		It("withdraws compute and routes when a running environment becomes mismatched", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-brand-transition")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+			createStatefulPod(env, "node-a", corev1.PodRunning, true, nil)
+
+			// The environment provisions and runs: the StatefulSet is scaled to
+			// 1 and the routes are published.
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.Replicas).NotTo(BeNil())
+				g.Expect(*sts.Spec.Replicas).To(Equal(int32(1)))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Editing the image into a brand mismatch must withdraw the
+			// previously-provisioned compute and access before marking Failed.
+			got := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			got.Spec.Image = "harbor.local/ai-images/base-maca:1.0"
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				got2 := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got2)).To(Succeed())
+				g.Expect(got2.Status.Phase).NotTo(BeNil())
+				g.Expect(got2.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got2.Status.Phase.Reason).To(Equal(reasonBrandMismatch))
+				g.Expect(got2.Status.Endpoints).To(BeEmpty())
+				// Compute is withdrawn: the StatefulSet is scaled to zero.
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.Replicas).NotTo(BeNil())
+				g.Expect(*sts.Spec.Replicas).To(Equal(int32(0)))
+				// Access is withdrawn: no HTTP or TCP routes remain.
+				var hrs gatewayv1.HTTPRouteList
+				g.Expect(k8sClient.List(ctx, &hrs, client.InNamespace(testNamespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name})).To(Succeed())
+				g.Expect(hrs.Items).To(BeEmpty())
+				var trs gatewayv1.TCPRouteList
+				g.Expect(k8sClient.List(ctx, &trs, client.InNamespace(testNamespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name})).To(Succeed())
+				g.Expect(trs.Items).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
 	})
 
 	Context("storage", func() {
@@ -511,6 +563,72 @@ var _ = Describe("DevEnvironment controller", func() {
 			pvc := &corev1.PersistentVolumeClaim{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: workspacePVCName(env), Namespace: env.Namespace}, pvc)).To(Succeed())
 		})
+
+		It("does not delete foreign resources that share the environment's name or labels", func() {
+			// Foreign resources occupy the environment's name and labels before
+			// the controller provisions anything; none carry an ownerRef to the
+			// environment.
+			envName := "de-foreign"
+			foreignSvc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{Name: envName, Namespace: testNamespace},
+				Spec:       corev1.ServiceSpec{Ports: []corev1.ServicePort{{Port: 8080}}},
+			}
+			Expect(k8sClient.Create(ctx, foreignSvc)).To(Succeed())
+			foreignHTTP := &gatewayv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-foreign-web", Namespace: testNamespace, Labels: map[string]string{devEnvironmentLabelKey: envName}},
+				Spec: gatewayv1.HTTPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
+						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testGatewayName)},
+					}},
+					Rules: []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{
+						BackendObjectReference: gatewayv1.BackendObjectReference{Name: gatewayv1.ObjectName("some-svc"), Port: ptrTo(gatewayv1.PortNumber(8080))},
+					}}}}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, foreignHTTP)).To(Succeed())
+			foreignTCP := &gatewayv1.TCPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-foreign-tcp-9999", Namespace: testNamespace, Labels: map[string]string{devEnvironmentLabelKey: envName}},
+				Spec: gatewayv1.TCPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
+						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testGatewayName)},
+					}},
+					Rules: []gatewayv1.TCPRouteRule{{BackendRefs: []gatewayv1.BackendRef{{
+						BackendObjectReference: gatewayv1.BackendObjectReference{Name: gatewayv1.ObjectName("some-svc"), Port: ptrTo(gatewayv1.PortNumber(8080))},
+					}}}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, foreignTCP)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, foreignSvc)
+				_ = k8sClient.Delete(ctx, foreignHTTP)
+				_ = k8sClient.Delete(ctx, foreignTCP)
+			}()
+
+			// The controller must not adopt the foreign Service: applying its
+			// own Service conflicts, so the environment never provisions.
+			env := validDevEnvironment(envName)
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
+			}, "15s", "200ms").Should(Succeed())
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, envKey(env.Name), &aiv1alpha1.DevEnvironment{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Cleanup deleted nothing it did not own: all three foreign
+			// resources survive.
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignSvc), foreignSvc)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignHTTP), foreignHTTP)).To(Succeed())
+			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignTCP), foreignTCP)).To(Succeed())
+		})
 	})
 
 	Context("gateway routes", func() {
@@ -747,6 +865,53 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 				g.Expect(cond.Reason).To(Equal(reasonGatewayNotReady))
 				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("brackets an IPv6 gateway address in published endpoints", func() {
+			gw := &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: testGatewayName, Namespace: testNamespace},
+				Spec: gatewayv1.GatewaySpec{
+					GatewayClassName: gatewayv1.ObjectName("eg"),
+					Listeners: []gatewayv1.Listener{{
+						Name:     gatewayv1.SectionName(testPortName),
+						Port:     gatewayv1.PortNumber(80),
+						Protocol: gatewayv1.HTTPProtocolType,
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, gw)).To(Succeed())
+			defer deleteGateway()
+			gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{{Type: ptrTo(gatewayv1.IPAddressType), Value: "2001:db8::1"}}
+			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
+
+			env := validDevEnvironment("de-ipv6")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				var web, ssh, tcp string
+				for _, ep := range got.Status.Endpoints {
+					switch ep.Name {
+					case string(env.Spec.Type):
+						web = ep.Address
+					case sshPortName:
+						ssh = ep.Address
+					case testGRPCPortName:
+						tcp = ep.Address
+					}
+				}
+				g.Expect(web).To(Equal("http://[2001:db8::1]:80" + webRootPath + env.Name + "/"))
+				g.Expect(ssh).To(HavePrefix("ssh://" + sshEndpointUser + "@[2001:db8::1]:"))
+				g.Expect(tcp).To(HavePrefix("[2001:db8::1]:"))
+				g.Expect(portFromEndpoint(tcp)).To(BeNumerically(">", 0))
+				g.Expect(portFromEndpoint(ssh)).To(BeNumerically(">", 0))
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})
