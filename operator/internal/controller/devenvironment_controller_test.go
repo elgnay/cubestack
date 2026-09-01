@@ -281,6 +281,11 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 			createStatefulPod(env, "node-a", corev1.PodRunning, true, nil)
+			// The synthetic pod has no owner reference, so deleteEnv cannot
+			// remove it; clean it up here so it does not leak into later specs.
+			defer func() {
+				_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName(env), Namespace: env.Namespace}})
+			}()
 
 			// The environment provisions and runs: the StatefulSet is scaled to
 			// 1 and the routes are published.

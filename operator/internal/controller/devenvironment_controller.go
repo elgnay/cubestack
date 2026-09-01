@@ -311,16 +311,16 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 	if env.Spec.Storage != nil && env.Spec.Storage.PVCRetention == aiv1alpha1.PVCRetentionDelete {
 		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: workspacePVCName(env), Namespace: env.Namespace}}
 		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil {
-			if apierrors.IsNotFound(err) {
-				return nil
+			if !apierrors.IsNotFound(err) {
+				return err
 			}
-			return err
-		}
-		if pvc.Labels[devEnvironmentLabelKey] != env.Name {
-			return nil
-		}
-		if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
-			return err
+			// A missing PVC is already cleaned up; fall through to the
+			// finalizer removal so the environment does not stall in
+			// Terminating.
+		} else if pvc.Labels[devEnvironmentLabelKey] == env.Name {
+			if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
 		}
 	}
 
