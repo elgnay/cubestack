@@ -809,6 +809,13 @@ func (r *DevEnvironmentReconciler) userAuthorizedKeys(ctx context.Context, env *
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: ks.Name}, s); err != nil {
 		return "", err
 	}
+	// Only a Secret that explicitly delegates itself may back authorized_keys:
+	// copying data from an undelegated Secret would let an environment creator
+	// read any same-namespace Secret through the managed SSH secret that the
+	// workload mounts.
+	if s.Labels[devEnvSSHKeysDelegatedLabel] != devEnvSSHKeysDelegatedValue {
+		return "", fmt.Errorf("secret %s/%s is not delegated for SSH keys: missing label %q", env.Namespace, ks.Name, devEnvSSHKeysDelegatedLabel)
+	}
 	return string(s.Data[key]), nil
 }
 
@@ -920,6 +927,13 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		ports[sp.Name] = p
 	}
 
+	// Drop routes for exposures removed since the last reconcile: the loop
+	// above no longer allocates their ports, but the old TCPRoute would keep
+	// claiming the Gateway listener and block reuse of the freed port.
+	if err := r.pruneTCPRoutes(ctx, env, ports); err != nil {
+		return nil, err
+	}
+
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH || hasHTTPPorts(env) {
 		if err := r.applyHTTPRoute(ctx, env, gw); err != nil {
 			return nil, err
@@ -931,6 +945,53 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		}
 	}
 	return ports, nil
+}
+
+// pruneTCPRoutes deletes this environment's TCPRoutes whose allocated port is
+// no longer in the desired set — i.e. when an SSH or extra TCP exposure was
+// removed from the spec. Route names embed the allocated port, so the desired
+// set is matched by port; a leftover route would keep claiming the Gateway
+// listener and block reuse of the freed port by another environment.
+func (r *DevEnvironmentReconciler) pruneTCPRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, desired map[string]int32) error {
+	desiredPorts := make(map[int32]bool, len(desired))
+	for _, p := range desired {
+		desiredPorts[p] = true
+	}
+	var trs gatewayv1.TCPRouteList
+	if err := r.List(ctx, &trs, client.InNamespace(env.Namespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name}); err != nil {
+		if meta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	for i := range trs.Items {
+		if desiredPorts[tcpRoutePort(trs.Items[i].Name)] {
+			continue
+		}
+		// Only routes owned by this environment may be deleted: a foreign
+		// object carrying the environment label must not be touched.
+		if err := ensureDevEnvOwned(&trs.Items[i], env); err != nil {
+			continue
+		}
+		if err := r.Delete(ctx, &trs.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// tcpRoutePort extracts the allocated listener port from a TCPRoute name of
+// the form <env>-tcp-<port>.
+func tcpRoutePort(name string) int32 {
+	i := strings.LastIndex(name, "-tcp-")
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(name[i+len("-tcp-"):])
+	if err != nil {
+		return 0
+	}
+	return int32(n)
 }
 
 func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {

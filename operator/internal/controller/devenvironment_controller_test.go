@@ -399,8 +399,12 @@ var _ = Describe("DevEnvironment controller", func() {
 
 		It("copies user public keys into the managed authorized_keys", func() {
 			keys := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "dev-alice-ssh-keys", Namespace: testNamespace},
-				Data:       map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dev-alice-ssh-keys",
+					Namespace: testNamespace,
+					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+				},
+				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -422,6 +426,41 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
 				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(testUserSSHKey))
 				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("rejects an undelegated keysSecret without copying its data", func() {
+			// A Secret without the delegation label must never back
+			// authorized_keys: copying it would let the environment creator read
+			// any same-namespace Secret through the managed SSH secret.
+			leaked := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "dev-secret-undelegated", Namespace: testNamespace},
+				Data:       map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+			}
+			Expect(k8sClient.Create(ctx, leaked)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, leaked) }()
+
+			env := validDevEnvironment("de-undelegated")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: leaked.Name},
+					Key:                  sshUserKeysDefaultKey,
+				},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// The reconcile aborts on the undelegated secret before recording
+			// the SSH secret reference or creating the managed secret, so the
+			// referenced keys can never surface as authorized_keys.
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
+				s := &corev1.Secret{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshSecretName(env)), s))).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})
@@ -480,8 +519,12 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteGateway()
 
 			keys := &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{Name: "de-routes-keys", Namespace: testNamespace},
-				Data:       map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "de-routes-keys",
+					Namespace: testNamespace,
+					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+				},
+				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -594,6 +637,73 @@ var _ = Describe("DevEnvironment controller", func() {
 				got1 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env1.Name), got1)).To(Succeed())
 				g.Expect(sshEndpointPort(got1.Status.Endpoints)).To(Equal(p1))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("prunes TCPRoutes for removed exposures and frees the listener port", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-prune")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var pSSH, pGRPC int32
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				pSSH = sshEndpointPort(got.Status.Endpoints)
+				for _, ep := range got.Status.Endpoints {
+					if ep.Name == testGRPCPortName {
+						pGRPC = portFromEndpoint(ep.Address)
+					}
+				}
+				g.Expect(pSSH).To(BeNumerically(">", 0))
+				g.Expect(pGRPC).To(BeNumerically(">", 0))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Drop the extra TCP exposure: the grpc TCPRoute must be deleted
+			// while the SSH route and its port stay stable.
+			got := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			got.Spec.Ports = nil
+			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				tr := &gatewayv1.TCPRoute{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pGRPC), Namespace: env.Namespace}, tr))).To(BeTrue())
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pSSH), Namespace: env.Namespace}, tr)).To(Succeed())
+				got2 := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got2)).To(Succeed())
+				g.Expect(sshEndpointPort(got2.Status.Endpoints)).To(Equal(pSSH))
+				for _, ep := range got2.Status.Endpoints {
+					g.Expect(ep.Name).NotTo(Equal(testGRPCPortName))
+				}
+			}, "15s", "200ms").Should(Succeed())
+
+			// The freed listener port is reusable: a new environment with the
+			// same TCP exposure (and no SSH of its own) takes the released port.
+			env2 := validDevEnvironment("de-prune-b")
+			env2.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
+			}
+			Expect(k8sClient.Create(ctx, env2)).To(Succeed())
+			defer deleteEnv(env2.Name)
+
+			Eventually(func(g Gomega) {
+				got2 := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env2.Name), got2)).To(Succeed())
+				p2 := int32(0)
+				for _, ep := range got2.Status.Endpoints {
+					if ep.Name == testGRPCPortName {
+						p2 = portFromEndpoint(ep.Address)
+					}
+				}
+				g.Expect(p2).To(Equal(pGRPC))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

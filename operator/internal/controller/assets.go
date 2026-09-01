@@ -62,6 +62,14 @@ const (
 	sshAuthorizedKeysKey  = "authorized_keys"
 	sshUserKeysDefaultKey = "keys"
 
+	// devEnvSSHKeysDelegatedLabel marks a Secret that explicitly opts in to being
+	// used as an environment's SSH authorized_keys source. Only a Secret carrying
+	// this label may be referenced by spec.ssh.keysSecret: reading an undelegated
+	// Secret would let an environment creator exfiltrate any same-namespace Secret
+	// through the managed SSH secret that the workload mounts.
+	devEnvSSHKeysDelegatedLabel = "ai.cubestack.io/ssh-keys-delegated"
+	devEnvSSHKeysDelegatedValue = "true"
+
 	// workspaceClaimName is the StatefulSet volumeClaimTemplate name; the
 	// controller creates the PVC <env>-workspace-0 from it (K8s PVC naming:
 	// <sts>-<claim>-<ordinal>).
