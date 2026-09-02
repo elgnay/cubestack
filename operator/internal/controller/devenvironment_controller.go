@@ -196,7 +196,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
 		desired.Status.Endpoints = nil
 		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonBrandMismatch)
-		setReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonBrandMismatch, reason)
+		setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonBrandMismatch, reason)
 		return ctrl.Result{}, r.updateStatusIfChanged(ctx, &env, desired)
 	}
 	setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpuType matches the image brand")
@@ -918,10 +918,10 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 	err := r.Get(ctx, types.NamespacedName{Namespace: cfg.GatewayNamespace, Name: cfg.GatewayName}, gw)
 	switch {
 	case meta.IsNoMatchError(err):
-		setRouteReadyCondition(&status.Conditions, false, reasonGatewayAPINotInstalled, "Gateway API CRDs are not installed")
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayAPINotInstalled, "Gateway API CRDs are not installed")
 		return nil
 	case apierrors.IsNotFound(err):
-		setRouteReadyCondition(&status.Conditions, false, reasonGatewayNotFound, fmt.Sprintf("Gateway %s/%s not found", cfg.GatewayNamespace, cfg.GatewayName))
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotFound, fmt.Sprintf("Gateway %s/%s not found", cfg.GatewayNamespace, cfg.GatewayName))
 		return nil
 	case err != nil:
 		return err
@@ -929,17 +929,17 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 
 	ports, err := r.publishRoutes(ctx, env, gw)
 	if err != nil {
-		setRouteReadyCondition(&status.Conditions, false, reasonRouteCreateFailed, err.Error())
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonRouteCreateFailed, err.Error())
 		return nil
 	}
 
 	gwIP := gatewayIP(gw, cfg)
 	if gwIP == "" {
-		setRouteReadyCondition(&status.Conditions, false, reasonGatewayNotReady, "Gateway has no assigned address")
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotReady, "Gateway has no assigned address")
 		status.Endpoints = nil
 		return nil
 	}
-	setRouteReadyCondition(&status.Conditions, true, reasonPublished, "Routes are published on the gateway")
+	setDevEnvironmentRouteReadyCondition(&status.Conditions, true, reasonPublished, "Routes are published on the gateway")
 	r.buildEndpoints(env, status, gwIP, ports)
 	return nil
 }
@@ -1418,9 +1418,9 @@ func (r *DevEnvironmentReconciler) setStorageReadyCondition(ctx context.Context,
 	return nil
 }
 
-// setRouteReadyCondition sets the RouteReady condition from the gateway
+// setDevEnvironmentRouteReadyCondition sets the RouteReady condition from the gateway
 // publish outcome.
-func setRouteReadyCondition(conditions *[]metav1.Condition, ready bool, reason, message string) {
+func setDevEnvironmentRouteReadyCondition(conditions *[]metav1.Condition, ready bool, reason, message string) {
 	status := metav1.ConditionTrue
 	if !ready {
 		status = metav1.ConditionFalse
@@ -1430,8 +1430,8 @@ func setRouteReadyCondition(conditions *[]metav1.Condition, ready bool, reason, 
 	})
 }
 
-// setReadyCondition sets the Ready condition.
-func setReadyCondition(conditions *[]metav1.Condition, status metav1.ConditionStatus, reason, message string) {
+// setDevEnvironmentReadyCondition sets the Ready condition.
+func setDevEnvironmentReadyCondition(conditions *[]metav1.Condition, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(conditions, metav1.Condition{
 		Type: aiv1alpha1.ConditionReady, Status: status, Reason: reason, Message: message,
 	})
@@ -1443,26 +1443,26 @@ func (r *DevEnvironmentReconciler) setPhaseAndReady(env *aiv1alpha1.DevEnvironme
 	switch {
 	case !env.Spec.Running:
 		setPhase(status, aiv1alpha1.PhaseStopped, reasonStopped)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonStopped, "Environment is stopped (running=false)")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonStopped, "Environment is stopped (running=false)")
 	case pod == nil:
 		setPhase(status, aiv1alpha1.PhasePending, reasonPending)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "The environment pod has not been created yet")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "The environment pod has not been created yet")
 	case pod.Spec.NodeName == "":
 		setPhase(status, aiv1alpha1.PhasePending, reasonPending)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "The environment pod is not scheduled to a node yet")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "The environment pod is not scheduled to a node yet")
 	case podFailed(pod):
 		reason := failedReason(pod)
 		setPhase(status, aiv1alpha1.PhaseFailed, reason)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reason, fmt.Sprintf("Environment failed: %s", reason))
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reason, fmt.Sprintf("Environment failed: %s", reason))
 	case pod.Status.Phase == corev1.PodRunning && podReady(pod):
 		setPhase(status, aiv1alpha1.PhaseRunning, reasonRunning)
-		setReadyCondition(&status.Conditions, metav1.ConditionTrue, reasonRunning, "Environment is running and ready")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionTrue, reasonRunning, "Environment is running and ready")
 	case pod.Status.Phase == corev1.PodRunning:
 		setPhase(status, aiv1alpha1.PhaseRunning, reasonRunning)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonRunning, "Environment pod is running but not ready")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonRunning, "Environment pod is running but not ready")
 	default:
 		setPhase(status, aiv1alpha1.PhasePending, reasonPending)
-		setReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "Environment pod is being created")
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "Environment pod is being created")
 	}
 }
 

@@ -36,14 +36,14 @@ import (
 )
 
 const (
-	testDevImage        = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
-	testDevStorageClass = "ceph-rbd"
-	testGPUResource     = "nvidia.com/gpu"
-	testGatewayName     = "test-gw"
-	testGatewayIP       = "1.2.3.4"
-	testGRPCPortName    = "grpc"
-	testJupyterName     = "jupyter"
-	testUserSSHKey      = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	testDevImage          = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
+	testDevStorageClass   = "ceph-rbd"
+	testGPUResource       = "nvidia.com/gpu"
+	testDevEnvGatewayName = "test-gw"
+	testGatewayIP         = "1.2.3.4"
+	testGRPCPortName      = "grpc"
+	testJupyterName       = "jupyter"
+	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 )
 
 // webRootPath is the published web path prefix for environments in the test
@@ -85,7 +85,7 @@ func deleteEnv(name string) {
 }
 
 func deleteGateway() {
-	_ = k8sClient.Delete(ctx, &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: testGatewayName, Namespace: testNamespace}})
+	_ = k8sClient.Delete(ctx, &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace}})
 }
 
 // createStatefulPod fabricates the ordinal-0 pod that a real scheduler and
@@ -149,7 +149,7 @@ func createBoundPVC(env *aiv1alpha1.DevEnvironment) {
 // status address (a real controller would assign it).
 func createGateway(withAddress bool) {
 	gw := &gatewayv1.Gateway{
-		ObjectMeta: metav1.ObjectMeta{Name: testGatewayName, Namespace: testNamespace},
+		ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace},
 		Spec: gatewayv1.GatewaySpec{
 			GatewayClassName: gatewayv1.ObjectName("eg"),
 			Listeners: []gatewayv1.Listener{{
@@ -583,7 +583,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "de-foreign-web", Namespace: testNamespace, Labels: map[string]string{devEnvironmentLabelKey: envName}},
 				Spec: gatewayv1.HTTPRouteSpec{
 					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
-						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testGatewayName)},
+						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testDevEnvGatewayName)},
 					}},
 					Rules: []gatewayv1.HTTPRouteRule{{BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: gatewayv1.BackendRef{
 						BackendObjectReference: gatewayv1.BackendObjectReference{Name: gatewayv1.ObjectName("some-svc"), Port: ptrTo(gatewayv1.PortNumber(8080))},
@@ -595,7 +595,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				ObjectMeta: metav1.ObjectMeta{Name: "de-foreign-tcp-9999", Namespace: testNamespace, Labels: map[string]string{devEnvironmentLabelKey: envName}},
 				Spec: gatewayv1.TCPRouteSpec{
 					CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
-						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testGatewayName)},
+						{Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)), Kind: ptrTo(gatewayv1.Kind(gatewayKind)), Namespace: ptrTo(gatewayv1.Namespace(testNamespace)), Name: gatewayv1.ObjectName(testDevEnvGatewayName)},
 					}},
 					Rules: []gatewayv1.TCPRouteRule{{BackendRefs: []gatewayv1.BackendRef{{
 						BackendObjectReference: gatewayv1.BackendObjectReference{Name: gatewayv1.ObjectName("some-svc"), Port: ptrTo(gatewayv1.PortNumber(8080))},
@@ -688,7 +688,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: env.Name + "-web", Namespace: env.Namespace}, route)).To(Succeed())
 				g.Expect(route.Spec.ParentRefs).To(HaveLen(1))
-				g.Expect(string(route.Spec.ParentRefs[0].Name)).To(Equal(testGatewayName))
+				g.Expect(string(route.Spec.ParentRefs[0].Name)).To(Equal(testDevEnvGatewayName))
 				g.Expect(route.Spec.Rules).To(HaveLen(2))
 				g.Expect(route.Spec.Rules[0].Matches).To(HaveLen(1))
 				g.Expect(route.Spec.Rules[0].Matches[0].Path.Value).To(Equal(ptrTo(webRootPath + env.Name + "/")))
@@ -831,7 +831,7 @@ var _ = Describe("DevEnvironment controller", func() {
 		})
 
 		It("degrades RouteReady when the Gateway is missing", func() {
-			gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: testGatewayName, Namespace: testNamespace}}
+			gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace}}
 			if err := k8sClient.Get(ctx, client.ObjectKeyFromObject(gw), gw); err == nil {
 				Expect(k8sClient.Delete(ctx, gw)).To(Succeed())
 			}
@@ -875,7 +875,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 		It("brackets an IPv6 gateway address in published endpoints", func() {
 			gw := &gatewayv1.Gateway{
-				ObjectMeta: metav1.ObjectMeta{Name: testGatewayName, Namespace: testNamespace},
+				ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace},
 				Spec: gatewayv1.GatewaySpec{
 					GatewayClassName: gatewayv1.ObjectName("eg"),
 					Listeners: []gatewayv1.Listener{{
