@@ -23,6 +23,7 @@ limitations under the License.
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 
 package controller
 
@@ -47,6 +48,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -62,13 +64,22 @@ import (
 type InferenceServiceReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
+	// GatewayDomain is the platform domain; the public hostname of a published
+	// service is <modelName>.<GatewayDomain> (design §3.3).
+	GatewayDomain string
+	// GatewayName and GatewayNamespace select the platform Gateway the
+	// HTTPRoutes of published services attach to.
+	GatewayName      string
+	GatewayNamespace string
 }
 
 // Reconcile runs the render pipeline's generation steps (design §4.1 steps
-// 1–4): resolve the references, render the templates, provision the asset
-// ConfigMaps and the model PVC, and apply the Services and workloads of every
-// role with dependency gating, reporting the Resolved, Rendered, Provisioned
-// and WorkloadsApplied conditions in status.
+// 1–7): resolve the references, render the templates, provision the asset
+// ConfigMaps and the model PVC, apply the Services and workloads of every
+// role with dependency gating, check the internal endpoint, publish the
+// public route and aggregate Ready/Progressing — reporting the Resolved,
+// Rendered, Provisioned, WorkloadsApplied, EndpointReady, RouteReady, Ready
+// and Progressing conditions in status.
 func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var isvc aiv1alpha1.InferenceService
 	if err := r.Get(ctx, req.NamespacedName, &isvc); err != nil {
@@ -86,10 +97,12 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	desired := isvc.DeepCopy()
 	desired.Status.ObservedGeneration = isvc.Generation
 	// The audit echo reflects only a fully provisioned state: it is cleared
-	// here and filled after every provisioning step succeeds. The role echo
-	// follows the same rule — it is filled only after a successful apply.
+	// here and filled after every provisioning step succeeds. The role and
+	// endpoint echoes follow the same rule — they are filled only after a
+	// successful apply (the endpoint by the convergence steps).
 	desired.Status.Assets = nil
 	desired.Status.Roles = nil
+	desired.Status.Endpoint = nil
 	setResolvedCondition(&desired.Status.Conditions, resolved)
 	if resolved.profile != nil {
 		desired.Status.Profile = &aiv1alpha1.ProfileStatus{Name: resolved.profile.Name}
@@ -112,10 +125,18 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	}
 
 	if !resolved.resolved() {
-		// A stale Rendered from a previous spec must not persist.
+		// A stale Rendered from a previous spec must not persist, and the
+		// convergence conditions whose checks need the resolved references
+		// (endpoint role, route profile) cannot be verified — they are removed
+		// alongside the Status.Endpoint echo (line 104). Ready is kept: it
+		// reflects the running deployment (design §3.3).
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRendered)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionProvisioned)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionWorkloadsApplied)
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionEndpointReady)
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+		// Nothing is being applied: a stale True/Rollout must not linger.
+		setProgressingCondition(&desired.Status.Conditions, nil, "")
 		return ctrl.Result{}, r.updateStatusIfChanged(ctx, &isvc, desired)
 	}
 
@@ -176,11 +197,40 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 			desired.Status.Profile.Revision = rev
 			setWorkloadsAppliedCondition(&desired.Status.Conditions, "", nil)
 		}
+
+		// Convergence steps (design §4.1 steps 5-7): endpoint reachability,
+		// route publish, and the Ready/Progressing aggregation. Failures here
+		// only set their own condition and never block the other aggregates.
+		endpoint, err := r.checkEndpoint(ctx, desired, resolved.profile)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		setEndpointReadyCondition(&desired.Status.Conditions, endpoint)
+		desired.Status.Endpoint = &aiv1alpha1.EndpointStatus{Internal: endpoint.Internal}
+
+		hostname := publicHostname(desired, r.GatewayDomain)
+		route, err := r.checkRoute(ctx, desired, resolved.profile, endpoint, hostname)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		setRouteReadyCondition(&desired.Status.Conditions, route)
+		if hostname != "" && route.Reason == "" {
+			desired.Status.Endpoint.Public = "https://" + hostname
+		}
+
+		setReadyCondition(&desired.Status.Conditions, rolesStatus)
+		setProgressingCondition(&desired.Status.Conditions, rolesStatus, applyRes.Progressing)
 	} else {
-		// A stale Provisioned from a previous spec must not persist when the
-		// current spec no longer renders.
+		// A stale Provisioned — and the applied-result conditions, whose steps
+		// only run on a successful render+apply — must not persist when the
+		// current spec no longer renders. Ready is kept: it reflects the
+		// running deployment (design §3.3 "Ready 继续反映当前部署的实际状态"),
+		// and Progressing is set to Converged — nothing is being applied.
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionProvisioned)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionWorkloadsApplied)
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionEndpointReady)
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+		setProgressingCondition(&desired.Status.Conditions, nil, "")
 	}
 
 	return ctrl.Result{}, r.updateStatusIfChanged(ctx, &isvc, desired)
@@ -216,6 +266,8 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 			handler.EnqueueRequestsFromMapFunc(r.enqueueForSourceConfigMap)).
 		Watches(&leaderworkersetv1.LeaderWorkerSet{},
 			handler.EnqueueRequestsFromMapFunc(r.enqueueForOwnedLWS)).
+		Watches(&gatewayv1.HTTPRoute{},
+			handler.EnqueueRequestsFromMapFunc(r.enqueueForOwnedHTTPRoute)).
 		Complete(r)
 }
 
@@ -232,6 +284,18 @@ func (r *InferenceServiceReconciler) enqueueReferencingServices(ctx context.Cont
 		return nil
 	}
 	return r.referencingServices(ctx, indexKey, ref)
+}
+
+// enqueueForOwnedHTTPRoute maps an HTTPRoute to the InferenceService owning
+// it: gateway acceptance writes to the route status and external deletions or
+// edits must re-trigger the reconcile so RouteReady and the route object
+// recover promptly.
+func (r *InferenceServiceReconciler) enqueueForOwnedHTTPRoute(ctx context.Context, obj client.Object) []reconcile.Request {
+	route := obj.(*gatewayv1.HTTPRoute)
+	if owner := metav1.GetControllerOf(route); owner != nil && isInferenceServiceOwner(owner) {
+		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: route.Namespace, Name: owner.Name}}}
+	}
+	return nil
 }
 
 // enqueueForSourceConfigMap maps a ConfigMap in cubestack-system to the
@@ -256,10 +320,18 @@ func (r *InferenceServiceReconciler) enqueueForSourceConfigMap(ctx context.Conte
 // enqueueForOwnedLWS maps a LeaderWorkerSet to the InferenceService owning it.
 func (r *InferenceServiceReconciler) enqueueForOwnedLWS(ctx context.Context, obj client.Object) []reconcile.Request {
 	lws := obj.(*leaderworkersetv1.LeaderWorkerSet)
-	if owner := metav1.GetControllerOf(lws); owner != nil && owner.Kind == "InferenceService" {
+	if owner := metav1.GetControllerOf(lws); owner != nil && isInferenceServiceOwner(owner) {
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: lws.Namespace, Name: owner.Name}}}
 	}
 	return nil
+}
+
+// isInferenceServiceOwner reports whether the owner reference points at an
+// InferenceService of this API group — the Kind alone is not enough: a
+// controller owner of the same Kind from another group must not be treated as
+// one of our services.
+func isInferenceServiceOwner(owner *metav1.OwnerReference) bool {
+	return owner.Kind == inferenceServiceKind && owner.APIVersion == aiv1alpha1.GroupVersion.String()
 }
 
 // referencingServices lists the InferenceServices whose spec field (via the
@@ -281,6 +353,10 @@ func (r *InferenceServiceReconciler) referencingServices(ctx context.Context, in
 // deprecatedLabelKey marks an InferenceRuntimeProfile as deprecated; services
 // referencing one report the ProfileDeprecated warning condition.
 const deprecatedLabelKey = "ai.cubestack.io/deprecated"
+
+// inferenceServiceKind is the Kind of the owner-reference lookups of the
+// owned-resource watches (LWS, HTTPRoute).
+const inferenceServiceKind = "InferenceService"
 
 // setRenderedCondition sets the Rendered condition from the render outcome.
 // The reason is the first failure; the message aggregates all failures.
