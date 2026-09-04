@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -632,6 +633,83 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignSvc), foreignSvc)).To(Succeed())
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignHTTP), foreignHTTP)).To(Succeed())
 			Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignTCP), foreignTCP)).To(Succeed())
+		})
+	})
+
+	Context("legacy StatefulSet with an RWO workspace claim", func() {
+		// A DevEnvironment whose StatefulSet was created before the platform
+		// pinned the workspace claim (ReadWriteOnce, no StorageClassName) must
+		// stay updatable after an operator upgrade: spec.volumeClaimTemplates is
+		// immutable, so the controller preserves the stored claim and applies
+		// pod-template/replica changes around it instead of wedging the
+		// environment on an immutability error (design §7.2).
+		It("keeps the existing claim template and updates the pod template", func() {
+			const mismatchedImage = "harbor.local/ai-images/base-maca:1.0"
+
+			env := validDevEnvironment("de-legacy-claim")
+			// Seed the environment brand-mismatched so the live reconciler does
+			// not race this spec into creating its own StatefulSet: while the
+			// brand gate fails, nothing is provisioned, so the legacy StatefulSet
+			// seeded below is left in place.
+			env.Spec.Image = mismatchedImage
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			legacySTS := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      env.Name,
+					Namespace: env.Namespace,
+					Labels:    map[string]string{devEnvironmentLabelKey: env.Name},
+					Annotations: map[string]string{
+						stsSpecHashAnnotationKey: stsSpecHash(env),
+					},
+				},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas:    ptrTo(int32(0)),
+					ServiceName: env.Name,
+					Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{devEnvironmentLabelKey: env.Name}},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: testJupyterName, Image: mismatchedImage}}},
+					},
+					VolumeClaimTemplates: []corev1.PersistentVolumeClaim{{
+						ObjectMeta: metav1.ObjectMeta{Name: workspaceClaimName},
+						Spec: corev1.PersistentVolumeClaimSpec{
+							AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+							Resources: corev1.VolumeResourceRequirements{
+								Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse(env.Spec.Storage.Size)},
+							},
+						},
+					}},
+				},
+			}
+			Expect(controllerutil.SetControllerReference(env, legacySTS, k8sClient.Scheme())).To(Succeed())
+			Expect(k8sClient.Create(ctx, legacySTS)).To(Succeed())
+			createBoundPVC(env)
+
+			// The first post-upgrade drift (a real spec edit) must reconcile:
+			// repair the image and scale back up without touching the immutable
+			// claim template.
+			fresh := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), fresh)).To(Succeed())
+			fresh.Spec.Image = testDevImage
+			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.Replicas).To(Equal(ptrTo(int32(1))))
+				g.Expect(sts.Spec.Template.Spec.Containers[0].Image).To(Equal(testDevImage))
+				// The immutable claim template is preserved as originally created.
+				g.Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(1))
+				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName).To(BeNil())
+			}, "15s", "200ms").Should(Succeed())
+
+			// The retained workspace claim survives the upgrade untouched.
+			pvc := &corev1.PersistentVolumeClaim{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: workspacePVCName(env), Namespace: env.Namespace}, pvc)).To(Succeed())
+			Expect(pvc.Status.Phase).To(Equal(corev1.ClaimBound))
 		})
 	})
 

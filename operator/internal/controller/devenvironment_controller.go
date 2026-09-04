@@ -763,6 +763,13 @@ func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *ai
 		existing.Spec.Replicas != nil && *existing.Spec.Replicas == *sts.Spec.Replicas {
 		return nil
 	}
+	// spec.volumeClaimTemplates is immutable once the StatefulSet exists, so an
+	// update must keep the templates already stored on the object. A StatefulSet
+	// that predates the pinned cephfs-ephemeral/ReadWriteMany workspace claim
+	// keeps its originally-provisioned claim and stays updatable instead of
+	// wedging on an immutability error on the first drift; only newly created
+	// environments get the platform-fixed claim template.
+	sts.Spec.VolumeClaimTemplates = existing.Spec.VolumeClaimTemplates
 	sts.ResourceVersion = existing.ResourceVersion
 	return r.Update(ctx, sts)
 }
