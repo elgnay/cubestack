@@ -37,7 +37,6 @@ import (
 
 const (
 	testDevImage          = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
-	testDevStorageClass   = "ceph-rbd"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
 	testGatewayIP         = "1.2.3.4"
@@ -66,10 +65,9 @@ func validDevEnvironment(name string) *aiv1alpha1.DevEnvironment {
 				Memory:   "64Gi",
 			},
 			Storage: &aiv1alpha1.StorageSpec{
-				Size:             "200Gi",
-				StorageClassName: testDevStorageClass,
-				PVCRetention:     aiv1alpha1.PVCRetentionRetain,
-				MountPath:        "/workspace",
+				Size:         "200Gi",
+				PVCRetention: aiv1alpha1.PVCRetentionRetain,
+				MountPath:    "/workspace",
 			},
 		},
 	}
@@ -127,7 +125,7 @@ func createBoundPVC(env *aiv1alpha1.DevEnvironment) {
 			Labels:    map[string]string{devEnvironmentLabelKey: env.Name},
 		},
 		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteOnce},
+			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
 			Resources: corev1.VolumeResourceRequirements{
 				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("200Gi")},
 			},
@@ -201,7 +199,8 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(c.ReadinessProbe).NotTo(BeNil())
 				g.Expect(sts.Spec.VolumeClaimTemplates).To(HaveLen(1))
 				g.Expect(sts.Spec.VolumeClaimTemplates[0].Name).To(Equal(workspaceClaimName))
-				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
+				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes).To(ContainElement(corev1.ReadWriteMany))
+				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName).To(Equal(ptrTo(workspaceStorageClassName)))
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(metav1.GetControllerOf(sts).UID).To(Equal(env.UID))
