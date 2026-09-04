@@ -48,6 +48,9 @@ const (
 	assetSourceAnnotationKey = "ai.cubestack.io/asset-source"
 	assetHashAnnotationKey   = "ai.cubestack.io/asset-hash"
 
+	// modelVersionLabelKey is used on static PVs for PVC selector binding (design §3.1).
+	modelVersionLabelKey = "ai.cubestack.io/model-version"
+
 	// Labels, finalizer, and SSH secret data keys of the resources created for
 	// a DevEnvironment (design §4.3–4.4, §6.2–6.3).
 	devEnvironmentLabelKey = "ai.cubestack.io/dev-environment"
@@ -208,7 +211,7 @@ func setProvisionedCondition(conditions *[]metav1.Condition, reason string, prov
 			Type:    aiv1alpha1.ConditionProvisioned,
 			Status:  metav1.ConditionTrue,
 			Reason:  "Provisioned",
-			Message: "Rendered asset ConfigMaps and model PVCs are provisioned",
+			Message: "Rendered asset ConfigMaps, model PVCs and S3 credentials copies are provisioned",
 		})
 		return
 	}
