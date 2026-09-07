@@ -37,6 +37,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"net"
@@ -133,6 +134,20 @@ const (
 	sshKeysVolumeName = "ssh-keys"
 	sshEndpointUser   = "user"
 
+	// Jupyter token: the managed Secret <env>-auth holds the random token under
+	// the data key jupyterTokenKey, and the workload reads it through the
+	// JUPYTER_TOKEN env var (design §6.3). The token guards the web path; only
+	// the owner (via the Secret) and the pod know it.
+	jupyterTokenKey = "token"
+	jupyterTokenEnv = "JUPYTER_TOKEN"
+
+	// jupyterTokenRevisionAnnotationKey records a non-sensitive sha256 digest of
+	// the managed Jupyter token on the StatefulSet pod template. JUPYTER_TOKEN
+	// is read from the Secret at container start, so a refilled token must roll
+	// the pod; the digest makes the template (and stsSpecHash) change when the
+	// token is created or refilled without ever putting the plaintext on the pod.
+	jupyterTokenRevisionAnnotationKey = "ai.cubestack.io/jupyter-token-revision"
+
 	// compute node pool labels: development pods are pinned to the compute
 	// pool, isolated from the inference pool (design §8.1).
 	computeNodePoolLabelKey = "cubestack.io/node-pool"
@@ -213,6 +228,25 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		desired.Status.SSHKeysSecret = nil
 	}
 
+	// 2b. Jupyter token secret: a random per-environment token guarding the web
+	// path, injected into the workload as JUPYTER_TOKEN (design §6.3). It is
+	// reconciled before the core resources so a pod never references a missing
+	// Secret.
+	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
+		digest, err := r.reconcileJupyterAuthSecret(ctx, &env)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		// Carry the token revision to applyStatefulSet below. env is re-fetched
+		// every reconcile and only its status is persisted, so this in-memory
+		// annotation never lands on the DevEnvironment object; it only drives the
+		// pod-template annotation and stsSpecHash (see desiredStatefulSet).
+		if env.Annotations == nil {
+			env.Annotations = map[string]string{}
+		}
+		env.Annotations[jupyterTokenRevisionAnnotationKey] = digest
+	}
+
 	// 3. Core resources.
 	if err := r.applyService(ctx, &env); err != nil {
 		return ctrl.Result{}, err
@@ -285,6 +319,7 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshSecretName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: authSecretName(env), Namespace: env.Namespace}},
 	} {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -386,6 +421,7 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Secret{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvKeysSecret)).
 		Watches(&aiv1alpha1.DevEnvironment{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
 	if gatewayAPICRDsInstalled(mgr) {
 		builder.Owns(&gatewayv1.HTTPRoute{}).
@@ -414,6 +450,29 @@ func (r *DevEnvironmentReconciler) enqueueAllDevEnvironments(ctx context.Context
 	}
 	reqs := make([]reconcile.Request, 0, len(list.Items))
 	for _, env := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: env.Namespace, Name: env.Name}})
+	}
+	return reqs
+}
+
+// enqueueForDevEnvKeysSecret maps a Secret to the DevEnvironments that reference
+// it as their authorized_keys source (spec.ssh.keysSecret): rotating the user
+// keys Secret re-reconciles the referencing environment so the managed SSH
+// secret's authorized_keys content refreshes. The reference is same-namespace
+// (corev1.SecretKeySelector), so Secrets in other namespaces short-circuit
+// cheaply.
+func (r *DevEnvironmentReconciler) enqueueForDevEnvKeysSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+	secret := obj.(*corev1.Secret)
+	list := &aiv1alpha1.DevEnvironmentList{}
+	if err := r.List(ctx, list, client.InNamespace(secret.Namespace)); err != nil {
+		return nil
+	}
+	reqs := make([]reconcile.Request, 0)
+	for i := range list.Items {
+		env := &list.Items[i]
+		if env.Spec.SSH == nil || env.Spec.SSH.KeysSecret == nil || env.Spec.SSH.KeysSecret.Name != secret.Name {
+			continue
+		}
 		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: env.Namespace, Name: env.Name}})
 	}
 	return reqs
@@ -516,6 +575,25 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 	}
 }
 
+// jupyterTokenPodAnnotations returns the pod-template annotations derived from
+// env for a jupyter environment: a non-sensitive sha256 digest of the managed
+// token carried from reconcileJupyterAuthSecret via env.Annotations (in-memory
+// only, never persisted on the DevEnvironment). Because JUPYTER_TOKEN is read
+// from the Secret at container start, putting the digest on the pod template
+// changes the template (and stsSpecHash) when the token is created or refilled,
+// so applyStatefulSet rolls the workload onto the new token. The digest reveals
+// nothing about the token itself, so no plaintext ever reaches the pod.
+func jupyterTokenPodAnnotations(env *aiv1alpha1.DevEnvironment) map[string]string {
+	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeJupyter {
+		return nil
+	}
+	rev := env.Annotations[jupyterTokenRevisionAnnotationKey]
+	if rev == "" {
+		return nil
+	}
+	return map[string]string{jupyterTokenRevisionAnnotationKey: rev}
+}
+
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
 // spec.running, the workspace volumeClaimTemplate, and PVC retention so the
 // workspace data survives stop and delete (the finalizer removes it only when
@@ -532,7 +610,7 @@ func (r *DevEnvironmentReconciler) desiredStatefulSet(env *aiv1alpha1.DevEnviron
 			Replicas:    &replicas,
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: r.envLabels(env.Name)},
+				ObjectMeta: metav1.ObjectMeta{Labels: r.envLabels(env.Name), Annotations: jupyterTokenPodAnnotations(env)},
 				Spec:       r.desiredPodSpec(env),
 			},
 			VolumeClaimTemplates: r.desiredVolumeClaimTemplates(env),
@@ -557,11 +635,31 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(mainPort)}},
 		},
 	}
+	var envVars []corev1.EnvVar
 	if env.Spec.Runtime != nil {
 		container.Command = env.Spec.Runtime.Command
 		container.Args = env.Spec.Runtime.Args
-		container.Env = env.Spec.Runtime.Env
+		// Copy the user env list: the token injection below must not alias (and
+		// thereby mutate) the env list stored on the cached spec.
+		envVars = append(envVars, env.Spec.Runtime.Env...)
 	}
+	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
+		// JUPYTER_TOKEN is controller-managed: the random token lives in the
+		// <env>-auth Secret surfaced to the owner, so a user-supplied entry is
+		// dropped and the injected secretKeyRef always wins (a user override
+		// would bypass the token the owner is told about).
+		envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == jupyterTokenEnv })
+		envVars = append(envVars, corev1.EnvVar{
+			Name: jupyterTokenEnv,
+			ValueFrom: &corev1.EnvVarSource{
+				SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: authSecretName(env)},
+					Key:                  jupyterTokenKey,
+				},
+			},
+		})
+	}
+	container.Env = envVars
 	if env.Spec.Storage != nil {
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
 			Name: workspaceClaimName, MountPath: env.Spec.Storage.MountPath,
@@ -775,7 +873,10 @@ func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *ai
 }
 
 // stsSpecHash hashes the pod-template-affecting fields so applyStatefulSet can
-// detect template changes without comparing server-defaulted fields.
+// detect template changes without comparing server-defaulted fields. It mirrors
+// the pod template exactly: in particular it includes the Jupyter token revision
+// (see jupyterTokenPodAnnotations), so creating or refilling a token changes the
+// hash and applyStatefulSet issues an update that rolls the workload.
 func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 	type templateInput struct {
 		Type       aiv1alpha1.DevEnvironmentType
@@ -785,16 +886,23 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		Storage    *aiv1alpha1.StorageSpec
 		Volumes    []aiv1alpha1.VolumeMount
 		SSHExposed bool
+		// JupyterTokenRevision is the digest carried on the pod template for a
+		// jupyter environment ("" otherwise): introducing the JUPYTER_TOKEN env
+		// var plus its revision rolls existing StatefulSets once on upgrade, and
+		// a later token refill rolls them again. The plaintext never enters the
+		// hash input, only its non-sensitive digest.
+		JupyterTokenRevision string
 	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
-		Type:       env.Spec.Type,
-		Image:      env.Spec.Image,
-		Resources:  env.Spec.Resources,
-		Runtime:    env.Spec.Runtime,
-		Storage:    env.Spec.Storage,
-		Volumes:    env.Spec.Volumes,
-		SSHExposed: sshExposed(env),
+		Type:                 env.Spec.Type,
+		Image:                env.Spec.Image,
+		Resources:            env.Spec.Resources,
+		Runtime:              env.Spec.Runtime,
+		Storage:              env.Spec.Storage,
+		Volumes:              env.Spec.Volumes,
+		SSHExposed:           sshExposed(env),
+		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
@@ -851,6 +959,87 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *
 
 func sshSecretName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-ssh-keys"
+}
+
+// authSecretName is the name of the managed Jupyter token Secret <env>-auth.
+func authSecretName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + "-auth"
+}
+
+// reconcileJupyterAuthSecret creates or updates the managed Jupyter token Secret
+// <env>-auth (design §6.3): a random token generated once under the data key
+// jupyterTokenKey. The token is never rotated — an existing non-empty token is
+// kept so the surfaced token stays valid — but a missing or emptied key is
+// refilled so the workload's JUPYTER_TOKEN env var always resolves. The Secret
+// is removed together with the environment in cleanup.
+//
+// It returns the non-sensitive digest of the token in effect (created, refilled,
+// or already present) so the caller can record a token revision on the pod
+// template: JUPYTER_TOKEN is read at container start, so a refill must roll the
+// workload for the new token to take effect (see stsSpecHash).
+func (r *DevEnvironmentReconciler) reconcileJupyterAuthSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (string, error) {
+	name := authSecretName(env)
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
+	if apierrors.IsNotFound(err) {
+		token, err := generateJupyterToken()
+		if err != nil {
+			return "", err
+		}
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
+			Type:       corev1.SecretTypeOpaque,
+			Data:       map[string][]byte{jupyterTokenKey: []byte(token)},
+		}
+		if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
+			return "", err
+		}
+		if err := r.Create(ctx, desired); err != nil {
+			return "", err
+		}
+		return jupyterTokenDigest(token), nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if err := ensureDevEnvOwned(secret, env); err != nil {
+		return "", err
+	}
+	if len(secret.Data[jupyterTokenKey]) == 0 {
+		token, err := generateJupyterToken()
+		if err != nil {
+			return "", err
+		}
+		if secret.Data == nil {
+			secret.Data = map[string][]byte{}
+		}
+		secret.Data[jupyterTokenKey] = []byte(token)
+		if err := r.Update(ctx, secret); err != nil {
+			return "", err
+		}
+		return jupyterTokenDigest(token), nil
+	}
+	return jupyterTokenDigest(string(secret.Data[jupyterTokenKey])), nil
+}
+
+// jupyterTokenDigest hashes the token so a non-sensitive revision can be
+// recorded on the pod template: a sha256 of a random 128-bit token reveals
+// nothing that could recover the token, while still changing whenever the token
+// changes so the workload rolls onto the new token.
+func jupyterTokenDigest(token string) string {
+	h := sha256.New()
+	h.Write([]byte(token))
+	return fmt.Sprintf("sha256:%x", h.Sum(nil))
+}
+
+// generateJupyterToken returns a random 32-hex-char token for the managed
+// Jupyter auth Secret.
+func generateJupyterToken() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
 }
 
 // userAuthorizedKeys reads the multi-line public keys from spec.ssh.keysSecret
