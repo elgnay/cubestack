@@ -38,6 +38,7 @@ import (
 
 const (
 	testDevImage          = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
+	testMismatchImage     = "harbor.local/ai-images/base-maca:1.0"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
 	testGatewayIP         = "1.2.3.4"
@@ -90,7 +91,7 @@ func deleteGateway() {
 // createStatefulPod fabricates the ordinal-0 pod that a real scheduler and
 // kubelet would create for the environment. The pod's name and labels match
 // what the controller looks up, so the fabricated status drives the phase.
-func createStatefulPod(env *aiv1alpha1.DevEnvironment, nodeName string, phase corev1.PodPhase, ready bool, waiting *corev1.ContainerStateWaiting) {
+func createStatefulPod(env *aiv1alpha1.DevEnvironment, ready bool, waiting *corev1.ContainerStateWaiting) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      podName(env),
@@ -98,12 +99,12 @@ func createStatefulPod(env *aiv1alpha1.DevEnvironment, nodeName string, phase co
 			Labels:    map[string]string{devEnvironmentLabelKey: env.Name},
 		},
 		Spec: corev1.PodSpec{
-			NodeName:   nodeName,
+			NodeName:   "node-a",
 			Containers: []corev1.Container{{Name: testJupyterName, Image: testDevImage}},
 		},
 	}
 	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
-	pod.Status.Phase = phase
+	pod.Status.Phase = corev1.PodRunning
 	if ready {
 		pod.Status.Conditions = []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}}
 	}
@@ -174,6 +175,24 @@ func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
 	return 0
 }
 
+// listEventsForEnv returns the core/v1 Events recorded for the named
+// DevEnvironment with the given reason. Events accumulate in the test namespace
+// across specs under the shared manager, so assertions always filter by the
+// unique environment name rather than global counts.
+func listEventsForEnv(name, reason string) []corev1.Event {
+	var evts corev1.EventList
+	if err := k8sClient.List(ctx, &evts, client.InNamespace(testNamespace)); err != nil {
+		return nil
+	}
+	out := []corev1.Event{}
+	for _, e := range evts.Items {
+		if e.InvolvedObject.Name == name && e.InvolvedObject.Kind == "DevEnvironment" && e.Reason == reason {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 var _ = Describe("DevEnvironment resource helpers", func() {
 	Describe("generateJupyterToken", func() {
 		It("returns distinct non-empty 32-hex tokens", func() {
@@ -225,6 +244,52 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			env := envWithSSHEndpoint(0)
 			env.Status.Endpoints = nil
 			Expect(r.allocatePort(env, sshPortName, used(20000, 20001, 20002))).To(Equal(int32(0)))
+		})
+	})
+
+	Describe("setPhase", func() {
+		It("keeps LastTransitionTime stable while the phase name is unchanged", func() {
+			status := &aiv1alpha1.DevEnvironmentStatus{}
+			setPhase(status, aiv1alpha1.PhasePending, reasonPending)
+			first := status.Phase.LastTransitionTime
+
+			setPhase(status, aiv1alpha1.PhasePending, reasonNotScheduled)
+
+			Expect(status.Phase.LastTransitionTime).To(BeIdenticalTo(first))
+			Expect(status.Phase.Reason).To(Equal(reasonNotScheduled))
+		})
+
+		It("bumps LastTransitionTime when the phase name changes", func() {
+			status := &aiv1alpha1.DevEnvironmentStatus{}
+			setPhase(status, aiv1alpha1.PhasePending, reasonPending)
+			first := status.Phase.LastTransitionTime
+
+			setPhase(status, aiv1alpha1.PhaseRunning, reasonRunning)
+
+			Expect(status.Phase.LastTransitionTime).NotTo(BeIdenticalTo(first))
+			Expect(status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+		})
+	})
+
+	Describe("condition helper idempotency", func() {
+		It("preserves LastTransitionTime when an unchanged condition is re-set", func() {
+			conditions := []metav1.Condition{}
+			setDevEnvironmentReadyCondition(&conditions, metav1.ConditionTrue, reasonRunning, "ready")
+			first := meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime
+
+			setDevEnvironmentReadyCondition(&conditions, metav1.ConditionTrue, reasonRunning, "ready")
+
+			Expect(meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime).To(Equal(first))
+		})
+
+		It("updates LastTransitionTime only when the condition status flips", func() {
+			conditions := []metav1.Condition{}
+			setDevEnvironmentReadyCondition(&conditions, metav1.ConditionTrue, reasonRunning, "ready")
+			first := meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime
+
+			setDevEnvironmentReadyCondition(&conditions, metav1.ConditionFalse, reasonStopped, "stopped")
+
+			Expect(meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime).NotTo(Equal(first))
 		})
 	})
 })
@@ -335,7 +400,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
-			createStatefulPod(env, "node-a", corev1.PodRunning, true, nil)
+			createStatefulPod(env, true, nil)
 			// The synthetic pod has no owner reference, so deleteEnv cannot
 			// remove it; clean it up here so it does not leak into later specs.
 			defer func() {
@@ -454,7 +519,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env := validDevEnvironment("de-phase-running")
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
-			createStatefulPod(env, "node-a", corev1.PodRunning, true, nil)
+			createStatefulPod(env, true, nil)
 			createBoundPVC(env)
 
 			Eventually(func(g Gomega) {
@@ -471,7 +536,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env := validDevEnvironment("de-phase-failed")
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
-			createStatefulPod(env, "node-a", corev1.PodRunning, false,
+			createStatefulPod(env, false,
 				&corev1.ContainerStateWaiting{Reason: "CrashLoopBackOff", Message: "back-off"})
 
 			Eventually(func(g Gomega) {
@@ -481,6 +546,133 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
 				g.Expect(got.Status.Phase.Reason).To(Equal(crashLoopBackOff))
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("reports Running but not Ready while the pod runs without passing readiness", func() {
+			env := validDevEnvironment("de-phase-running-unready")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+			createStatefulPod(env, false, nil)
+			defer func() {
+				_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName(env), Namespace: env.Namespace}})
+			}()
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+		})
+	})
+
+	Context("status generation", func() {
+		It("tracks observedGeneration and re-derives status after a spec change", func() {
+			env := validDevEnvironment("de-gen")
+			env.Spec.Running = false
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseStopped))
+			}, "15s", "200ms").Should(Succeed())
+
+			// A spec edit bumps metadata.generation; the status is re-derived for
+			// the new generation (observedGeneration catches up), never left stale.
+			Eventually(func(g Gomega) {
+				cur := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), cur)).To(Succeed())
+				cur.Spec.Running = true
+				g.Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+			}, "15s", "200ms").Should(Succeed())
+		})
+	})
+
+	Context("lifecycle events", func() {
+		It("records a Created event on adoption and a Started event on running", func() {
+			env := validDevEnvironment("de-ev-start")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				g.Expect(listEventsForEnv(env.Name, eventReasonCreated)).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			createStatefulPod(env, true, nil)
+			defer func() {
+				_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName(env), Namespace: env.Namespace}})
+			}()
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+				g.Expect(listEventsForEnv(env.Name, eventReasonStarted)).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("records a Stopped event when running is set to false", func() {
+			env := validDevEnvironment("de-ev-stop")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+			createStatefulPod(env, true, nil)
+			defer func() {
+				_ = k8sClient.Delete(ctx, &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: podName(env), Namespace: env.Namespace}})
+			}()
+
+			// Converge to Running first, so the later stop is a real transition.
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+			}, "15s", "200ms").Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				cur := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), cur)).To(Succeed())
+				cur.Spec.Running = false
+				g.Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseStopped))
+				g.Expect(listEventsForEnv(env.Name, eventReasonStopped)).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("records a Warning Failed event on a gpuType/image brand mismatch", func() {
+			env := validDevEnvironment("de-ev-fail")
+			env.Spec.Image = testMismatchImage
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				evts := listEventsForEnv(env.Name, eventReasonFailed)
+				g.Expect(evts).NotTo(BeEmpty())
+				g.Expect(evts[0].Type).To(Equal(corev1.EventTypeWarning))
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})
