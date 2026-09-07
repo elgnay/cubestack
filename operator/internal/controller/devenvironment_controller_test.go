@@ -679,6 +679,20 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(string(s.Data[jupyterTokenKey])).To(Equal(original))
 			}, "2s", "200ms").Should(Succeed())
 
+			// Capture the pod-template token revision and STS spec hash while the
+			// original token is in effect, so a later refill can be proven to roll
+			// the workload onto the new token.
+			var hashBefore string
+			Eventually(func(g Gomega) {
+				gotSTS := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), gotSTS)).To(Succeed())
+				// JUPYTER_TOKEN is read at container start, so the pod template
+				// records a non-sensitive digest of the token in effect.
+				g.Expect(gotSTS.Spec.Template.Annotations[jupyterTokenRevisionAnnotationKey]).To(Equal(jupyterTokenDigest(original)))
+				hashBefore = gotSTS.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(hashBefore).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
 			// An emptied key is refilled with a fresh token rather than left
 			// empty, so the workload's JUPYTER_TOKEN env always resolves.
 			s := &corev1.Secret{}
@@ -692,6 +706,19 @@ var _ = Describe("DevEnvironment controller", func() {
 				val := string(freshSecret.Data[jupyterTokenKey])
 				g.Expect(val).To(HaveLen(32))
 				g.Expect(val).NotTo(Equal(original))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The refill must roll the workload: the pod template's token revision
+			// becomes the digest of the new token and the STS spec hash changes, so
+			// applyStatefulSet updates the template and a StatefulSet controller
+			// restarts the pod onto the refilled JUPYTER_TOKEN.
+			Eventually(func(g Gomega) {
+				gotSTS := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), gotSTS)).To(Succeed())
+				freshSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), freshSecret)).To(Succeed())
+				g.Expect(gotSTS.Spec.Template.Annotations[jupyterTokenRevisionAnnotationKey]).To(Equal(jupyterTokenDigest(string(freshSecret.Data[jupyterTokenKey]))))
+				g.Expect(gotSTS.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -902,11 +929,16 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			// The first post-upgrade drift (a real spec edit) must reconcile:
 			// repair the image and scale back up without touching the immutable
-			// claim template.
-			fresh := &aiv1alpha1.DevEnvironment{}
-			Expect(k8sClient.Get(ctx, envKey(env.Name), fresh)).To(Succeed())
-			fresh.Spec.Image = testDevImage
-			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+			// claim template. The controller writes status for this mismatched
+			// environment concurrently, so retry the edit on the 409 conflict it
+			// can otherwise cause (re-fetching each attempt, as in convergence
+			// specs).
+			Eventually(func(g Gomega) {
+				cur := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), cur)).To(Succeed())
+				cur.Spec.Image = testDevImage
+				g.Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			}, "10s", "200ms").Should(Succeed())
 
 			Eventually(func(g Gomega) {
 				sts := &appsv1.StatefulSet{}
