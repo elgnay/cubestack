@@ -60,12 +60,19 @@ Always use `kubebuilder create api` and `kubebuilder create webhook` to scaffold
 The e2e tests are designed to validate the solution in an isolated environment (similar to GitHub Actions CI).
 Ensure you run them against a dedicated [Kind](https://kind.sigs.k8s.io/) cluster (not your “real” dev/prod cluster).
 
+### Helm Chart Is Generated from `config/` — Never Hand-Edit
+The chart's `templates/` and `vap.yaml` are generated from the `config/` sources by `hack/update-helm-resources.sh`; only `Chart.yaml`, `values.yaml`, `.helmignore` and READMEs are hand-written. The ai.cubestack.io CRDs in `crds/` are NOT stored/committed — they are copied from `config/crd/bases` at use time by `make helm-crds-sync` (a prereq of `helm-package` / `helm-e2e-install`), so their content is by construction in sync with `config/`.
+- `config/` is the single source of truth: after any `config/` change (types/markers → `make manifests`, or editing rbac/vap/manager yaml), run `make helm-resources-update` and commit the regenerated chart together with the `config/` change.
+- Never hand-edit generated files — a future regeneration overwrites them and the CI `helm-drift` job (`make helm-resources-check`) fails on the diff. The drift gate covers `templates/` + `vap.yaml`; CRD sync needs no gate because it happens from `config/` at use time.
+- `helm-e2e-*` make targets install and verify the operator on a dedicated kind cluster; see the repo README for the quickstart.
+
 ## After Making Changes
 
 **After editing `*_types.go` or markers:**
 ```bash
 make manifests  # Regenerate CRDs/RBAC from markers
 make generate   # Regenerate DeepCopy methods
+make helm-resources-update  # Regenerate helm/cubestack-operator-chart from config/ (commit with the change)
 ```
 
 **After editing `*.go` files:**
@@ -273,30 +280,19 @@ kubectl apply -f https://raw.githubusercontent.com/<org>/<repo>/<tag>/dist/insta
 
 ### Option 2: Helm Chart
 
-```bash
-kubebuilder edit --plugins=helm/v2-alpha                      # Generates dist/chart/ (default)
-kubebuilder edit --plugins=helm/v2-alpha --output-dir=charts  # Generates charts/chart/
-```
+The operator ships as a Helm chart at `helm/cubestack-operator-chart/`. The chart's
+`templates/` and `vap.yaml` are generated from `config/` by
+`hack/update-helm-resources.sh` (see Critical Rules above); the ai CRDs in
+`crds/` are synced from `config/crd/bases` at use time by `make helm-crds-sync`
+— do not use the kubebuilder helm plugin and do not hand-edit generated chart
+files.
 
-**For development:**
 ```bash
-make helm-deploy IMG=<registry>/<project>:<tag>          # Deploy manager via Helm
-make helm-deploy IMG=$IMG HELM_EXTRA_ARGS="--set ..."    # Deploy with custom values
-make helm-status                                         # Show release status
-make helm-uninstall                                      # Remove release
-make helm-history                                        # View release history
-make helm-rollback                                       # Rollback to previous version
+make helm-resources-update  # Regenerate chart templates/vap.yaml from config/ after config changes
+make helm-crds-sync          # Copy the ai CRDs from config/crd/bases into the chart (crds/ is not committed)
+helm install cubestack ./helm/cubestack-operator-chart --namespace cubestack-system --create-namespace
+helm uninstall cubestack --namespace cubestack-system   # removes the operator, keeps the CRDs
 ```
-
-**For end users/production:**
-```bash
-helm install my-release ./<output-dir>/chart/ --namespace <ns> --create-namespace
-```
-
-**Important:** If you add webhooks or modify manifests after initial chart generation:
-1. Backup any customizations in `<output-dir>/chart/values.yaml` and `<output-dir>/chart/manager/manager.yaml`
-2. Re-run: `kubebuilder edit --plugins=helm/v2-alpha --force` (use same `--output-dir` if customized)
-3. Manually restore your custom values from the backup
 
 ### Publish Container Image
 
