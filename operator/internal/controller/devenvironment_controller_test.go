@@ -174,6 +174,61 @@ func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
 	return 0
 }
 
+var _ = Describe("DevEnvironment resource helpers", func() {
+	Describe("generateJupyterToken", func() {
+		It("returns distinct non-empty 32-hex tokens", func() {
+			a, err := generateJupyterToken()
+			Expect(err).NotTo(HaveOccurred())
+			b, err := generateJupyterToken()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(a).To(HaveLen(32))
+			Expect(b).To(MatchRegexp("^[0-9a-f]{32}$"))
+			Expect(a).NotTo(Equal(b))
+		})
+	})
+
+	Describe("allocatePort", func() {
+		cfg := DevEnvironmentControllerConfig{SSHPortRangeStart: 20000, SSHPortRangeEnd: 20002}
+		r := &DevEnvironmentReconciler{Config: cfg}
+		used := func(ports ...int32) map[int32]bool {
+			m := map[int32]bool{}
+			for _, p := range ports {
+				m[p] = true
+			}
+			return m
+		}
+		envWithSSHEndpoint := func(port int32) *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns"},
+				Status: aiv1alpha1.DevEnvironmentStatus{Endpoints: []aiv1alpha1.Endpoint{
+					{Name: sshPortName, Address: fmt.Sprintf("1.2.3.4:%d", port)},
+				}},
+			}
+		}
+
+		It("keeps the environment's own recorded port when it is still free", func() {
+			Expect(r.allocatePort(envWithSSHEndpoint(20001), sshPortName, used(20002))).To(Equal(int32(20001)))
+		})
+
+		It("skips ports used by other environments and picks the lowest free", func() {
+			env := envWithSSHEndpoint(0)
+			env.Status.Endpoints = nil
+			Expect(r.allocatePort(env, sshPortName, used(20000))).To(Equal(int32(20001)))
+			Expect(r.allocatePort(env, sshPortName, used(20000, 20001))).To(Equal(int32(20002)))
+		})
+
+		It("does not reuse its own recorded port when another environment now holds it", func() {
+			Expect(r.allocatePort(envWithSSHEndpoint(20001), sshPortName, used(20001))).To(Equal(int32(20000)))
+		})
+
+		It("returns 0 when the whole configured range is used", func() {
+			env := envWithSSHEndpoint(0)
+			env.Status.Endpoints = nil
+			Expect(r.allocatePort(env, sshPortName, used(20000, 20001, 20002))).To(Equal(int32(0)))
+		})
+	})
+})
+
 var _ = Describe("DevEnvironment controller", func() {
 	Context("provisioning", func() {
 		It("creates the StatefulSet with the desired pod template", func() {
@@ -486,6 +541,55 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		It("refreshes authorized_keys when the referenced keys Secret changes", func() {
+			rotated := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI rotated-key alice@example.com"
+			keys := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dev-alice-rotate-keys",
+					Namespace: testNamespace,
+					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+				},
+				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+			}
+			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, keys) }()
+
+			env := validDevEnvironment("de-rotate-keys")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
+					Key:                  sshUserKeysDefaultKey,
+				},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var hostKey []byte
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(testUserSSHKey))
+				hostKey = s.Data[sshHostKeyKey]
+			}, "15s", "200ms").Should(Succeed())
+
+			// Rotate the user's keys: the watch on spec.ssh.keysSecret re-reconciles
+			// the environment, so the managed authorized_keys follows while the host
+			// keypair stays stable.
+			freshKeys := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, envKey(keys.Name), freshKeys)).To(Succeed())
+			freshKeys.Data[sshUserKeysDefaultKey] = []byte(rotated)
+			Expect(k8sClient.Update(ctx, freshKeys)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(rotated))
+				g.Expect(s.Data[sshHostKeyKey]).To(Equal(hostKey))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		It("rejects an undelegated keysSecret without copying its data", func() {
 			// A Secret without the delegation label must never back
 			// authorized_keys: copying it would let the environment creator read
@@ -518,6 +622,115 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
 				s := &corev1.Secret{}
 				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshSecretName(env)), s))).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+		})
+	})
+
+	Context("jupyter token", func() {
+		It("creates the <env>-auth Secret and injects JUPYTER_TOKEN into the workload", func() {
+			env := validDevEnvironment("de-token")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(string(s.Data[jupyterTokenKey])).To(HaveLen(32))
+				g.Expect(metav1.GetControllerOf(s).UID).To(Equal(env.UID))
+				g.Expect(s.Labels).To(HaveKeyWithValue(devEnvironmentLabelKey, env.Name))
+
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				var injected *corev1.EnvVar
+				for i := range sts.Spec.Template.Spec.Containers[0].Env {
+					if sts.Spec.Template.Spec.Containers[0].Env[i].Name == jupyterTokenEnv {
+						injected = &sts.Spec.Template.Spec.Containers[0].Env[i]
+					}
+				}
+				g.Expect(injected).NotTo(BeNil())
+				g.Expect(injected.ValueFrom).NotTo(BeNil())
+				g.Expect(injected.ValueFrom.SecretKeyRef.Name).To(Equal(authSecretName(env)))
+				g.Expect(injected.ValueFrom.SecretKeyRef.Key).To(Equal(jupyterTokenKey))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("keeps the token across reconciles and refills an emptied token key", func() {
+			env := validDevEnvironment("de-token-stable")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var original string
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				original = string(s.Data[jupyterTokenKey])
+				g.Expect(original).To(HaveLen(32))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Further reconciles (e.g. a stop/start) must not rotate the token:
+			// the token is generated once and kept while non-empty.
+			fresh := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), fresh)).To(Succeed())
+			fresh.Spec.Running = false
+			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+			Consistently(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(string(s.Data[jupyterTokenKey])).To(Equal(original))
+			}, "2s", "200ms").Should(Succeed())
+
+			// An emptied key is refilled with a fresh token rather than left
+			// empty, so the workload's JUPYTER_TOKEN env always resolves.
+			s := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+			s.Data[jupyterTokenKey] = []byte("")
+			Expect(k8sClient.Update(ctx, s)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				freshSecret := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), freshSecret)).To(Succeed())
+				val := string(freshSecret.Data[jupyterTokenKey])
+				g.Expect(val).To(HaveLen(32))
+				g.Expect(val).NotTo(Equal(original))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("does not create the token Secret or env for non-jupyter environments", func() {
+			env := validDevEnvironment("de-token-ssh")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				for _, c := range sts.Spec.Template.Spec.Containers {
+					for _, v := range c.Env {
+						g.Expect(v.Name).NotTo(Equal(jupyterTokenEnv))
+					}
+				}
+				err := k8sClient.Get(ctx, envKey(authSecretName(env)), &corev1.Secret{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("removes the token Secret when the environment is deleted", func() {
+			env := validDevEnvironment("de-token-del")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(s.Data[jupyterTokenKey]).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, envKey(env.Name), &aiv1alpha1.DevEnvironment{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				err = k8sClient.Get(ctx, envKey(authSecretName(env)), &corev1.Secret{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})
@@ -904,6 +1117,61 @@ var _ = Describe("DevEnvironment controller", func() {
 					}
 				}
 				g.Expect(p2).To(Equal(pGRPC))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("frees the listener port and TCPRoute when the environment is deleted", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			// Earlier specs release their environments asynchronously (via the
+			// finalizer), so drain them first: the port pool below must start
+			// empty for the reuse assertion to be deterministic.
+			Eventually(func(g Gomega) {
+				list := &aiv1alpha1.DevEnvironmentList{}
+				g.Expect(k8sClient.List(ctx, list)).To(Succeed())
+				g.Expect(list.Items).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			env1 := validDevEnvironment("de-free-a")
+			env1.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env1)).To(Succeed())
+
+			var p int32
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env1.Name), got)).To(Succeed())
+				p = sshEndpointPort(got.Status.Endpoints)
+				g.Expect(p).To(BeNumerically(">", 0))
+				tr := &gatewayv1.TCPRoute{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env1.Name, p), Namespace: env1.Namespace}, tr)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Deleting the environment must release both the TCPRoute and the
+			// listener port. Wait until the object is fully gone: its status
+			// endpoints would otherwise still mark the port as in use.
+			Expect(k8sClient.Delete(ctx, env1)).To(Succeed())
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, envKey(env1.Name), &aiv1alpha1.DevEnvironment{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				tr := &gatewayv1.TCPRoute{}
+				err = k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env1.Name, p), Namespace: env1.Namespace}, tr)
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			// With the pool empty again, a new ssh environment reuses the freed
+			// port (lowest free) and publishes its own TCPRoute for it.
+			env2 := validDevEnvironment("de-free-b")
+			env2.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env2)).To(Succeed())
+			defer deleteEnv(env2.Name)
+
+			Eventually(func(g Gomega) {
+				got2 := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env2.Name), got2)).To(Succeed())
+				g.Expect(sshEndpointPort(got2.Status.Endpoints)).To(Equal(p))
+				tr := &gatewayv1.TCPRoute{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env2.Name, p), Namespace: env2.Namespace}, tr)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
