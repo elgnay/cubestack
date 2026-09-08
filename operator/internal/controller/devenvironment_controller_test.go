@@ -25,6 +25,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -175,18 +176,18 @@ func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
 	return 0
 }
 
-// listEventsForEnv returns the core/v1 Events recorded for the named
+// listEventsForEnv returns the events.k8s.io/v1 Events recorded for the named
 // DevEnvironment with the given reason. Events accumulate in the test namespace
 // across specs under the shared manager, so assertions always filter by the
 // unique environment name rather than global counts.
-func listEventsForEnv(name, reason string) []corev1.Event {
-	var evts corev1.EventList
+func listEventsForEnv(name, reason string) []eventsv1.Event {
+	var evts eventsv1.EventList
 	if err := k8sClient.List(ctx, &evts, client.InNamespace(testNamespace)); err != nil {
 		return nil
 	}
-	out := []corev1.Event{}
+	out := []eventsv1.Event{}
 	for _, e := range evts.Items {
-		if e.InvolvedObject.Name == name && e.InvolvedObject.Kind == "DevEnvironment" && e.Reason == reason {
+		if e.Regarding.Name == name && e.Regarding.Kind == "DevEnvironment" && e.Reason == reason {
 			out = append(out, e)
 		}
 	}

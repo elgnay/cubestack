@@ -20,7 +20,7 @@ limitations under the License.
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
@@ -58,7 +58,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -178,7 +178,7 @@ type DevEnvironmentReconciler struct {
 	// Recorder emits lifecycle Events (Created/Started/Stopped/Failed, design
 	// §11.2). When nil it is wired from the manager in SetupWithManager; the
 	// guard keeps helper-only constructions safe.
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 // Reconcile runs the DevEnvironment pipeline: brand match gate, SSH secret,
@@ -203,7 +203,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			return ctrl.Result{}, err
 		}
 		if r.Recorder != nil {
-			r.Recorder.Eventf(&env, corev1.EventTypeNormal, eventReasonCreated,
+			r.Recorder.Eventf(&env, nil, corev1.EventTypeNormal, eventReasonCreated, eventReasonCreated,
 				"DevEnvironment %s/%s created", env.Namespace, env.Name)
 		}
 		return ctrl.Result{Requeue: true}, nil
@@ -440,9 +440,7 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 // the Gateway API CRDs are installed, since a missing CRD would fail the cache.
 func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Recorder == nil {
-		// Deprecated in controller-runtime v0.24, but the only path that writes
-		// core/v1 Events, which is what the lifecycle Events (design §11.2) use.
-		r.Recorder = mgr.GetEventRecorderFor(devEnvManagedByValue) //nolint:staticcheck
+		r.Recorder = mgr.GetEventRecorder(devEnvManagedByValue)
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1alpha1.DevEnvironment{}).
@@ -1693,8 +1691,8 @@ func (r *DevEnvironmentReconciler) setPhaseAndReady(env *aiv1alpha1.DevEnvironme
 	}
 }
 
-// emitLifecycleTransition records a core/v1 Event when the derived phase makes
-// a user-visible lifecycle transition (design §11.2). env carries the last
+// emitLifecycleTransition records an events.k8s.io/v1 Event when the derived
+// phase makes a user-visible lifecycle transition (design §11.2). env carries the last
 // persisted phase and desired the just-derived one, so only a real transition
 // fires; a phase that is unchanged across reconciles emits nothing. The Stopped
 // guard (old phase must be non-empty) keeps a newly created, never-started
@@ -1710,17 +1708,17 @@ func (r *DevEnvironmentReconciler) emitLifecycleTransition(env, desired *aiv1alp
 	switch desired.Status.Phase.Name {
 	case aiv1alpha1.PhaseRunning:
 		if oldName != aiv1alpha1.PhaseRunning {
-			r.Recorder.Eventf(env, corev1.EventTypeNormal, eventReasonStarted,
+			r.Recorder.Eventf(env, nil, corev1.EventTypeNormal, eventReasonStarted, eventReasonStarted,
 				"DevEnvironment %s/%s is running", env.Namespace, env.Name)
 		}
 	case aiv1alpha1.PhaseStopped:
 		if oldName != "" && oldName != aiv1alpha1.PhaseStopped {
-			r.Recorder.Eventf(env, corev1.EventTypeNormal, eventReasonStopped,
+			r.Recorder.Eventf(env, nil, corev1.EventTypeNormal, eventReasonStopped, eventReasonStopped,
 				"DevEnvironment %s/%s is stopped", env.Namespace, env.Name)
 		}
 	case aiv1alpha1.PhaseFailed:
 		if oldName != aiv1alpha1.PhaseFailed {
-			r.Recorder.Eventf(env, corev1.EventTypeWarning, eventReasonFailed,
+			r.Recorder.Eventf(env, nil, corev1.EventTypeWarning, eventReasonFailed, eventReasonFailed,
 				"DevEnvironment %s/%s failed: %s", env.Namespace, env.Name, desired.Status.Phase.Reason)
 		}
 	}
