@@ -19,6 +19,7 @@ package controller
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -30,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -292,6 +294,84 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 
 			Expect(meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime).NotTo(Equal(first))
 		})
+	})
+})
+
+var _ = Describe("emitLifecycleTransition", func() {
+	// envName is the DevEnvironment used by the specs below.
+	const envName = "de-emit"
+
+	// recordedEvent is one Event the reconciler's recorder saw, reduced to the
+	// (type, reason) pair the emit calls use.
+	type recordedEvent struct {
+		typ    string
+		reason string
+	}
+
+	// newRecorder returns a reconciler wired to an events.FakeRecorder plus a
+	// drain that returns every (type, reason) pair recorded since the last call.
+	newRecorder := func() (*DevEnvironmentReconciler, func() []recordedEvent) {
+		fr := events.NewFakeRecorder(64)
+		r := &DevEnvironmentReconciler{Recorder: fr}
+		drain := func() []recordedEvent {
+			out := []recordedEvent{}
+			for {
+				select {
+				case msg := <-fr.Events:
+					// FakeRecorder formats each emit as "<type> <reason> <note>".
+					f := strings.Fields(msg)
+					if len(f) >= 2 {
+						out = append(out, recordedEvent{typ: f[0], reason: f[1]})
+					}
+				default:
+					return out
+				}
+			}
+		}
+		return r, drain
+	}
+
+	// at returns an environment whose status records the given phase, i.e. the
+	// last phase the controller persisted before the reconcile under test.
+	at := func(phase aiv1alpha1.PhaseName) *aiv1alpha1.DevEnvironment {
+		env := &aiv1alpha1.DevEnvironment{ObjectMeta: metav1.ObjectMeta{Name: envName, Namespace: testNamespace}}
+		if phase != "" {
+			setPhase(&env.Status, phase, "")
+		}
+		return env
+	}
+
+	It("records each transition exactly once and stays quiet on a repeat of the same phase", func() {
+		r, drain := newRecorder()
+		pending := at(aiv1alpha1.PhasePending)
+
+		// Entering Running from Pending records one Started Event.
+		running := at(aiv1alpha1.PhaseRunning)
+		r.emitLifecycleTransition(pending, running)
+		Expect(drain()).To(Equal([]recordedEvent{{typ: corev1.EventTypeNormal, reason: eventReasonStarted}}))
+
+		// A later reconcile that derives Running again must not record another.
+		r.emitLifecycleTransition(running, at(aiv1alpha1.PhaseRunning))
+		Expect(drain()).To(BeEmpty())
+
+		// Running -> Stopped records one Stopped Event; repeats stay quiet.
+		stopped := at(aiv1alpha1.PhaseStopped)
+		r.emitLifecycleTransition(running, stopped)
+		Expect(drain()).To(Equal([]recordedEvent{{typ: corev1.EventTypeNormal, reason: eventReasonStopped}}))
+		r.emitLifecycleTransition(stopped, at(aiv1alpha1.PhaseStopped))
+		Expect(drain()).To(BeEmpty())
+
+		// Entering Failed records one Warning Failed Event; repeats stay quiet.
+		r.emitLifecycleTransition(running, at(aiv1alpha1.PhaseFailed))
+		Expect(drain()).To(Equal([]recordedEvent{{typ: corev1.EventTypeWarning, reason: eventReasonFailed}}))
+		r.emitLifecycleTransition(at(aiv1alpha1.PhaseFailed), at(aiv1alpha1.PhaseFailed))
+		Expect(drain()).To(BeEmpty())
+	})
+
+	It("does not record a Stopped Event for an environment that never started", func() {
+		r, drain := newRecorder()
+		r.emitLifecycleTransition(at(""), at(aiv1alpha1.PhaseStopped))
+		Expect(drain()).To(BeEmpty())
 	})
 })
 
