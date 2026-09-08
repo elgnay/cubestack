@@ -375,6 +375,216 @@ var _ = Describe("emitLifecycleTransition", func() {
 	})
 })
 
+var _ = Describe("DevEnvironment pod spec rendering", func() {
+	Describe("mainContainerPort", func() {
+		It("maps jupyter to the 8888 web port", func() {
+			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)).To(Equal(int32(8888)))
+		})
+
+		It("maps ssh to the 22 sshd port", func() {
+			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeSSH)).To(Equal(int32(22)))
+		})
+
+		It("maps vscode to the 8080 code-server port", func() {
+			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeVSCode)).To(Equal(int32(8080)))
+		})
+	})
+
+	Describe("desiredResources", func() {
+		It("requests and limits the nvidia gpu by gpuCount", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPUType: aiv1alpha1.GPUTypeNVIDIA, GPUCount: 2,
+			}}}
+			got := desiredResources(env)
+			key := corev1.ResourceName(testGPUResource)
+			Expect(got.Requests).To(HaveKey(key))
+			Expect(got.Limits).To(HaveKey(key))
+			req := got.Requests[key]
+			lim := got.Limits[key]
+			Expect(req.Value()).To(Equal(int64(2)))
+			Expect(lim.Value()).To(Equal(int64(2)))
+		})
+
+		It("maps a metax gpuType to the metax-tech.com/gpu resource", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPUType: aiv1alpha1.GPUTypeMetaX, GPUCount: 1,
+			}}}
+			got := desiredResources(env)
+			key := corev1.ResourceName("metax-tech.com/gpu")
+			Expect(got.Requests).To(HaveKey(key))
+			Expect(got.Limits).To(HaveKey(key))
+			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceName(testGPUResource)))
+		})
+
+		It("maps optional cpu and memory to limits only", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPUType: aiv1alpha1.GPUTypeNVIDIA, GPUCount: 1, CPU: "16", Memory: "32Gi",
+			}}}
+			got := desiredResources(env)
+			Expect(got.Limits.Cpu().Cmp(resource.MustParse("16"))).To(Equal(0))
+			Expect(got.Limits.Memory().Cmp(resource.MustParse("32Gi"))).To(Equal(0))
+			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceCPU))
+			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceMemory))
+		})
+	})
+
+	Describe("desiredSecurityContext", func() {
+		It("defaults a nil runtime to non-root uid and gid 1000", func() {
+			sc := desiredSecurityContext(nil)
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(true)))
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(1000))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(1000))))
+			Expect(sc.Privileged).To(BeNil())
+		})
+
+		It("keeps the non-root defaults when runtime has no security context", func() {
+			sc := desiredSecurityContext(&aiv1alpha1.RuntimeSpec{Command: []string{"sleep"}})
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(true)))
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(1000))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(1000))))
+		})
+
+		It("honors runAsUser=0 as root and disables runAsNonRoot", func() {
+			sc := desiredSecurityContext(&aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))}})
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(false)))
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(1000))))
+		})
+
+		It("honors the explicit runAsGroup when root is requested", func() {
+			sc := desiredSecurityContext(&aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
+				RunAsUser: ptrTo(int64(0)), RunAsGroup: ptrTo(int64(2000)),
+			}})
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(false)))
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(2000))))
+		})
+
+		It("keeps runAsNonRoot enabled for an explicit non-root user", func() {
+			sc := desiredSecurityContext(&aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(1001))}})
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(true)))
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(1001))))
+		})
+	})
+
+	Describe("desiredPodSpec", func() {
+		newEnv := func() *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-render", Namespace: "default"},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeVSCode, Image: testDevImage,
+				},
+			}
+		}
+		render := func(mut func(*aiv1alpha1.DevEnvironment)) corev1.PodSpec {
+			env := newEnv()
+			if mut != nil {
+				mut(env)
+			}
+			return (&DevEnvironmentReconciler{}).desiredPodSpec(env)
+		}
+
+		It("pins the pod to the compute pool and probes the main port per type", func() {
+			for _, tt := range []struct {
+				typ  aiv1alpha1.DevEnvironmentType
+				port int32
+			}{
+				{typ: aiv1alpha1.DevEnvironmentTypeJupyter, port: 8888},
+				{typ: aiv1alpha1.DevEnvironmentTypeSSH, port: 22},
+				{typ: aiv1alpha1.DevEnvironmentTypeVSCode, port: 8080},
+			} {
+				spec := render(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Type = tt.typ })
+				Expect(spec.NodeSelector).To(Equal(map[string]string{computeNodePoolLabelKey: computeNodePoolValue}))
+				Expect(spec.Containers).To(HaveLen(1))
+				c := spec.Containers[0]
+				Expect(c.Name).To(Equal(string(tt.typ)))
+				Expect(c.Image).To(Equal(testDevImage))
+				Expect(c.ReadinessProbe).NotTo(BeNil())
+				Expect(c.ReadinessProbe.ProbeHandler.TCPSocket.Port.IntVal).To(Equal(tt.port))
+			}
+		})
+
+		It("copies runtime command, args and env onto the container", func() {
+			command := []string{"/bin/sh"}
+			args := []string{"-c", "sleep infinity"}
+			runtimeEnv := []corev1.EnvVar{
+				{Name: "FOO", Value: "bar"},
+				{Name: "FROM_SECRET", ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "creds"}, Key: "k",
+				}}},
+			}
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Command: command, Args: args, Env: runtimeEnv}
+			})
+			c := spec.Containers[0]
+			Expect(c.Command).To(Equal(command))
+			Expect(c.Args).To(Equal(args))
+			Expect(c.Env).To(Equal(runtimeEnv))
+		})
+
+		It("mounts the workspace claim at spec.storage.mountPath and none when storage is omitted", func() {
+			mountPath := "/workspace"
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Storage = &aiv1alpha1.StorageSpec{MountPath: mountPath}
+			})
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{
+				Name: workspaceClaimName, MountPath: mountPath,
+			}}))
+
+			spec = render(nil)
+			Expect(spec.Containers[0].VolumeMounts).To(BeEmpty())
+		})
+
+		It("mounts spec.volumes with pvc, path, subPath and readOnly fidelity", func() {
+			ro := aiv1alpha1.VolumeMount{Name: "artifacts", PVCName: "artifacts-pvc", MountPath: "/data/artifacts", ReadOnly: true, SubPath: "artifacts/v3"}
+			rw := aiv1alpha1.VolumeMount{Name: "cache", PVCName: "cache-pvc", MountPath: "/cache"}
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Volumes = []aiv1alpha1.VolumeMount{ro, rw}
+			})
+			c := spec.Containers[0]
+			Expect(c.VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: ro.Name, MountPath: ro.MountPath, ReadOnly: ro.ReadOnly, SubPath: ro.SubPath},
+				{Name: rw.Name, MountPath: rw.MountPath, ReadOnly: rw.ReadOnly},
+			}))
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{
+				{Name: ro.Name, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: ro.PVCName, ReadOnly: ro.ReadOnly}}},
+				{Name: rw.Name, VolumeSource: corev1.VolumeSource{PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: rw.PVCName, ReadOnly: rw.ReadOnly}}},
+			}))
+		})
+
+		It("mounts the ssh keys secret for an exposed ssh type", func() {
+			var env *aiv1alpha1.DevEnvironment
+			spec := render(func(e *aiv1alpha1.DevEnvironment) { env = e; e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH })
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{
+				Name: sshKeysVolumeName, MountPath: "/etc/cubestack/ssh", ReadOnly: true,
+			}}))
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{{
+				Name:         sshKeysVolumeName,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
+			}}))
+		})
+
+		It("injects JUPYTER_TOKEN from the managed auth secret and drops a user override", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+				{Name: jupyterTokenEnv, Value: "user-override"},
+				{Name: "KEEP", Value: "me"},
+			}}
+			c := (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0]
+			Expect(c.Env).To(Equal([]corev1.EnvVar{
+				{Name: "KEEP", Value: "me"},
+				{Name: jupyterTokenEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: authSecretName(env)},
+					Key:                  jupyterTokenKey,
+				}}},
+			}))
+			// A jupyter environment without ssh.enabled mounts no ssh volume.
+			Expect(c.VolumeMounts).To(BeEmpty())
+		})
+	})
+})
+
 var _ = Describe("DevEnvironment controller", func() {
 	Context("provisioning", func() {
 		It("creates the StatefulSet with the desired pod template", func() {
