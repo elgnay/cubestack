@@ -1,0 +1,76 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "cubestack-portal-chart.fullname" . }}-role
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
+rules:
+  # Read htpasswd secret for authentication
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["cubestack-htpasswd"]
+    verbs: ["get"]
+  # Read operator CRDs for UI APIs
+  - apiGroups: ["ai.cubestack.io"]
+    resources: ["inferenceservices", "devenvironments", "inferenceruntimeprofiles", "modelversions"]
+    verbs: ["get", "list", "watch"]
+---
+# Cluster-scoped: `namespaces` cannot be read through a namespaced Role, and
+# the name carries the release namespace so same-named releases in different
+# namespaces do not collide on cluster-scoped resources.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-portal-chart.clusterRoleName" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
+rules:
+  # Read namespaces for UI APIs (cluster-scoped resource)
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "cubestack-portal-chart.fullname" . }}-role-binding
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "cubestack-portal-chart.fullname" . }}-role
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cubestack-portal-chart.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cubestack-portal-chart.clusterRoleBindingName" . }}
+  labels:
+    app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cubestack-portal-chart.clusterRoleName" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "cubestack-portal-chart.serviceAccountName" . }}
+    namespace: {{ .Values.namespace }}

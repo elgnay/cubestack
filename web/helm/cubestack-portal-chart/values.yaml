@@ -1,0 +1,99 @@
+# Default values for cubestack-portal-chart.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# Image settings
+image:
+  registry: harbor.isuanova.com
+  repository: suanova/cubestack-ui
+  # Use latest or a specific tag for OCI mode
+  tag: "latest"
+  pullPolicy: Always
+
+# Number of replicas
+replicaCount: 1
+
+# Ingress configuration
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: ui.cubestack.local
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+# Environment variables
+env: {}
+
+# Resource limits and requests
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 256Mi
+
+# Node selector for scheduling
+nodeSelector: {}
+
+# Tolerations for scheduling
+tolerations: []
+
+# Affinity rules for scheduling
+affinity: {}
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod security context
+podSecurityContext:
+  # The portal image runs as the `node` user (UID 1000). K8s cannot verify a
+  # non-numeric user (e.g. `USER node`) against runAsNonRoot, so pin the
+  # numeric UID explicitly.
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - "ALL"
+
+# Namespace to install into
+namespace: cubestack-system
+
+# Secrets for sensitive data
+secrets:
+  # Session secret for UI
+  sessionSecret:
+    create: true
+    # Set to existing secret name if using external secret
+    existingSecret: ""
+    existingSecretKey: "session-secret"
+    # Generate random secret if create is true
+    length: 32
+  # Portal login credentials (htpasswd file content: one `user:bcrypt-hash`
+  # line per entry). No credentials are bundled with the chart — provide your
+  # own at install time, e.g.:
+  #   --set-file secrets.htpasswd.content=/path/to/htpasswd
+  # The chart creates a Secret named "cubestack-htpasswd", which is the
+  # portal's built-in default, so no further configuration is needed.
+  # Without content, no htpasswd Secret is created and portal login reports
+  # "auth not configured".
+  htpasswd:
+    content: ""
+
+# Pod disruption budget for HA. Set exactly one of minAvailable / maxUnavailable.
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  maxUnavailable: null

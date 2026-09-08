@@ -1,0 +1,28 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "cubestack-portal-chart.fullname" . }}-pdb
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
+    helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
+spec:
+  # Kubernetes requires exactly one of minAvailable/maxUnavailable.
+  # kindIs "invalid" checks for null explicitly so a numeric 0 stays valid.
+  {{- if and (not (kindIs "invalid" .Values.podDisruptionBudget.minAvailable)) (not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable)) }}
+  {{- fail "podDisruptionBudget: set exactly one of minAvailable and maxUnavailable" }}
+  {{- else if not (kindIs "invalid" .Values.podDisruptionBudget.minAvailable) }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else if not (kindIs "invalid" .Values.podDisruptionBudget.maxUnavailable) }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  {{- else }}
+  {{- fail "podDisruptionBudget: one of minAvailable or maxUnavailable must be set" }}
+  {{- end }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "cubestack-portal-chart.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
