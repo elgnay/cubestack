@@ -28,8 +28,8 @@ images are final** — they cannot be solved inside the images themselves.
 |---|---|---|---|---|
 | 1 | Brand marker | `devenvironment_controller.go::brandMatch`: image name (lowercased) must **contain** `base-cuda` / `base-maca` | Image registry path must include the `base-cuda` / `base-maca` segment | ✅ consistent with the brand gate |
 | 2 | Type → port | `::mainContainerPort`: jupyter 8888 / ssh 22 / vscode 8080; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP | ✅ |
-| 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as **uid/gid 1000** (incl. writing `$HOME`) | ✅ (but see #6, #9) |
-| 4 | `$HOME` / working dir = `/workspace` | comment in `devenvironment_types.go` + sample: PVC mounted at `mountPath` (default `/workspace`), base image `$HOME` lands on it | Image `USER`/`HOME` should point at the mount point (default `/workspace`) | ⚠️ see "Gap A" |
+| 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as the **resolved uid/gid** — `image.cubestack.io/{uid,gid}` labels, platform default 1000/1000 — non-root, incl. writing `$HOME` (stock images ship uid 1000) | ✅ (but see #6, #9) |
+| 4 | `$HOME` / working dir = `mountPath` | comment in `devenvironment_types.go` + sample: PVC mounted at `mountPath` (default `/workspace`); the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is the image's declared home (label; default `/workspace`) — docker-stacks images declare `/home/jovyan` and keep it; `mountPath` overrides it | ⚠️ see "Gap A" + §2 contract |
 | 5 | SSH key mount | `assets.go:63`: Secret data keys `ssh_host_ed25519_key`(+`.pub`), `authorized_keys`; `devenvironment_controller.go:709` mounts read-only at `/etc/cubestack/ssh`, default mode 0644; host key is **never rotated** (persistence provided by the Secret) | Entrypoint must **copy host key / authorized_keys to a user-writable dir and tighten to 0600** before starting sshd (sshd refuses a world-readable 0644 private key, and a root-owned RO mount cannot be chmod'ed in place) | ✅ handled by entrypoint script |
 | 6 | sshd listening on :22 as uid 1000 | ssh Service 22→22 in the controller; `desiredSecurityContext` grants no capabilities | Binding a port <1024 as non-root needs `NET_BIND_SERVICE`; a Restricted PSA would drop it | 🚩 **Gap B** |
 | 7 | `JUPYTER_TOKEN` | `jupyterTokenEnv="JUPYTER_TOKEN"` (:144), injected only for the jupyter type, from `<env>-auth` Secret `data[token]` | The jupyter server must authenticate with this env value | ✅ (jupyter-server reads `JUPYTER_TOKEN` natively, see §3.B4) |
@@ -37,7 +37,7 @@ images are final** — they cannot be solved inside the images themselves.
 | 9 | Runtime-mode inference | Single-container pod; `type` and `image` are independent axes; the controller injects no `type`/mode env | The same image must decide by itself whether to run jupyter or sshd (e.g. inferred from whether `JUPYTER_TOKEN` is injected / ssh keys are mounted) | 🚩 **convention to be defined** (implicit inference is workable; explicit is recommended) |
 | 10 | Multi-service in one container | `sshExposed` adds a 22 Service and mounts keys for jupyter/vscode types, sharing the main container | jupyter type + `ssh.enabled` ⇒ the same process group must run jupyter *and* sshd | ✅ handled by entrypoint script |
 | 11 | GPU extended resource | `::gpuResource`: nvidia `nvidia.com/gpu` / metax `metax-tech.com/gpu` | The image is device-agnostic; `nvidia-smi`/`mx-smi` come from driver injection | ✅ see §3 |
-| 12 | SSH login user | `sshEndpointUser="user"` (:137) is the platform default → endpoint `ssh://user@<gw>`; first-party images **declare** their login account via the `image.cubestack.io/ssh-user` label (all ship `user`); operator resolution precedence spec → label → default is issue #169 | The image must contain the login account it declares (default `user`), uid 1000 | ✅ |
+| 12 | SSH login user | `sshEndpointUser="user"` (:137) is the platform default → endpoint `ssh://user@<gw>`; first-party images **declare** their login account via the `image.cubestack.io/ssh-user` label — self-authored images ship `user`, the docker-stacks-derived jupyter ships `jovyan`; operator resolution precedence spec → label → default is issue #169 | The image must contain the login account it declares (default `user`, uid 1000); for jupyter that is the stock `jovyan` account | ✅ |
 
 ### Image-declared runtime metadata (`image.cubestack.io/*`)
 
@@ -48,6 +48,13 @@ platform defaults when absent. One precedence applies to every knob:
 curated/relayed image "just works" with nothing set; spec fields remain the
 per-environment override. Of the four knobs, only `ssh-user` needs a new spec
 field; uid/gid/home already have homes in the DevEnvironment CRD.
+
+The platform defaults encode the **self-authored layout** (account `user`, uid/gid 1000,
+`/workspace`) — the contract our own platform-layer images ship by construction. Images we do **not**
+author are not forced into that layout: **stock-derived images** (the docker-stacks jupyter overlay)
+keep the upstream account/home (`jovyan` uid 1000 gid 100, `/home/jovyan`) exactly as the stock image
+ships them, and declare that via the labels. The labels are therefore *per-image declarations of the
+image's native layout*, not conformance requirements.
 
 | Knob | Image label | Platform default | Spec override (CRD) |
 |---|---|---|---|
@@ -60,13 +67,20 @@ For inspectable (builtin) images the controller validates tuple coherence: the
 declared `ssh-user`'s passwd uid must equal the resolved uid — a non-root sshd can
 only serve an account whose uid equals the process uid.
 
-### Gap A — `/workspace` writable by uid 1000
+The workspace PVC mounts at the image's **declared home** — `spec.storage.mountPath` when the user
+sets it, otherwise the `image.cubestack.io/home` label, otherwise the `/workspace` platform default —
+so `/home/jovyan` for the jupyter overlay, `/workspace` for self-authored images. The `home` label is
+what lets a stock-derived image keep its native `$HOME` while still getting a persistent workspace on
+the PVC. ⚠️ The CRD currently defaults `mountPath=/workspace`, which would override the label for
+omitted specs; making an unset `mountPath` defer to the label is part of #169.
+
+### Gap A — the home mount writable by uid 1000
 
 The pod sets no `fsGroup`; the workspace PVC uses `cephfs-ephemeral` (RWX, `assets.go:85`). The
 container runs as uid 1000 with `$HOME` on the mount, so the **RWX StorageClass's mount behavior must
-make `/workspace` writable by 1000** (cephfs owner/mode). The image cannot chown itself (non-root).
-This belongs to workspace-storage work for verification; the image only commits to pointing `$HOME`
-at the mount point.
+make the mount path writable by 1000** (cephfs owner/mode) — regardless of whether that path is
+`/workspace` or `/home/jovyan`. The image cannot chown itself (non-root). This belongs to
+workspace-storage work for verification; the image only commits to pointing `$HOME` at the mount point.
 
 ### Gap B — capability for non-root sshd binding :22
 
@@ -165,36 +179,40 @@ together with Gaps B/C.
 
 ## 4. Composition model (recommended)
 
-Images are three stacked layers, sharing one "platform layer" to avoid duplicate builds:
+Two families of images share a common "platform layer" so that service capability (entrypoint, ssh
+key handling) is written once. They differ in the base and the layout they carry:
 
 ```
-platform layer (ubuntu22.04)
-  ├ user 'user' uid/gid 1000; on start points $HOME at the mount point (default /workspace)
-  ├ python 3.11 (pip) + common tooling + openssh-server
-  ├ entrypoint.sh: runtime-mode selection (§2 Gap D) + ssh key / authorized_keys copy & tightening
-  └ jupyterlab (per variant)
-      ├────────────────────────────┬──────────────────────────────
-      │ runtime axis (stacked on platform)
-      ▼                             ▼
-  CPU bare base                  GPU runtime layer
-  ┌──────────────────┐      ┌──────────────────────────────────────┐
-  │ jupyter          │      │ base-cuda: platform + nvidia/cuda     │
-  │ ssh-ubuntu-server│      │            runtime(<cuda>-ubuntu22.04)│
-  └──────────────────┘      │ base-maca: platform + MACA runtime    │
-                            └──────────────────────────────────────┘
+  common scripts (images/common): entrypoint (mode select) + ssh key / authorized_keys copy & tighten
+                                   │ shared by both families
+        ┌──────────────────────────┴───────────────────────────┐
+        │                                                      │
+ self-authored platform layer                     docker-stacks thin overlay
+ (ubuntu22.04) — ships the self-authored           (jupyter CPU) on quay.io/jupyter/
+ layout: user 'user' uid/gid 1000,                 minimal-notebook — keeps stock layout
+ $HOME on the workspace mount                      native: jovyan uid 1000 gid 100,
+ (default /workspace); python + jupyterlab         $HOME=/home/jovyan (declared via labels);
+ (for jupyter type) + openssh-server               + openssh-server / ssh key handling ONLY
+   │                                               so ssh.enabled works; otherwise == stock
+   ├── CPU: ssh-ubuntu-server                      (jupyter type on a GPU-vendor image is the
+   └── GPU: base-cuda (+nvidia runtime)            self-authored jupyterlab, not this overlay)
+           base-maca (+Metax runtime)
 ```
 
 Key points:
 
-- **Entrypoint / service capability lives in the platform layer**: GPU and CPU images share the
-  jupyter/sshd/entrypoint logic; the GPU layer only adds the runtime. Dockerfiles use multi-stage /
-  shared base images so the entrypoint is not duplicated four times.
-- **First-party images expose the account `user`** (uid/gid 1000, aligning with the `sshEndpointUser`
-  default and `desiredSecurityContext`), declared via the `image.cubestack.io/ssh-user` label (see §2 #12,
-  issue #169), with `HOME` on the mount point (`/workspace`).
-- **`base-cuda`/`base-maca` reuse the same platform layer**: a jupyter-type environment can pick a
-  GPU-vendor image, while an ssh-type environment on a GPU-vendor image runs only sshd (mode chosen
-  by the entrypoint).
+- **What is shared is the entrypoint and the ssh key / `authorized_keys` handling** (`images/common`),
+  reused by both families — GPU and CPU images, and the docker-stacks overlay, do not duplicate it.
+- **Account / `HOME` follow the image family** (see §2 label contract): the **self-authored** platform
+  layer (`ssh-ubuntu-server`, `base-cuda`, `base-maca`) ships the platform default `user` uid/gid 1000
+  with `HOME` on the workspace mount (`/workspace`) — there is no upstream UX to preserve, so
+  uniformity is free. The **stock-derived jupyter** image is **not** conformed: it keeps `jovyan`
+  (uid 1000, gid 100) and `/home/jovyan` exactly as docker-stacks ships them, so users familiar with
+  the stock image see stock behavior; it adds sshd only for `ssh.enabled`. Both declare their layout
+  via `image.cubestack.io/*` labels (issue #169).
+- **`base-cuda`/`base-maca` reuse the same self-authored platform layer**: a jupyter-type environment
+  can pick a GPU-vendor image, while an ssh-type environment on a GPU-vendor image runs only sshd (mode
+  chosen by the entrypoint).
 
 ---
 
@@ -253,19 +271,23 @@ pin `harbor.local/ai-images/base-cuda:11.8-pytorch2.2` / `harbor.local/ai-images
 ### 6.3 `jupyter` and `ssh·ubuntu-server`
 
 - **`jupyter` (CPU)**:
-  - Option A: **thin-overlay `quay.io/jupyter/…`** (e.g. minimal-notebook or pytorch-notebook) —
-    override default user/`HOME` (jovyan/`/home/jovyan` → `user`(1000)/mount point) and reuse its
-    mature notebook stack. Note the official images are **Quay-only**, Docker Hub is stale; non-root
-    arbitrary-UID must follow its remap rules.
+  - Option A: **thin-overlay `quay.io/jupyter/minimal-notebook`**, **stock-native**: keep the image
+    exactly as docker-stacks ships it — `jovyan` (uid 1000, gid 100), `$HOME=/home/jovyan`, stock
+    launcher/entrypoint — and add **only** openssh-server + the shared ssh key handling so that
+    `ssh.enabled` works. The workspace PVC mounts at `/home/jovyan` (its native home, declared via the
+    `image.cubestack.io/home` label). Users familiar with the stock image get stock behavior; `base_url`
+    / token need no image change (see below).
   - Option B: **self-build** (ubuntu22.04 + conda/pip + jupyterlab + custom entrypoint) — full control
     of uid/HOME/size, but you own the dependency manifest.
-  - **Decision**: CPU `jupyter` via Option A **thin-overlay** on `quay.io/jupyter/minimal-notebook` —
-    the platform layer (shared scripts + account/`HOME` contract, §4) is overlaid on the mature
-    docker-stacks base (rename `jovyan` → `user`/gid 1000, `HOME` on the mount point). Option B
-    (self-build) stays a fallback if a product later needs the ecosystem trimmed; the GPU variant
-    remains base-cuda's platform layer.
+  - **Decision**: CPU `jupyter` via Option A **thin-overlay, stock + ssh only** (recommended in §4).
+    No renaming to `user`, no gid-1000 move, no `/workspace` redirect, no XDG re-homing: everything
+    except the added sshd stays identical to the stock image, because there is no platform reason to
+    change it — the label contract (§2) lets the platform adapt to the image rather than the image to
+    the platform. Option B (self-build) stays a fallback if a product later needs the ecosystem
+    trimmed; the GPU variant remains base-cuda's self-authored platform layer.
 - **`ssh·ubuntu-server` (CPU)**: self-build (ubuntu22.04 + openssh-server + entrypoint that
-  copies/tightens keys) — simplest, smallest attack surface.
+  copies/tightens keys) — simplest, smallest attack surface; self-authored (no upstream stock UX to
+  preserve) so it ships the platform default account `user` uid/gid 1000, `$HOME` on `/workspace`.
 - **Acceptance mapping**: jupyter 8888 + token (`JUPYTER_TOKEN` env, no-token rejected) + base_url path
   reachable (depends on Gap C closing); ssh 22 + authorized_keys login + host keys persistent across
   restarts (provided by the Secret).
@@ -292,7 +314,7 @@ pin `harbor.local/ai-images/base-cuda:11.8-pytorch2.2` / `harbor.local/ai-images
 
 | Item | Owner | Recommendation | Blocks |
 |---|---|---|---|
-| A workspace writability check (uid 1000 writing `/workspace`) | workspace storage (cephfs-ephemeral) | Confirm the RWX SC makes 1000 writable | smoke of all images |
+| A workspace writability check (uid 1000 writing the home mount: `/workspace` self-authored, `/home/jovyan` jupyter) | workspace storage (cephfs-ephemeral) | Confirm the RWX SC makes the mount path writable by 1000 | smoke of all images |
 | B non-root sshd binding :22 | controller + PSA policy | `capabilities.add:[NET_BIND_SERVICE]` on the main container (when SSH is exposed) | base image ssh acceptance |
 | C injecting jupyter `base_url` | controller | Inject `CUBESTACK_BASE_URL=/dev/<ns>/<env>/`; image sets `ServerApp.base_url` from it | jupyter image acceptance, e2e |
 | D mode env (optional) | controller | Inject `CUBESTACK_TYPE`, entrypoint reads it first | vscode hook |
@@ -303,14 +325,14 @@ pin `harbor.local/ai-images/base-cuda:11.8-pytorch2.2` / `harbor.local/ai-images
 
 | Item | Conclusion | Status |
 |---|---|---|
-| Platform-layer model + `user`(1000)/`HOME`=mount point + mode entrypoint | §4 | ✅ recommended here |
-| GPU image = platform + runtime layer (layered reuse) | §4 | ✅ recommended here |
+| Two-family model: self-authored platform layer (`user` 1000, `HOME` on `/workspace`) + docker-stacks thin overlay (`jovyan`/`/home/jovyan`, stock-native, ssh added) — shared entrypoint + label-declared layout | §4 | ✅ recommended here |
+| GPU image = self-authored platform + runtime layer (layered reuse) | §4 | ✅ recommended here |
 | Project `ai-images`, host `harbor.isuanova.com` (online) / `harbor.local` (offline) | §5 | ✅ recommended (follows today) |
 | Dockerfiles live in monorepo `images/` | §7 | ✅ recommended (lands with the build work) |
 | base-cuda base = runtime (not devel) + whether to bake torch | §6.1 | ⚠️ **pending product** (CUDA version 11.8 vs 12.x, torch version, devel variant?) |
 | base-maca self-build + commercial gate | §6.2 | ⚠️ **to confirm**: Metax package channel / injection model / target software versions |
-| jupyter CPU = thin-overlay Quay (Option A) | §6.3 | ✅ decided (shipped in images work) |
-| ssh·ubuntu-server self-build | §6.3 | ✅ recommended here |
+| jupyter CPU = stock-native thin-overlay on Quay minimal-notebook + ssh only | §6.3 | ✅ decided (shipped in images work) |
+| ssh·ubuntu-server self-build, platform-default `user`/`/workspace` | §6.3 | ✅ recommended here |
 | Gaps A/B/C/D closure | §8 | ⚠️ **to schedule into follow-up controller work** (B/C precede image acceptance) |
 
 After review: promote the "✅ recommended" items to "decided", backfill the "to confirm" items, and
