@@ -20,8 +20,11 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"github.com/suanova/cubestack/internal/renderer"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -37,6 +40,7 @@ const (
 	testShmMountPath = "/dev/shm"
 	testMemoryMedium = "Memory"
 	testShmVolName   = "dshm"
+	testISVCName     = "svc-a"
 
 	testGPUModelMXC500 = "MXC500"
 	testGPUModelMXC550 = "MXC550"
@@ -79,6 +83,40 @@ var _ = Describe("buildPodSpec", func() {
 		c := spec.Containers[0]
 		Expect(c.Resources.Requests.Name("nvidia.com/gpu", resource.DecimalSI).String()).To(Equal("1"))
 		Expect(c.Resources.Limits.Name("nvidia.com/gpu", resource.DecimalSI).String()).To(Equal("1"))
+	})
+
+	It("attaches the service-wide podAntiAffinity term with the platform selector", func() {
+		spec := &corev1.PodSpec{}
+		attachServiceAntiAffinity(spec, testISVCName, "kubernetes.io/hostname")
+		Expect(spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(Equal([]corev1.PodAffinityTerm{{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"ai.cubestack.io/inference-service": testISVCName}},
+			TopologyKey:   "kubernetes.io/hostname",
+		}}))
+	})
+
+	It("propagates the profile-level podAntiAffinity to every role workload", func() {
+		// The declaration lives once at profile scope; desiredWorkload must put
+		// the identical term on every role's pod spec — a role without the term
+		// could co-locate with a constrained role, breaking the mutual guarantee.
+		r := &InferenceServiceReconciler{Scheme: testScheme}
+		profile := &aiv1alpha1.InferenceRuntimeProfile{Spec: aiv1alpha1.InferenceRuntimeProfileSpec{
+			PodAntiAffinity: &aiv1alpha1.PodAntiAffinity{TopologyKey: "topology.kubernetes.io/zone"},
+			Roles: []aiv1alpha1.Role{
+				{Name: testApplyRouterRole, Workload: aiv1alpha1.Workload{Kind: aiv1alpha1.WorkloadKindDeployment}},
+				{Name: "prefill", Workload: aiv1alpha1.Workload{Kind: aiv1alpha1.WorkloadKindDeployment}},
+			},
+		}}
+		isvc := &aiv1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: testISVCName, Namespace: testNamespace}}
+		wantTerm := corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"ai.cubestack.io/inference-service": testISVCName}},
+			TopologyKey:   "topology.kubernetes.io/zone",
+		}
+		for _, role := range profile.Spec.Roles {
+			rr := &renderer.RenderedRole{Name: role.Name, Replicas: 1, PodTemplate: aiv1alpha1.PodTemplate{Image: testEngineImage}}
+			obj := r.desiredWorkload(isvc, profile, &role, rr, &renderer.Result{}, modelHostPath())
+			dep := obj.(*appsv1.Deployment)
+			Expect(dep.Spec.Template.Spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution).To(Equal([]corev1.PodAffinityTerm{wantTerm}))
+		}
 	})
 
 	It("attaches a required nodeAffinity In term for multi-model accelerators", func() {

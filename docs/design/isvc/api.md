@@ -489,6 +489,7 @@ Controller 将此模板按 `workload.kind` 写入对应位置：`LeaderWorkerSet
 | `endpoint.role` | string | L0：必填；L1：必须存在于 `roles`，且该 role 须定义 `service` | 作为服务对外端点的 role 名称。Controller 以该 role 的 Service 作为内部端点（InferenceService 的 `status.endpoint.internal`）；`publish: true` 时，它同时作为 HTTPRoute 的后端。渲染后 Service 的可解析性由 `EndpointReady` 校验（见 §3.3）。 |
 | `endpoint.portName` | string | L0：可选，默认 `http`；L2：渲染后须存在于端点 Service 的端口中（`EndpointReady`） | 对外端点使用的 Service 端口名，与 `endpoint.role` 一起确定 HTTPRoute 的后端端口。 |
 | `readinessPolicy.requireAllRoles` | bool | L0：v1alpha1 固定 `true` | 服务就绪条件的聚合方式：所有 role 的工作负载和 Pod 都就绪后，InferenceService 才会标记为 Ready。 |
+| `podAntiAffinity` | object | L0：可选；`topologyKey` 必填且为合法 K8s label key | 同服务 Pod 反亲和：`{topologyKey}`。本服务**全部 role** 的 Pod（leader/worker、跨组、跨 role）在声明的拓扑域内互不共置（`requiredDuringSchedulingIgnoredDuringExecution`）——声明一次，Controller 将其注入每个 role 的 PodSpec，保证是互斥的双向约束。labelSelector 由平台固定为本服务（`ai.cubestack.io/inference-service`），不可自定义——用于多副本组异机/异域散布；单副本无效果。与 `accelerator.models` 的 nodeSelector/nodeAffinity（§3.2）按 K8s AND 语义叠加。 |
 
 #### Status
 

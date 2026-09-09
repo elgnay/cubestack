@@ -221,6 +221,19 @@ var _ = Describe("InferenceRuntimeProfile", func() {
 			Expect(k8sClient.Delete(ctx, irp)).To(Succeed())
 		})
 
+		It("accepts a podAntiAffinity topologyKey and round-trips the spec", func() {
+			irp := validInferenceRuntimeProfile("irp-antiaffinity")
+			irp.Spec.PodAntiAffinity = &PodAntiAffinity{TopologyKey: "kubernetes.io/hostname"}
+
+			Expect(k8sClient.Create(ctx, irp)).To(Succeed())
+
+			got := &InferenceRuntimeProfile{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: irp.Name}, got)).To(Succeed())
+			Expect(got.Spec).To(Equal(irp.Spec))
+
+			Expect(k8sClient.Delete(ctx, irp)).To(Succeed())
+		})
+
 		//nolint:dupl // status subresource round-trip mirrors the ModelVersion test
 		It("updates status through the status subresource", func() {
 			irp := validInferenceRuntimeProfile("irp-status")
@@ -412,6 +425,18 @@ var _ = Describe("InferenceRuntimeProfile", func() {
 					}}
 				},
 				"Unsupported value"),
+			Entry("podAntiAffinity without topologyKey",
+				"irp-invalid-antiaffinity-no-topology",
+				func(s *InferenceRuntimeProfileSpec) {
+					s.PodAntiAffinity = &PodAntiAffinity{}
+				},
+				"spec.podAntiAffinity.topologyKey"),
+			Entry("podAntiAffinity with an invalid topologyKey",
+				"irp-invalid-antiaffinity-topology",
+				func(s *InferenceRuntimeProfileSpec) {
+					s.PodAntiAffinity = &PodAntiAffinity{TopologyKey: "not a label key"}
+				},
+				"spec.podAntiAffinity.topologyKey"),
 			Entry("probe without httpGet or tcpSocket",
 				"irp-invalid-probe-no-action",
 				func(s *InferenceRuntimeProfileSpec) {

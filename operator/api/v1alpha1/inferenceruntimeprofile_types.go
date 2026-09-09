@@ -415,6 +415,18 @@ type EmptyDirVolume struct {
 	SizeLimit *resource.Quantity `json:"sizeLimit,omitempty"`
 }
 
+// PodAntiAffinity is the supported pod anti-affinity subset: one required
+// term spreading this service's pods across the given topology domains.
+// Declaring it gives the scheduler a hard constraint: no two pods carrying
+// the service label may share a topology domain.
+type PodAntiAffinity struct {
+	// TopologyKey is the domain across which the service's pods must be
+	// spread, e.g. kubernetes.io/hostname. Must be a valid Kubernetes label
+	// key: an optional lowercase DNS prefix followed by a lowercase name.
+	// +kubebuilder:validation:Pattern="^([a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*[/])?[a-z0-9]([-a-z0-9_.]*[a-z0-9])?$"
+	TopologyKey string `json:"topologyKey"`
+}
+
 // HostPathVolume is a hostPath volume.
 type HostPathVolume struct {
 	// Path is the absolute host path.
@@ -595,6 +607,12 @@ type InferenceRuntimeProfileSpec struct {
 
 	// Endpoint selects the role serving as the service endpoint.
 	Endpoint EndpointSpec `json:"endpoint"`
+
+	// PodAntiAffinity spreads this service's pods (of every role) across the
+	// given topology domains: no two pods of the service may share a domain.
+	// The label selector is fixed by the platform to the service itself.
+	// +optional
+	PodAntiAffinity *PodAntiAffinity `json:"podAntiAffinity,omitempty"`
 
 	// ReadinessPolicy aggregates the service readiness condition.
 	// +optional

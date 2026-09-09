@@ -21,6 +21,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
 )
@@ -150,6 +151,28 @@ func buildPodSpec(pt aiv1alpha1.PodTemplate, isvcName string, model *aiv1alpha1.
 		})
 	}
 	return spec
+}
+
+// attachServiceAntiAffinity adds the service-wide anti-affinity term to one
+// role's pod spec (design §3.2 podAntiAffinity): no two pods of this service
+// may share the declared topology domain. The label selector is fixed by the
+// platform to the service label — it cannot be customized. desiredWorkload
+// calls it for every role from the single profile-level declaration, so all
+// role pods carry the same term and the guarantee is mutual.
+func attachServiceAntiAffinity(spec *corev1.PodSpec, isvcName, topologyKey string) {
+	if spec.Affinity == nil {
+		spec.Affinity = &corev1.Affinity{}
+	}
+	if spec.Affinity.PodAntiAffinity == nil {
+		spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{}
+	}
+	spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution = append(
+		spec.Affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		corev1.PodAffinityTerm{
+			LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{inferenceServiceLabelKey: isvcName}},
+			TopologyKey:   topologyKey,
+		},
+	)
 }
 
 // attachModelNodeAffinity constrains scheduling to nodes offering one of the
