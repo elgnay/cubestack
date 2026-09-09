@@ -39,6 +39,27 @@ images are final** — they cannot be solved inside the images themselves.
 | 11 | GPU extended resource | `::gpuResource`: nvidia `nvidia.com/gpu` / metax `metax-tech.com/gpu` | The image is device-agnostic; `nvidia-smi`/`mx-smi` come from driver injection | ✅ see §3 |
 | 12 | SSH login user | `sshEndpointUser="user"` (:137) is the platform default → endpoint `ssh://user@<gw>`; first-party images **declare** their login account via the `image.cubestack.io/ssh-user` label (all ship `user`); operator resolution precedence spec → label → default is issue #169 | The image must contain the login account it declares (default `user`), uid 1000 | ✅ |
 
+### Image-declared runtime metadata (`image.cubestack.io/*`)
+
+Images may declare, via labels, the runtime facts the platform otherwise assumes.
+Labels are read **only for builtin-registry images** (issue #169) and fall back to
+platform defaults when absent. One precedence applies to every knob:
+**spec field > image label > platform default** — labels carry per-image facts so a
+curated/relayed image "just works" with nothing set; spec fields remain the
+per-environment override. Of the four knobs, only `ssh-user` needs a new spec
+field; uid/gid/home already have homes in the DevEnvironment CRD.
+
+| Knob | Image label | Platform default | Spec override (CRD) |
+|---|---|---|---|
+| SSH login account | `image.cubestack.io/ssh-user` | `user` | `spec.ssh.userName` (new, #169) |
+| Container uid | `image.cubestack.io/uid` | `1000` | `spec.runtime.securityContext.runAsUser` |
+| Container gid | `image.cubestack.io/gid` | `1000` | `spec.runtime.securityContext.runAsGroup` |
+| Durable home / mount | `image.cubestack.io/home` | `/workspace` | `spec.storage.mountPath` |
+
+For inspectable (builtin) images the controller validates tuple coherence: the
+declared `ssh-user`'s passwd uid must equal the resolved uid — a non-root sshd can
+only serve an account whose uid equals the process uid.
+
 ### Gap A — `/workspace` writable by uid 1000
 
 The pod sets no `fsGroup`; the workspace PVC uses `cephfs-ephemeral` (RWX, `assets.go:85`). The
