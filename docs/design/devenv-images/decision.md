@@ -37,7 +37,7 @@ images are final** — they cannot be solved inside the images themselves.
 | 9 | Runtime-mode inference | Single-container pod; `type` and `image` are independent axes; the controller injects no `type`/mode env | The same image must decide by itself whether to run jupyter or sshd (e.g. inferred from whether `JUPYTER_TOKEN` is injected / ssh keys are mounted) | 🚩 **convention to be defined** (implicit inference is workable; explicit is recommended) |
 | 10 | Multi-service in one container | `sshExposed` adds a 22 Service and mounts keys for jupyter/vscode types, sharing the main container | jupyter type + `ssh.enabled` ⇒ the same process group must run jupyter *and* sshd | ✅ handled by entrypoint script |
 | 11 | GPU extended resource | `::gpuResource`: nvidia `nvidia.com/gpu` / metax `metax-tech.com/gpu` | The image is device-agnostic; `nvidia-smi`/`mx-smi` come from driver injection | ✅ see §3 |
-| 12 | SSH login user | `sshEndpointUser="user"` (:137), endpoint `ssh://user@<gw>` | The image must contain an account named `user`, uid 1000 | ✅ |
+| 12 | SSH login user | `sshEndpointUser="user"` (:137) is the platform default → endpoint `ssh://user@<gw>`; first-party images **declare** their login account via the `image.cubestack.io/ssh-user` label (all ship `user`); operator resolution precedence spec → label → default is issue #169 | The image must contain the login account it declares (default `user`), uid 1000 | ✅ |
 
 ### Gap A — `/workspace` writable by uid 1000
 
@@ -168,8 +168,9 @@ Key points:
 - **Entrypoint / service capability lives in the platform layer**: GPU and CPU images share the
   jupyter/sshd/entrypoint logic; the GPU layer only adds the runtime. Dockerfiles use multi-stage /
   shared base images so the entrypoint is not duplicated four times.
-- **User is uniformly `user`** (uid/gid 1000, aligning with `sshEndpointUser` and
-  `desiredSecurityContext`), with `HOME` on the mount point (`/workspace`).
+- **First-party images expose the account `user`** (uid/gid 1000, aligning with the `sshEndpointUser`
+  default and `desiredSecurityContext`), declared via the `image.cubestack.io/ssh-user` label (see §2 #12,
+  issue #169), with `HOME` on the mount point (`/workspace`).
 - **`base-cuda`/`base-maca` reuse the same platform layer**: a jupyter-type environment can pick a
   GPU-vendor image, while an ssh-type environment on a GPU-vendor image runs only sshd (mode chosen
   by the entrypoint).
@@ -237,9 +238,11 @@ pin `harbor.local/ai-images/base-cuda:11.8-pytorch2.2` / `harbor.local/ai-images
     arbitrary-UID must follow its remap rules.
   - Option B: **self-build** (ubuntu22.04 + conda/pip + jupyterlab + custom entrypoint) — full control
     of uid/HOME/size, but you own the dependency manifest.
-  - **Recommendation**: CPU `jupyter` via Option B self-build (the platform layer already contains this
-    stack, §4); the GPU variant is base-cuda's platform layer. Fall back to Option A (thin-overlay
-    Quay) only if the product clearly needs the full docker-stacks ecosystem.
+  - **Decision**: CPU `jupyter` via Option A **thin-overlay** on `quay.io/jupyter/minimal-notebook` —
+    the platform layer (shared scripts + account/`HOME` contract, §4) is overlaid on the mature
+    docker-stacks base (rename `jovyan` → `user`/gid 1000, `HOME` on the mount point). Option B
+    (self-build) stays a fallback if a product later needs the ecosystem trimmed; the GPU variant
+    remains base-cuda's platform layer.
 - **`ssh·ubuntu-server` (CPU)**: self-build (ubuntu22.04 + openssh-server + entrypoint that
   copies/tightens keys) — simplest, smallest attack surface.
 - **Acceptance mapping**: jupyter 8888 + token (`JUPYTER_TOKEN` env, no-token rejected) + base_url path
@@ -285,7 +288,7 @@ pin `harbor.local/ai-images/base-cuda:11.8-pytorch2.2` / `harbor.local/ai-images
 | Dockerfiles live in monorepo `images/` | §7 | ✅ recommended (lands with the build work) |
 | base-cuda base = runtime (not devel) + whether to bake torch | §6.1 | ⚠️ **pending product** (CUDA version 11.8 vs 12.x, torch version, devel variant?) |
 | base-maca self-build + commercial gate | §6.2 | ⚠️ **to confirm**: Metax package channel / injection model / target software versions |
-| jupyter CPU self-build vs thin-overlay Quay | §6.3 | ⚠️ to confirm |
+| jupyter CPU = thin-overlay Quay (Option A) | §6.3 | ✅ decided (shipped in images work) |
 | ssh·ubuntu-server self-build | §6.3 | ✅ recommended here |
 | Gaps A/B/C/D closure | §8 | ⚠️ **to schedule into follow-up controller work** (B/C precede image acceptance) |
 
