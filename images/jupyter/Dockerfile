@@ -61,6 +61,10 @@ RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
 
 # $HOME/workdir on the PVC; ephemeral caches/runtime are redirected to the image
 # (/home/user) so they never clobber or durably pollute the user's workspace.
+# The SSH login account this image exposes when its sshd runs; the platform
+# reads it to build the ssh://<user>@... endpoint (see images README, #169).
+LABEL ai.cubestack.io/ssh-user="user"
+
 ENV CUBESTACK_IMAGE=jupyter \
     HOME=/workspace \
     XDG_CACHE_HOME=/home/user/.cache \
