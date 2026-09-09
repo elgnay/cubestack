@@ -45,7 +45,7 @@ RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
 
 # The SSH login account this image exposes; the platform reads it to build the
 # ssh://<user>@... endpoint (see images README, #169).
-LABEL ai.cubestack.io/ssh-user="user"
+LABEL image.cubestack.io/ssh-user="user"
 
 ENV CUBESTACK_IMAGE=ssh \
     HOME=/workspace
