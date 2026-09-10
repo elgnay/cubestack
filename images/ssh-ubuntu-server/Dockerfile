@@ -1,12 +1,16 @@
-# Cubestack 'ssh-ubuntu-server' DevEnvironment base image.
+# Cubestack 'ssh-ubuntu22.04' DevEnvironment base image.
 #
-# Minimal image exposing sshd on :22 for the platform 'ssh' DevEnvironment type.
-# The operator mounts the ssh Secret read-only at /etc/cubestack/ssh (host keys +
-# authorized_keys) and runs the container as uid/gid 1000 with $HOME=/workspace
-# (the workspace PVC). The entrypoint stages those keys and starts sshd.
+# Minimal image exposing sshd on the unprivileged :2222 for the platform 'ssh'
+# DevEnvironment type (the Service publishes it as 22).
+# No key staging: the operator mounts two Secret keys as files (subPath) and sshd
+# reads them in place —
+#   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity)
+#   authorized_keys      -> $HOME/.ssh/authorized_keys2     (platform keys)
+# The container runs as uid/gid 1000 with $HOME=/home/ubuntu (the workspace PVC).
+# See images/README.md for the mount contract and its subPath caveat.
 #
 # Build context MUST be images/ (not this directory) so common/ is COPYable:
-#   docker build -f ssh-ubuntu-server/Dockerfile -t cubestack/ssh-ubuntu-server:smoke images/
+#   docker build -f ssh-ubuntu-server/Dockerfile -t harbor.isuanova.com/suanova/ssh-ubuntu22.04:<tag> images/
 #   (or: make -C images build)
 
 ARG UBUNTU_VERSION=22.04
@@ -26,31 +30,39 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Platform account: literal 'user', uid/gid 1000. passwd HOME points at the
-# workspace PVC so ssh login and $HOME land on /workspace. /home/user holds only
-# non-durable runtime state (staged ssh keys, caches).
-RUN groupadd -g 1000 cubestack \
-    && mkdir -p /workspace \
-               /home/user/cubestack/ssh \
-               /home/user/.cache /home/user/.config /home/user/.local/share \
-    && useradd -u 1000 -g 1000 -s /bin/bash -d /workspace user \
-    && chown -R 1000:1000 /workspace /home/user \
-    && chmod 700 /home/user/cubestack/ssh
+# Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the same
+# account, group, and home the AWS Ubuntu cloud image uses. The workspace PVC
+# mounts at the home, so nothing durable is baked under it; ~/.ssh exists only so
+# a subPath Secret mount and `ssh-copy-id` have a target when no PVC is attached.
+RUN groupadd -g 1000 ubuntu \
+    && useradd -u 1000 -g 1000 -s /bin/bash -d /home/ubuntu ubuntu \
+    && mkdir -p /home/ubuntu/.ssh \
+    && chown -R 1000:1000 /home/ubuntu \
+    && chmod 700 /home/ubuntu/.ssh
+
+# No host keys in the image: identity comes from the mounted Secret. Their
+# absence is also what tells the entrypoint whether ssh is enabled.
+RUN rm -f /etc/ssh/ssh_host_*
 
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
-COPY common/ssh-setup.sh /usr/local/bin/cubestack-ssh-setup.sh
-COPY common/sshd/10-cubestack-nonroot.conf /etc/ssh/sshd_config.d/10-cubestack-nonroot.conf
+# Shared sshd config (common/), with this family's ssh login account substituted
+# for the @SSH_USER@ placeholder. It must match USER below.
+ARG SSH_USER=ubuntu
+COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
-             /usr/local/bin/cubestack-ssh-setup.sh
+    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
 
-# The SSH login account this image exposes; the platform reads it to build the
-# ssh://<user>@... endpoint (see images README, #169).
-LABEL image.cubestack.io/ssh-user="user"
+# The account this image's layout is built around, and its home — declared
+# because the home differs from the platform mount default (/workspace). The
+# platform reads these to build the ssh://<user>@... endpoint and to mount the
+# workspace (#169).
+LABEL image.cubestack.io/user="${SSH_USER}" \
+      image.cubestack.io/home="/home/ubuntu"
 
 ENV CUBESTACK_IMAGE=ssh \
-    HOME=/workspace
+    HOME=/home/ubuntu
 
-WORKDIR /workspace
+WORKDIR /home/ubuntu
 USER 1000:1000
-EXPOSE 22
+EXPOSE 2222
 ENTRYPOINT ["tini", "-g", "--", "/usr/local/bin/cubestack-entrypoint.sh"]

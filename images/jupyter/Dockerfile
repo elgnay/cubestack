@@ -1,14 +1,24 @@
-# Cubestack 'jupyter' DevEnvironment base image (CPU).
+# Cubestack 'jupyter-minimal' DevEnvironment image (CPU) — stock-native overlay.
 #
-# Thin overlay on the docker-stacks minimal-notebook image: keep the mature
-# conda/JupyterLab stack and overlay the platform contract (see
-# docs/design/devenv-images/decision.md):
-#   - account 'user', uid/gid 1000, $HOME/workdir on /workspace (workspace PVC)
-#   - JupyterLab on :8888 honoring JUPYTER_TOKEN and CUBESTACK_BASE_URL
-#   - optional sshd on :22 when the /etc/cubestack/ssh Secret is mounted
+# Thin overlay on the docker-stacks minimal-notebook image that enables ONLY ssh
+# for the platform (see docs/design/devenv-images/decision.md): everything else
+# stays identical to the stock image. The upstream layout is kept exactly — user
+# 'jovyan' (uid 1000, primary group 'users' gid 100), $HOME=/home/jovyan, and the
+# stock launch chain tini -> start.sh -> start-notebook.py — so the platform
+# adapts to the image rather than the image to the platform.
+#
+# Additions on top of stock:
+#   - openssh-server, started only when the operator mounted the ssh Secret. No
+#     key staging: the Secret keys are mounted with subPath (host key at
+#     /etc/ssh/ssh_host_ed25519_key, platform authorized_keys at
+#     $HOME/.ssh/authorized_keys2) and sshd reads them in place.
+#   - image.cubestack.io/* labels declaring the native layout (uid/gid/home) and
+#     the ssh login account, so the operator can adapt.
+#   - Jupyter itself honors JUPYTER_TOKEN and NOTEBOOK_ARGS natively (token,
+#     base_url, ...) — no overlay jupyter logic.
 #
 # Build context MUST be images/ so common/ is COPYable:
-#   docker build -f jupyter/Dockerfile -t cubestack/jupyter:smoke images/
+#   docker build -f jupyter/Dockerfile -t harbor.isuanova.com/suanova/jupyter-minimal:<tag> images/
 #   (or: make -C images build)
 
 ARG JUPYTER_BASE=quay.io/jupyter/minimal-notebook:2026-09-07
@@ -30,49 +40,42 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
-# docker-stacks ships user 'jovyan' (uid 1000, primary group 'users' gid 100).
-# Rename to the platform 'user' account and move the primary group to gid 1000
-# so a runAsGroup=1000 process can write /opt/conda (upstream files are group
-# 'users', gid 100). /home/user keeps the real home for non-durable runtime dirs;
-# passwd HOME points at the workspace PVC so ssh login and notebook root land on
-# /workspace.
-RUN groupadd -g 1000 cubestack \
-    && usermod -l user jovyan \
-    && usermod -d /home/user -m user \
-    && usermod -g 1000 user \
-    && mkdir -p /workspace \
-               /home/user/.cache \
-               /home/user/.config \
-               /home/user/.local/share/jupyter/runtime \
-    && chown -R 1000:1000 /home/user /workspace \
-    && usermod -d /workspace user \
-    && chown -R 1000:1000 /opt/conda
-
-# conda on PATH for interactive ssh logins (login shells read /etc/profile.d).
-RUN printf 'export PATH="/opt/conda/bin:$PATH"\n' > /etc/profile.d/99-cubestack-conda.sh
+# Create the ~/.ssh target for the subPath authorized_keys mount (so a manual run
+# without a workspace PVC still works; the PVC shadows it in-cluster), and drop
+# the package-generated host keys: identity comes from the mounted Secret, and
+# their absence is how the entrypoint detects that ssh is enabled.
+RUN mkdir -p /home/jovyan/.ssh \
+    && chown 1000:100 /home/jovyan/.ssh \
+    && chmod 700 /home/jovyan/.ssh \
+    && rm -f /etc/ssh/ssh_host_*
 
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
-COPY common/ssh-setup.sh /usr/local/bin/cubestack-ssh-setup.sh
-COPY common/run-jupyter.sh /usr/local/bin/cubestack-run-jupyter.sh
-COPY common/sshd/10-cubestack-nonroot.conf /etc/ssh/sshd_config.d/10-cubestack-nonroot.conf
+# Shared sshd config (common/), with this family's ssh login account substituted
+# for the @SSH_USER@ placeholder. It must match the stock container account
+# (jovyan) that USER selects below.
+ARG SSH_USER=jovyan
+COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
-             /usr/local/bin/cubestack-ssh-setup.sh \
-             /usr/local/bin/cubestack-run-jupyter.sh
+    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
 
-# $HOME/workdir on the PVC; ephemeral caches/runtime are redirected to the image
-# (/home/user) so they never clobber or durably pollute the user's workspace.
-# The SSH login account this image exposes when its sshd runs; the platform
-# reads it to build the ssh://<user>@... endpoint (see images README, #169).
-LABEL image.cubestack.io/ssh-user="user"
+# Native layout of this stock-derived image, declared so the platform can adapt
+# to it rather than conform it (see images README, #169). user = the container
+# account (the one this image's sshd serves: a non-root sshd can only serve the
+# uid it runs as).
+LABEL image.cubestack.io/user="${SSH_USER}" \
+      image.cubestack.io/uid="1000" \
+      image.cubestack.io/gid="100" \
+      image.cubestack.io/home="/home/jovyan"
 
-ENV CUBESTACK_IMAGE=jupyter \
-    HOME=/workspace \
-    XDG_CACHE_HOME=/home/user/.cache \
-    XDG_CONFIG_HOME=/home/user/.config \
-    XDG_DATA_HOME=/home/user/.local/share \
-    JUPYTER_RUNTIME_DIR=/home/user/.local/share/jupyter/runtime
+ENV CUBESTACK_IMAGE=jupyter
 
-WORKDIR /workspace
-USER 1000:1000
-EXPOSE 8888 22
+EXPOSE 8888 2222
+
+# Back to the stock account; HOME/workdir remain stock /home/jovyan.
+USER 1000
+
+# Our entrypoint runs first (starts sshd when the Secret is mounted), then hands
+# off to the image CMD, which reproduces the stock launch chain exactly (the base
+# image runs tini + ENTRYPOINT start.sh + CMD start-notebook.py).
 ENTRYPOINT ["tini", "-g", "--", "/usr/local/bin/cubestack-entrypoint.sh"]
+CMD ["/usr/local/bin/start.sh", "start-notebook.py"]
