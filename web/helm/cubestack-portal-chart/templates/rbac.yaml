@@ -33,10 +33,29 @@ metadata:
     app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
     helm.sh/chart: {{ include "cubestack-portal-chart.chart" . }}
 rules:
-  # Read namespaces for UI APIs (cluster-scoped resource)
+  # Read namespaces and nodes for UI APIs (cluster-scoped core resources)
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+  # Read and write the operator's CRs. Reads are cluster-wide because the UI
+  # aggregates them (listClusterCustomObject) and the CRDs are a mix of
+  # namespaced and cluster scope. Writes (create/update/delete) are cluster-wide
+  # because the UI creates an environment/service in whichever namespace the
+  # user picks, and the portal has no per-user role or namespace scoping —
+  # sessions carry only the username (see the chart README, "Authorization
+  # model"), so every valid session is effectively a platform admin. Guard the
+  # htpasswd credentials as admin credentials. profiles and modelversions stay
+  # read-only: the UI never writes them.
+  - apiGroups: ["ai.cubestack.io"]
+    resources: ["inferenceservices", "devenvironments"]
+    verbs: ["create", "update", "delete", "get", "list", "watch"]
+  - apiGroups: ["ai.cubestack.io"]
+    resources: ["inferenceruntimeprofiles", "modelversions"]
+    verbs: ["get", "list", "watch"]
+
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
