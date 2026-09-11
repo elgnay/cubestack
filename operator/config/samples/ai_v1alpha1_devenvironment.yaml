@@ -23,7 +23,11 @@ spec:
   storage:
     size: 200Gi
     pvcRetention: retain         # retain / delete
-    mountPath: /workspace        # workspace mount path (default); base images set HOME here
+    # mountPath is optional. Left out, the controller derives the workspace path
+    # from runtime.user: /home/<user>, /root when running as root (runAsUser 0),
+    # else /workspace. Set it to pin a path — e.g. for a bring-your-own image
+    # whose home is somewhere else.
+    mountPath: /home/ubuntu
 
   # Extra data volumes (referencing existing PVCs)
   volumes:
@@ -46,6 +50,13 @@ spec:
 
   # Container runtime customization
   runtime:
+    # The account the container runs as — the one the image's sshd serves, and the
+    # account the ssh endpoint advertises. Omit it for the platform default "user";
+    # set it to the image's own account: "ubuntu" for the self-authored images
+    # (ssh-ubuntu22.04, base-cuda, base-maca), "jovyan" for the stock-derived
+    # jupyter-minimal (which also needs securityContext.runAsGroup: 100, its stock
+    # gid — the platform default is 1000).
+    user: ubuntu
     env:
       - name: MODEL_REPO
         value: /models/llama3-8b

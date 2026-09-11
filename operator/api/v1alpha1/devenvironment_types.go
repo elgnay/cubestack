@@ -54,9 +54,10 @@ type DevEnvironmentSpec struct {
 	Resources ResourcesSpec `json:"resources"`
 
 	// Storage is the workspace storage: a PVC created with the environment and
-	// mounted at the workspace path (default /workspace). Omit it to avoid
-	// creating a managed workspace PVC; to use an existing PVC as the workspace,
-	// mount it via spec.volumes at the workspace path (e.g. /workspace).
+	// mounted at the workspace path (spec.storage.mountPath, else derived from
+	// spec.runtime). Omit it to avoid creating a managed workspace PVC; to use an
+	// existing PVC as the workspace, mount it via spec.volumes at the workspace
+	// path (e.g. /workspace).
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
 
@@ -137,12 +138,13 @@ type StorageSpec struct {
 	// +optional
 	PVCRetention PVCRetentionPolicy `json:"pvcRetention,omitempty"`
 
-	// MountPath is the path where the workspace PVC is mounted; defaults to
-	// /workspace. The platform's base images set the container home/working
-	// directory to this path, so user data persists across restarts. Custom
-	// images must either align their home to this path or override mountPath
-	// with the image's home directory.
-	// +kubebuilder:default="/workspace"
+	// MountPath is the path where the workspace PVC is mounted. Leave it unset
+	// to derive the path from spec.runtime: /root when the container runs as
+	// root, /home/<user> when spec.runtime.user names an account, and /workspace
+	// otherwise. Set it to pin a different path — e.g. for a bring-your-own
+	// image whose home is somewhere else. It should be the directory the
+	// container's home points at, otherwise the workspace does not follow the
+	// user's home.
 	// +optional
 	MountPath string `json:"mountPath,omitempty"`
 }
@@ -231,6 +233,17 @@ type RuntimeSpec struct {
 	// Env is the environment variables (name/value or valueFrom: secretKeyRef).
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// User is the container account the environment runs as — the account the
+	// image's own sshd serves — and the account the SSH endpoint advertises. It
+	// defaults to the platform's conventional account "user"; set it when the
+	// image runs as something else (e.g. "jovyan" for a docker-stacks image),
+	// since a non-root sshd can only serve the uid it runs as, and
+	// securityContext.runAsUser has to name that same account.
+	// +kubebuilder:validation:MaxLength=32
+	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]*$`
+	// +optional
+	User string `json:"user,omitempty"`
 
 	// SecurityContext controls the container user: non-root by default
 	// (runAsUser=1000); set runAsUser=0 to run as root. The controller enforces

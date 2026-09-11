@@ -15,7 +15,8 @@ Container images that back the DevEnvironment `type`/image contract served by th
   **`/home/ubuntu`** (e.g. `ssh-ubuntu22.04`).
 - **Stock-derived** images keep their upstream-native layout **unchanged** and the overlay
   enables only ssh (e.g. `jupyter-minimal`: account `jovyan`, uid 1000 gid 100, home
-  `/home/jovyan`, stock launch chain). The platform adapts to each image via its declared labels.
+  `/home/jovyan`, stock launch chain). The platform is told about that layout per environment,
+  through the DevEnvironment spec — no image metadata is read.
 
 Every image:
 - never sets command/args (the controller provides none) — the image ENTRYPOINT decides what
@@ -26,8 +27,9 @@ Every image:
   `ssh_host_ed25519_key` at `/etc/ssh/ssh_host_ed25519_key` and `authorized_keys` at
   `$HOME/.ssh/authorized_keys2`. The mounted host key is also the ssh-enabled signal — images ship no
   host keys of their own
-- declares its runtime facts as labels under `image.cubestack.io/*`: `user` and `home` for the
-  self-authored image, plus `uid`/`gid` for the stock-derived overlay
+- accepts its account, uid/gid, and home being named in the DevEnvironment spec
+  (`spec.runtime.user`, `spec.runtime.securityContext`, `spec.storage.mountPath`) — `images/README.md`
+  gives the values per image
 
 ## Rules
 
@@ -41,7 +43,7 @@ Every image:
   contract's paths are fixed). The only per-family value in the drop-in is the ssh login account,
   kept as an `@SSH_USER@` placeholder that each Dockerfile substitutes from its `ARG SSH_USER` — so
   the shared parts cannot drift between families. Dockerfiles assemble packages, the overlay deltas,
-  the substitution, and labels.
+  and the substitution.
 - **The ssh material is mounted, never baked or staged.** Changing the mount paths means changing the
   drop-in (`HostKey`, `AuthorizedKeysFile`) *and* `images/README.md`'s contract table together, plus
   the operator's mount. Key material must stay readable by the container uid: `0644` root-owned is

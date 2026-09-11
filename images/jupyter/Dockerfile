@@ -4,16 +4,16 @@
 # for the platform (see docs/design/devenv-images/decision.md): everything else
 # stays identical to the stock image. The upstream layout is kept exactly — user
 # 'jovyan' (uid 1000, primary group 'users' gid 100), $HOME=/home/jovyan, and the
-# stock launch chain tini -> start.sh -> start-notebook.py — so the platform
-# adapts to the image rather than the image to the platform.
+# stock launch chain tini -> start.sh -> start-notebook.py. A DevEnvironment
+# running this image configures that layout explicitly: spec.runtime.user=jovyan
+# derives the workspace mount /home/jovyan, and securityContext.runAsGroup must
+# be set to 100 (see images/README.md).
 #
 # Additions on top of stock:
 #   - openssh-server, started only when the operator mounted the ssh Secret. No
 #     key staging: the Secret keys are mounted with subPath (host key at
 #     /etc/ssh/ssh_host_ed25519_key, platform authorized_keys at
 #     $HOME/.ssh/authorized_keys2) and sshd reads them in place.
-#   - image.cubestack.io/* labels declaring the native layout (uid/gid/home) and
-#     the ssh login account, so the operator can adapt.
 #   - Jupyter itself honors JUPYTER_TOKEN and NOTEBOOK_ARGS natively (token,
 #     base_url, ...) — no overlay jupyter logic.
 #
@@ -57,15 +57,6 @@ ARG SSH_USER=jovyan
 COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
     && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
-
-# Native layout of this stock-derived image, declared so the platform can adapt
-# to it rather than conform it (see images README, #169). user = the container
-# account (the one this image's sshd serves: a non-root sshd can only serve the
-# uid it runs as).
-LABEL image.cubestack.io/user="${SSH_USER}" \
-      image.cubestack.io/uid="1000" \
-      image.cubestack.io/gid="100" \
-      image.cubestack.io/home="/home/jovyan"
 
 ENV CUBESTACK_IMAGE=jupyter
 

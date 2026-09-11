@@ -47,6 +47,7 @@ const (
 	testGatewayIP         = "1.2.3.4"
 	testGRPCPortName      = "grpc"
 	testJupyterName       = "jupyter"
+	testRuntimeUser       = "jovyan"
 	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 )
 
@@ -464,6 +465,81 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			sc := desiredSecurityContext(&aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(1001))}})
 			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(true)))
 			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(1001))))
+		})
+	})
+
+	Describe("resolveMountPath", func() {
+		// The path depends only on spec.storage.mountPath and the runtime identity,
+		// so the fixture carries nothing else.
+		env := func(mutate func(*aiv1alpha1.DevEnvironmentSpec)) *aiv1alpha1.DevEnvironment {
+			e := &aiv1alpha1.DevEnvironment{}
+			if mutate != nil {
+				mutate(&e.Spec)
+			}
+			return e
+		}
+
+		It("falls back to the platform default when nothing is set", func() {
+			// The default account is "user", but an unset spec.runtime.user means
+			// /workspace — not /home/user.
+			Expect(resolveMountPath(env(nil))).To(Equal("/workspace"))
+		})
+
+		It("derives /home/<user> from a named account", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser}
+			}))).To(Equal("/home/jovyan"))
+		})
+
+		It("derives /root when the container runs as root", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))}}
+			}))).To(Equal("/root"))
+		})
+
+		It("lets an explicit mountPath win over the derivation", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser}
+				s.Storage = &aiv1alpha1.StorageSpec{MountPath: "/mnt/data"}
+			}))).To(Equal("/mnt/data"))
+		})
+
+		It("prefers root's home when root is requested alongside a named account", func() {
+			// Contradictory config: the container runs as root, so /root is the
+			// home the workspace has to follow.
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{
+					User:            "alice",
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				}
+			}))).To(Equal("/root"))
+		})
+
+		It("keeps an explicit non-root runAsUser on the account's home", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{
+					User:            "jovyan",
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(1000))},
+				}
+			}))).To(Equal("/home/jovyan"))
+		})
+	})
+
+	Describe("runtimeUser", func() {
+		It("advertises the account the spec names", func() {
+			Expect(runtimeUser(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Runtime: &aiv1alpha1.RuntimeSpec{User: testRuntimeUser},
+			}})).To(Equal(testRuntimeUser))
+		})
+
+		It("falls back to the platform default account", func() {
+			Expect(runtimeUser(&aiv1alpha1.DevEnvironment{})).To(Equal("user"))
+		})
+
+		It("falls back when the runtime is present but names no account", func() {
+			Expect(runtimeUser(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Runtime: &aiv1alpha1.RuntimeSpec{Command: []string{"sleep"}},
+			}})).To(Equal("user"))
 		})
 	})
 
@@ -1525,7 +1601,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 			Expect(got.Status.Endpoints).To(ContainElements(
 				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/"},
-				aiv1alpha1.Endpoint{Name: "ssh", Address: fmt.Sprintf("ssh://%s@%s:%d", sshEndpointUser, testGatewayIP, pSSH)},
+				aiv1alpha1.Endpoint{Name: "ssh", Address: fmt.Sprintf("ssh://%s@%s:%d", defaultRuntimeUser, testGatewayIP, pSSH)},
 				aiv1alpha1.Endpoint{Name: "metrics", Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/"},
 				aiv1alpha1.Endpoint{Name: testGRPCPortName, Address: fmt.Sprintf("%s:%d", testGatewayIP, pGRPC)},
 			))
@@ -1773,7 +1849,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					}
 				}
 				g.Expect(web).To(Equal("http://[2001:db8::1]:80" + webRootPath + env.Name + "/"))
-				g.Expect(ssh).To(HavePrefix("ssh://" + sshEndpointUser + "@[2001:db8::1]:"))
+				g.Expect(ssh).To(HavePrefix("ssh://" + defaultRuntimeUser + "@[2001:db8::1]:"))
 				g.Expect(tcp).To(HavePrefix("[2001:db8::1]:"))
 				g.Expect(portFromEndpoint(tcp)).To(BeNumerically(">", 0))
 				g.Expect(portFromEndpoint(ssh)).To(BeNumerically(">", 0))

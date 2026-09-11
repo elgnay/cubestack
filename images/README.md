@@ -11,7 +11,8 @@ Images are **not** all conformed to a single layout. The decision doc splits the
 - **Self-authored** images ship the platform default: account `ubuntu` (uid/gid **1000**), home and
   workdir **`/home/ubuntu`** (where the workspace PVC mounts).
 - **Stock-derived** images keep their upstream native layout **unchanged**; the overlay enables only
-  ssh. The platform reads each image's declared native facts and adapts to it — not the reverse.
+  ssh. The platform is told about that layout per environment, through the DevEnvironment spec — no
+  image metadata is read.
 
 | Image | Family | Base | Account (uid:gid) | Home / workspace | Exposes | ssh login |
 |-------|--------|------|-------------------|------------------|---------|-----------|
@@ -21,17 +22,29 @@ Images are **not** all conformed to a single layout. The decision doc splits the
 The `jupyter-minimal` overlay adds **only** `openssh-server` on top of the stock image: same account,
 home, conda stack, launcher (`tini → start.sh → start-notebook.py`), and jupyter settings.
 
-## Runtime facts the operator reads
+## Configuring a DevEnvironment for these images
 
-Each image may declare its layout as labels under `image.cubestack.io/*`. The stock-derived overlay
-declares all of them because its layout is upstream's; the self-authored image declares `user` and
-`home` (its home is not the platform mount default `/workspace`):
+Neither image's layout is discoverable from the cluster: the operator takes the run-as identity, the
+workspace mount path, and the ssh login account from the **DevEnvironment spec**. Pointing an
+environment at either shipped image therefore means stating what the image already is:
 
-- `image.cubestack.io/user` — the container account (the one its sshd serves).
-- `image.cubestack.io/uid` / `gid` / `home` — run-as identity and where the workspace PVC mounts.
+| Image | `spec.runtime.user` | `spec.runtime.securityContext` | Workspace mount |
+|-------|--------------------|-------------------------------|-----------------|
+| `ssh-ubuntu22.04` | `ubuntu` | *(omit — 1000:1000 is already the platform default)* | `/home/ubuntu` (derived) |
+| `jupyter-minimal` | `jovyan` | `runAsGroup: 100` | `/home/jovyan` (derived) |
 
-Honoring `home` for the PVC mountPath is operator work still tracked in #169; until it lands the
-operator mounts the PVC at `/workspace` while these images live at their declared home.
+What the controller derives when a field is omitted
+(`operator/internal/controller/devenvironment_controller.go`, `resolveMountPath` / `runtimeUser`):
+
+- **Workspace mount** — `spec.storage.mountPath` when set, else `/root` for an environment running as
+  root (`securityContext.runAsUser: 0`), else `/home/<user>` when `spec.runtime.user` names an
+  account, else `/workspace`.
+- **ssh login** — `spec.runtime.user`, else the platform default `user`.
+
+So `spec.runtime.user` alone yields the right mount for both images. `runAsGroup: 100` has to be set
+explicitly for `jupyter-minimal`: no other spec field implies the stock `gid 100`, and the default is
+1000. A bring-your-own image whose home is somewhere else pins it with `spec.storage.mountPath`, which
+always wins.
 
 ## Runtime behavior common to both images
 
@@ -46,7 +59,8 @@ operator mounts the PVC at `/workspace` while these images live at their declare
 - ssh is enabled by the presence of the mounted host key file — images ship no host keys of their own,
   and there is no key staging (see the mount contract below).
 - sshd runs as the container account (uid 1000): a non-root sshd can only serve the uid it runs as,
-  so the only login account is the image's own (coherent with the `user` label).
+  so the only login account is the image's own, and the resolved account has to name it — that is
+  `spec.runtime.user` when it is set, else the platform default `user`.
 - Jupyter is stock-native: the overlay adds no jupyter logic. `JUPYTER_TOKEN` (token) and
   `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`) are honored by the upstream launcher.
 
@@ -60,11 +74,15 @@ as files** with `subPath` — nothing is copied, staged, or re-permissioned in t
 | `ssh_host_ed25519_key` | `/etc/ssh/ssh_host_ed25519_key` | sshd host identity; its presence gates ssh |
 | `authorized_keys` | `$HOME/.ssh/authorized_keys2` | platform keys that may log in |
 
-`$HOME` is the image's declared `home` (`/home/ubuntu`, `/home/jovyan`) and the workspace PVC mounts
-there. sshd reads both files in place via the drop-in's `HostKey` and
-`AuthorizedKeysFile %h/.ssh/authorized_keys2 %h/.ssh/authorized_keys` — the second path is the user's
-own file, so `ssh-copy-id` and similar tools keep working alongside the platform keys. No `.pub` and
-no host-key-per-algorithm files are needed: sshd derives the public half from the private key.
+`$HOME` is the account's home (`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`), and the
+workspace PVC mounts there when the path is derived — an explicit `spec.storage.mountPath` is
+authoritative and may point elsewhere (see above), in which case `$HOME` stays on the container's own
+filesystem and only the workspace is durable. The rest of this contract holds either way: the subPath
+mount targets `$HOME` regardless, and the image bakes `$HOME/.ssh`. sshd reads both files in place via
+the drop-in's `HostKey` and `AuthorizedKeysFile %h/.ssh/authorized_keys2 %h/.ssh/authorized_keys` — the
+second path is the user's own file, so `ssh-copy-id` and similar tools keep working alongside the
+platform keys. No `.pub` and no host-key-per-algorithm files are needed: sshd derives the public half
+from the private key.
 
 That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
 serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
@@ -93,9 +111,10 @@ at `/etc/cubestack/ssh`. The changes below are tracked in **#173**.
   files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
   Tightening `defaultMode` to `0600`/`0400` makes the key unreadable to that uid and sshd exits with
   *no hostkeys available*.
-- **Mount the PVC at the image's declared `home`** (#169), so the platform keys land in the user's
-  home. It must also provide `~/.ssh`: the image bakes the directory, but the PVC shadows it, and the
-  subPath mount needs the parent to exist.
+- **Mount the PVC at the account's home** — the controller derives it from `spec.runtime.user` (see
+  above), unless the spec pins an explicit `mountPath`, which wins — so the platform keys land in the
+  user's home. It must also provide `~/.ssh`: the image bakes the directory, but the PVC shadows it,
+  and the subPath mount needs the parent to exist.
 - **Publish the container's `2222`** as the Service's ssh port (`port: 22`, `targetPort: 2222`) and
   point the readiness probe at `2222` — the probe targets the container, not the Service.
 
@@ -186,18 +205,20 @@ files are `COPY common/...`.
 
 - The `jupyter-minimal` overlay is intentionally thin: identical stock layout, sshd only. Tokens and the
   URL prefix flow through stock env (`JUPYTER_TOKEN`, `NOTEBOOK_ARGS`); `base_url` is not yet injected by
-  the operator (Gap C / #169). Its labels declare the native `gid 100` / `/home/jovyan`.
+  the operator (Gap C / decision doc §8). Its native `gid 100` and `/home/jovyan` are what a
+  DevEnvironment has to be configured with (see above).
 - sshd binds the unprivileged `2222`, so the images need **no capability at all** — design Gap B
   (`NET_BIND_SERVICE`) is closed by port choice rather than by granting a privilege. Two things follow:
   the operator must set the Service's `targetPort` to `2222` (#173), and a local smoke cannot validate
   the port privilege anyway — Docker writes `ip_unprivileged_port_start=0` into every container netns,
   so a container there can bind `:22` with no capability, while a pod's own netns defaults to `1024`.
-- The jupyter container runs at its native gid 100; until #169 lands the operator defaults
-  `runAsGroup` to 1000, so in-cluster correctness ships with #169. Self-authored images stay on the
-  platform uid/gid defaults (1000:1000).
-- The workspace PVC mounts at the image's declared home (`/home/ubuntu` self-authored; `/home/jovyan`
-  jupyter), where the notebook root already lives by default. An empty/root-owned PVC is
-  storage-side (Gap A); the image cannot fix it, and readiness is TCP-only.
+- The jupyter container runs at its native gid 100 while the operator defaults `runAsGroup` to 1000, so
+  the environment has to set `securityContext.runAsGroup: 100` — nothing else in the spec implies it.
+  Self-authored images stay on the platform uid/gid defaults (1000:1000).
+- The workspace PVC mounts at the account's home (`/home/ubuntu` self-authored; `/home/jovyan`
+  jupyter, both derived from `spec.runtime.user` — an explicit `spec.storage.mountPath` overrides),
+  where the notebook root already lives by default. An empty/root-owned PVC is storage-side (Gap A);
+  the image cannot fix it, and readiness is TCP-only.
 - **Smoke fidelity for the host-key mode.** Kubernetes projects Secret files root-owned `0644`, which a
   uid-1000 sshd accepts (the owner check applies only to a file owned by the uid doing the reading).
   Docker does not reproduce that faithfully: Docker Desktop reports a bind mount as root-owned `0600`

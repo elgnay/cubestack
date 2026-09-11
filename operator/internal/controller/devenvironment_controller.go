@@ -130,11 +130,20 @@ const (
 	serviceKind     = "Service"
 
 	// sshPortName names the SSH Service port and the "ssh" endpoint; the ssh
-	// endpoint address uses the generic login user of the base image.
+	// endpoint address carries the environment's login account, which is
+	// spec.runtime.user or defaultRuntimeUser when the spec names none.
 	sshPortName       = "ssh"
 	mainPortName      = "main"
 	sshKeysVolumeName = "ssh-keys"
-	sshEndpointUser   = "user"
+
+	// defaultRuntimeUser is the account an environment logs in as when
+	// spec.runtime.user names none; it is also the account the platform's base
+	// images conventionally use.
+	defaultRuntimeUser = "user"
+
+	// defaultWorkspacePath is where the workspace PVC mounts when neither
+	// spec.storage.mountPath nor the runtime identity implies another home.
+	defaultWorkspacePath = "/workspace"
 
 	// Jupyter token: the managed Secret <env>-auth holds the random token under
 	// the data key jupyterTokenKey, and the workload reads it through the
@@ -623,6 +632,37 @@ func jupyterTokenPodAnnotations(env *aiv1alpha1.DevEnvironment) map[string]strin
 	return map[string]string{jupyterTokenRevisionAnnotationKey: rev}
 }
 
+// runtimeUser is the account the environment's sshd serves: spec.runtime.user,
+// else the platform default.
+func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
+	if env.Spec.Runtime != nil && env.Spec.Runtime.User != "" {
+		return env.Spec.Runtime.User
+	}
+	return defaultRuntimeUser
+}
+
+// resolveMountPath is where the workspace PVC mounts: an explicit
+// spec.storage.mountPath wins, then the home the runtime identity implies —
+// /root for root, /home/<user> for a named account — else the platform default.
+// A container account is constrained by the CRD pattern to
+// ^[a-z_][a-z0-9_-]*$, so it cannot inject a path separator.
+//
+// The last two cases read the spec rather than runtimeUser: an environment that
+// names no account gets /workspace, not /home/user.
+func resolveMountPath(env *aiv1alpha1.DevEnvironment) string {
+	if env.Spec.Storage != nil && env.Spec.Storage.MountPath != "" {
+		return env.Spec.Storage.MountPath
+	}
+	if sc := env.Spec.Runtime; sc != nil && sc.SecurityContext != nil &&
+		sc.SecurityContext.RunAsUser != nil && *sc.SecurityContext.RunAsUser == 0 {
+		return "/root"
+	}
+	if env.Spec.Runtime != nil && env.Spec.Runtime.User != "" {
+		return "/home/" + env.Spec.Runtime.User
+	}
+	return defaultWorkspacePath
+}
+
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
 // spec.running, the workspace volumeClaimTemplate, and PVC retention so the
 // workspace data survives stop and delete (the finalizer removes it only when
@@ -691,7 +731,7 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	container.Env = envVars
 	if env.Spec.Storage != nil {
 		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-			Name: workspaceClaimName, MountPath: env.Spec.Storage.MountPath,
+			Name: workspaceClaimName, MountPath: resolveMountPath(env),
 		})
 	}
 	for _, v := range env.Spec.Volumes {
@@ -1509,7 +1549,7 @@ func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment
 	if sshExposed(env) {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 			Name:    sshPortName,
-			Address: fmt.Sprintf("ssh://%s@%s", sshEndpointUser, net.JoinHostPort(gwIP, strconv.Itoa(int(ports[sshPortName])))),
+			Address: fmt.Sprintf("ssh://%s@%s", runtimeUser(env), net.JoinHostPort(gwIP, strconv.Itoa(int(ports[sshPortName])))),
 		})
 	}
 	for _, p := range env.Spec.Ports {
