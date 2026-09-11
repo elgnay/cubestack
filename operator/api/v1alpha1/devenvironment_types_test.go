@@ -17,6 +17,8 @@ limitations under the License.
 package v1alpha1
 
 import (
+	"strings"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -126,7 +128,9 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(got.Spec.Resources.GPUCount).To(Equal(int32(1)))
 			Expect(got.Spec.Storage.Size).To(Equal("10Gi"))
 			Expect(got.Spec.Storage.PVCRetention).To(Equal(PVCRetentionRetain))
-			Expect(got.Spec.Storage.MountPath).To(Equal("/workspace"))
+			// No schema default: an unset mountPath stays empty so the controller
+			// can derive it from the runtime identity (resolveMountPath).
+			Expect(got.Spec.Storage.MountPath).To(BeEmpty())
 			Expect(got.Spec.Network.RDMAType).To(Equal(RDMATypeRoCE))
 			Expect(got.Spec.Lifecycle.IdleTimeout).To(Equal(int32(0)))
 
@@ -235,6 +239,22 @@ var _ = Describe("DevEnvironment", func() {
 					s.Ports = []PortSpec{{Name: testPortName, ContainerPort: 65536}}
 				},
 				"spec.ports"),
+			Entry("runtime user with an uppercase letter",
+				"de-invalid-runtime-user-case",
+				func(s *DevEnvironmentSpec) { s.Runtime.User = "Jovyan" },
+				"spec.runtime.user"),
+			Entry("runtime user starting with a digit",
+				"de-invalid-runtime-user-digit",
+				func(s *DevEnvironmentSpec) { s.Runtime.User = "1user" },
+				"spec.runtime.user"),
+			Entry("runtime user that could split the ssh endpoint",
+				"de-invalid-runtime-user-at",
+				func(s *DevEnvironmentSpec) { s.Runtime.User = "user@host" },
+				"spec.runtime.user"),
+			Entry("runtime user longer than the maximum",
+				"de-invalid-runtime-user-long",
+				func(s *DevEnvironmentSpec) { s.Runtime.User = strings.Repeat("a", 33) },
+				"spec.runtime.user"),
 		)
 
 		// Required fields are enforced as "the key must be present", so an empty

@@ -57,13 +57,6 @@ COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
     && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
 
-# The account this image's layout is built around, and its home — declared
-# because the home differs from the platform mount default (/workspace). The
-# platform reads these to build the ssh://<user>@... endpoint and to mount the
-# workspace (#169).
-LABEL image.cubestack.io/user="${SSH_USER}" \
-      image.cubestack.io/home="/home/ubuntu"
-
 ENV CUBESTACK_IMAGE=ssh \
     HOME=/home/ubuntu
 
