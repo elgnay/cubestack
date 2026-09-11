@@ -173,6 +173,9 @@ helm-e2e-crd-check: ## Verify chart CRDs plus the prerequisite lws/gateway CRDs,
 	$(HELM_E2E_KUBECTL) get clusterrole cubestack-metrics-reader >/dev/null; \
 	$(HELM_E2E_KUBECTL) get clusterrolebinding cubestack-manager-rolebinding >/dev/null; \
 	$(HELM_E2E_KUBECTL) get sa cubestack-controller-manager -n $(HELM_NAMESPACE) >/dev/null; \
+	$(HELM_E2E_KUBECTL) auth can-i update devenvironments.ai.cubestack.io \
+		--as=system:serviceaccount:$(HELM_NAMESPACE):cubestack-controller-manager -n $(HELM_NAMESPACE) | grep -qx yes \
+		|| { echo "manager SA cannot update DevEnvironments (the controller adds and removes its finalizer with Update)"; exit 1; }; \
 	echo "schema validation (invalid MV must be rejected):"; \
 	if printf '%s\n' 'apiVersion: ai.cubestack.io/v1alpha1' 'kind: ModelVersion' 'metadata:' '  name: e2e-invalid-should-fail' 'spec:' '  model: x' | $(HELM_E2E_KUBECTL) apply -f -; then \
 		echo "ERROR: invalid ModelVersion was accepted — CRD schema not enforced"; \
