@@ -109,9 +109,11 @@ check_mount_readable() {
 
 # served_key <port> — the ed25519 host key sshd serves, or empty if it is not
 # serving yet. A bare TCP connect is not sufficient: docker's port proxy accepts
-# the connection even when nothing listens inside the container.
+# the connection even when nothing listens inside the container. `|| true`: no
+# answer means an empty result, not a failure to propagate (pipefail is on, and
+# the callers decide what an empty key means).
 served_key() {
-  ssh-keyscan -t ed25519 -p "$1" 127.0.0.1 2>/dev/null | awk '!/^#/ && NF {print $NF; exit}'
+  ssh-keyscan -t ed25519 -p "$1" 127.0.0.1 2>/dev/null | awk '!/^#/ && NF {print $NF; exit}' || true
 }
 
 # wait_ssh <port> <seconds> <container-name>
@@ -153,7 +155,9 @@ if [ "$run_ssh" = 1 ]; then
     -v "$tmp/ssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
     -v "$tmp/ssh/host/authorized_keys:/home/ubuntu/.ssh/authorized_keys2:ro" \
     "$IMG_SSH" >/dev/null
-  ssh_port="$("$CONTAINER_TOOL" port "$ssh_cont" 2222 | head -n1 | sed 's/^.*://')"
+  # `docker port` fails on a container that is not running; `|| true` keeps that
+  # from aborting the run before the checks below can report it (pipefail is on).
+  ssh_port="$("$CONTAINER_TOOL" port "$ssh_cont" 2222 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
   # Record a timeout instead of letting set -e cut the run short: the ssh checks
   # below and the summary are exactly what a failing run is read for.
   wait_ssh "$ssh_port" 30 "$ssh_cont" ||
@@ -208,8 +212,10 @@ if [ "$run_jupyter" = 1 ]; then
     -v "$tmp/jupssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
     -v "$tmp/jupssh/host/authorized_keys:/home/jovyan/.ssh/authorized_keys2:ro" \
     "$IMG_JUPYTER" >/dev/null
-  jup_port="$("$CONTAINER_TOOL" port "$jup_cont" 8888 | head -n1 | sed 's/^.*://')"
-  jup_ssh_port="$("$CONTAINER_TOOL" port "$jup_cont" 2222 | head -n1 | sed 's/^.*://')"
+  # See the ssh block: a stopped container makes `docker port` fail, which must not
+  # abort the run before the Jupyter checks and the summary.
+  jup_port="$("$CONTAINER_TOOL" port "$jup_cont" 8888 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
+  jup_ssh_port="$("$CONTAINER_TOOL" port "$jup_cont" 2222 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
 
   printf "  waiting for JupyterLab"
   up=0
