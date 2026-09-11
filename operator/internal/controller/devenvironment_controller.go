@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// +kubebuilder:rbac:groups=ai.cubestack.io,resources=devenvironments,verbs=get;list;watch;update
+// +kubebuilder:rbac:groups=ai.cubestack.io,resources=devenvironments,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ai.cubestack.io,resources=devenvironments/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ai.cubestack.io,resources=devenvironments/finalizers,verbs=update
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -207,8 +207,13 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 
 	if !slices.Contains(env.Finalizers, devEnvFinalizer) {
+		// Patch, not Update: Update sends the whole object and carries the
+		// resourceVersion we read, so any write landing in between 409-conflicts
+		// and forces a retry reconcile. A merge patch has no such precondition,
+		// and the finalizer is the only field this call means to change.
+		patch := client.MergeFrom(env.DeepCopy())
 		env.Finalizers = append(env.Finalizers, devEnvFinalizer)
-		if err := r.Update(ctx, &env); err != nil {
+		if err := r.Patch(ctx, &env, patch); err != nil {
 			return ctrl.Result{}, err
 		}
 		if r.Recorder != nil {
@@ -323,7 +328,14 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 // the observed one.
 func (r *DevEnvironmentReconciler) updateStatusIfChanged(ctx context.Context, env *aiv1alpha1.DevEnvironment, desired *aiv1alpha1.DevEnvironment) error {
 	if !apiequality.Semantic.DeepEqual(env.Status, desired.Status) {
-		return r.Status().Update(ctx, desired)
+		// Patch, not Update: Update carries the resourceVersion of the object we
+		// read, and that read is served by the informer cache, which lags the API
+		// server — most visibly right after the finalizer patch above requeues
+		// immediately, so the very next reconcile describes a version the server
+		// has already moved past. It then 409-conflicts and forces a retry
+		// reconcile. Status is this controller's own observed state, so it needs
+		// no compare-and-swap; a merge patch drops the precondition.
+		return r.Status().Patch(ctx, desired, client.MergeFrom(env))
 	}
 	return nil
 }
