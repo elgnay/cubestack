@@ -13,6 +13,11 @@
 #   docker build -f ssh-ubuntu-server/Dockerfile -t harbor.isuanova.com/suanova/ssh-ubuntu22.04:<tag> images/
 #   (or: make -C images build)
 
+# Base: the Ubuntu release tag, deliberately not a digest pin. The release is the
+# axis the published repository name carries (ssh-ubuntu22.04), and it is
+# re-resolved at build time so a rebuild picks up Ubuntu security updates; a pinned
+# digest would freeze those out until someone remembered to bump it. Offline
+# installs record the digest of what was actually shipped (decision doc §3.D, §5).
 ARG UBUNTU_VERSION=22.04
 FROM ubuntu:${UBUNTU_VERSION}
 

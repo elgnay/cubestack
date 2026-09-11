@@ -66,8 +66,18 @@ there. sshd reads both files in place via the drop-in's `HostKey` and
 own file, so `ssh-copy-id` and similar tools keep working alongside the platform keys. No `.pub` and
 no host-key-per-algorithm files are needed: sshd derives the public half from the private key.
 
+That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
+serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
+there yields a login as the uid that already owns the workspace — not a new privilege. `StrictModes yes`
+would not close it either, since it accepts a key file owned by the account doing the reading; it is
+`no` here because the workspace PVC mounted at `%h` may not carry modes sshd demands. Restricting logins
+to operator-issued keys only would mean dropping this path (and `ssh-copy-id` with it) — a product
+decision, not a tightening the drop-in can make on its own.
+
 The operator must ensure the Secret always exists and carries `ssh_host_ed25519_key`; images have no
 fallback identity and fail fast without it (`ssh` mode exits; `jupyter` simply starts without sshd).
+A host key that is mounted but unusable is **not** that case: `jupyter` mode runs `sshd -t` before
+backgrounding sshd and exits if it fails, rather than serving a ready notebook with a dead ssh endpoint.
 
 ### Requirements on the operator
 
@@ -188,9 +198,12 @@ files are `COPY common/...`.
 - The workspace PVC mounts at the image's declared home (`/home/ubuntu` self-authored; `/home/jovyan`
   jupyter), where the notebook root already lives by default. An empty/root-owned PVC is
   storage-side (Gap A); the image cannot fix it, and readiness is TCP-only.
-- **Smoke fidelity for the host-key mode.** Kubernetes projects Secret files root-owned `0644`, which
-  a uid-1000 sshd accepts (the owner check does not apply to a file it does not own). Docker Desktop
-  reports a bind-mounted file as owned by the *calling* user, which flips that check on, so
-  `hack/smoke.sh` mounts the private key `0600` — the mode sshd demands on that code path. The cluster
-  path (`0644`, root-owned) was verified separately by hand; only the ownership Docker presents
-  differs, not the image.
+- **Smoke fidelity for the host-key mode.** Kubernetes projects Secret files root-owned `0644`, which a
+  uid-1000 sshd accepts (the owner check applies only to a file owned by the uid doing the reading).
+  Docker does not reproduce that faithfully: Docker Desktop reports a bind mount as root-owned `0600`
+  yet lets any container uid read it, while a rootful Linux daemon keeps the host uid and modes — there
+  the mounted `0600` key really is unreadable to uid 1000 and sshd exits with *no hostkeys available*.
+  `hack/smoke.sh` therefore mounts the private key `0600` **and** asserts up front that the container
+  uid can read it (`check_mount_readable`), so that environment mismatch is reported as itself rather
+  than as a 30-second ssh timeout. The cluster path (`0644`, root-owned) was verified separately by
+  hand; only the ownership the engine presents and enforces differs, not the image.

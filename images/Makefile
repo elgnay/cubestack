@@ -24,9 +24,14 @@ PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_
 # per make invocation — keep build/smoke/push in one go (`make push` does all three) or
 # pass an explicit TAG (§5 schemes). Publishing an older commit moves :latest backwards.
 # Authenticate first: docker login $(REGISTRY).
+#
+# TAG has no fallback: a build must name a real commit, so there is nothing to
+# substitute when git metadata is missing (a source tarball). git rev-parse then
+# yields nothing and every reference would end at the ':'; check-tag fails with
+# that reason instead, rather than inventing a non-reproducible tag.
 REGISTRY ?= harbor.isuanova.com
 PROJECT  ?= suanova
-TAG      ?= $(shell git rev-parse --short HEAD)
+TAG      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
 
 SSH_REPO     = $(REGISTRY)/$(PROJECT)/ssh-ubuntu$(UBUNTU_VERSION)
 # -minimal is the docker-stacks stack variant this overlay is built on (decision doc §5); unlike
@@ -42,18 +47,26 @@ IMG_JUPYTER ?= $(JUPYTER_REPO):$(TAG)
 LATEST_SSH     = $(SSH_REPO):latest
 LATEST_JUPYTER = $(JUPYTER_REPO):latest
 
-.PHONY: help build build-ssh build-jupyter smoke smoke-ssh smoke-jupyter \
+.PHONY: help check-tag build build-ssh build-jupyter smoke smoke-ssh smoke-jupyter \
 	push push-ssh push-jupyter
 
 .DEFAULT_GOAL := help
 
+# Every build/smoke/push target funnels through build-ssh or build-jupyter, so this
+# is the one place a missing TAG has to be caught.
+check-tag:
+	@test -n "$(TAG)" || { \
+		echo "make -C images: TAG is empty - 'git rev-parse --short HEAD' returned nothing" >&2; \
+		echo "                (not a git checkout?); pass TAG=<tag> explicitly." >&2; \
+		exit 1; }
+
 build: build-ssh build-jupyter ## Build both images
 
-build-ssh: ## Build the self-authored ssh image
+build-ssh: check-tag ## Build the self-authored ssh image
 	$(CONTAINER_TOOL) build $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) .
 
-build-jupyter: ## Build the jupyter image
+build-jupyter: check-tag ## Build the jupyter image
 	$(CONTAINER_TOOL) build $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f jupyter/Dockerfile -t $(IMG_JUPYTER) .
 

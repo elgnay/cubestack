@@ -70,9 +70,12 @@ check_contains() {
 #
 # Kubernetes projects Secret files root-owned 0644, and a non-root sshd accepts
 # them because OpenSSH only enforces private-key permissions on files owned by the
-# uid doing the reading. Docker cannot reproduce that ownership (Docker Desktop
-# reports a bind-mounted file as owned by the calling user), so the smoke mounts
-# the private key 0600 — the mode sshd demands when the owner check does apply.
+# uid doing the reading. Docker does not reproduce that faithfully: Docker Desktop
+# reports a bind mount as root-owned 0600 yet lets any container uid read it, while
+# a rootful Linux daemon keeps the host uid and modes — there a 0600 key really is
+# unreadable to uid 1000. So the smoke mounts the private key 0600 and asserts up
+# front that the container uid can read it (check_mount_readable), rather than
+# leaving that to a 30s ssh timeout.
 make_secret() {
   local base=$1
   mkdir -p "$base/client" "$base/host"
@@ -83,6 +86,25 @@ make_secret() {
   chmod 644 "$base/host/ssh_host_ed25519_key.pub"
   chmod 700 "$base/client"
   chmod 600 "$base/client/id_ed25519"
+}
+
+# check_mount_readable <image> <host key on the host> — assert the container uid
+# (1000) can read the mounted host key. On an engine that keeps the invoking user's
+# uid on bind mounts (rootful Linux Docker, or a userns remap) the 0600 key is
+# unreadable to uid 1000, and sshd exits with "no hostkeys available" — a property
+# of the environment, not of the image. Records the failure and returns, so the
+# dependent ssh assertions report their own failures and the summary still prints.
+check_mount_readable() {
+  local img=$1 key=$2
+  if "$CONTAINER_TOOL" run --rm --user 1000:1000 --entrypoint /usr/bin/test \
+       -v "$key:/etc/ssh/ssh_host_ed25519_key:ro" "$img" \
+       -r /etc/ssh/ssh_host_ed25519_key >/dev/null 2>&1; then
+    ok "container uid 1000 can read the mounted host key"
+    return 0
+  fi
+  bad "container uid 1000 cannot read $key"
+  echo "        this engine enforces the host uid on bind mounts, which the smoke cannot set;"
+  echo "        run it as uid 1000, or from Docker Desktop (which does not enforce it)."
 }
 
 # served_key <port> — the ed25519 host key sshd serves, or empty if it is not
@@ -123,6 +145,7 @@ if [ "$run_ssh" = 1 ]; then
   echo "== smoke: $IMG_SSH (ssh-ubuntu22.04) =="
   ssh_cont="cs-smoke-ssh-$$"
   make_secret "$tmp/ssh"
+  check_mount_readable "$IMG_SSH" "$tmp/ssh/host/ssh_host_ed25519_key"
 
   "$CONTAINER_TOOL" run -d --name "$ssh_cont" \
     --user 1000:1000 \
@@ -131,7 +154,10 @@ if [ "$run_ssh" = 1 ]; then
     -v "$tmp/ssh/host/authorized_keys:/home/ubuntu/.ssh/authorized_keys2:ro" \
     "$IMG_SSH" >/dev/null
   ssh_port="$("$CONTAINER_TOOL" port "$ssh_cont" 2222 | head -n1 | sed 's/^.*://')"
-  wait_ssh "$ssh_port" 30 "$ssh_cont"
+  # Record a timeout instead of letting set -e cut the run short: the ssh checks
+  # below and the summary are exactly what a failing run is read for.
+  wait_ssh "$ssh_port" 30 "$ssh_cont" ||
+    bad "sshd served no host key on port $ssh_port within 30s"
 
   out="$(ssh -i "$tmp/ssh/client/id_ed25519" \
     -p "$ssh_port" \
@@ -168,6 +194,7 @@ if [ "$run_jupyter" = 1 ]; then
   jup_cont="cs-smoke-jupyter-$$"
   base="/dev/ns/env"
   make_secret "$tmp/jupssh"
+  check_mount_readable "$IMG_JUPYTER" "$tmp/jupssh/host/ssh_host_ed25519_key"
 
   # Native identity (uid 1000, gid 'users' 100) and pure-stock knobs: token via
   # JUPYTER_TOKEN, URL prefix via NOTEBOOK_ARGS. The ssh Secret is mounted so the
@@ -226,7 +253,8 @@ if [ "$run_jupyter" = 1 ]; then
   fi
 
   # sshd on the same container (ssh Secret mounted -> ssh.enabled).
-  wait_ssh "$jup_ssh_port" 30 "$jup_cont"
+  wait_ssh "$jup_ssh_port" 30 "$jup_cont" ||
+    bad "sshd served no host key on port $jup_ssh_port within 30s"
 
   out="$(ssh -i "$tmp/jupssh/client/id_ed25519" \
     -p "$jup_ssh_port" \

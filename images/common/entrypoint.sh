@@ -25,6 +25,15 @@ ssh_enabled() { [ -f /etc/ssh/ssh_host_ed25519_key ]; }
 case "$mode" in
   jupyter)
     if ssh_enabled; then
+      # Validate before backgrounding: a host key that is present but unusable
+      # (bad config, unreadable key) would otherwise kill sshd while jupyter kept
+      # serving on its own port — the environment reports ready with the published
+      # ssh endpoint silently dead. The key's *absence* is the intentional
+      # ssh-off case handled above; its presence means ssh was requested.
+      if ! /usr/sbin/sshd -t -f /etc/ssh/sshd_config; then
+        echo "cubestack: sshd -t failed; refusing to run without a working ssh endpoint" >&2
+        exit 1
+      fi
       /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config &
     fi
     # Hand off to the image CMD (the image decides its launch chain).
