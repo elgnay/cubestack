@@ -73,9 +73,10 @@ const (
 	devEnvSSHKeysDelegatedLabel = "ai.cubestack.io/ssh-keys-delegated"
 	devEnvSSHKeysDelegatedValue = "true"
 
-	// workspaceClaimName is the StatefulSet volumeClaimTemplate name; the
-	// controller creates the PVC <env>-workspace-0 from it (K8s PVC naming:
-	// <sts>-<claim>-<ordinal>).
+	// workspaceClaimName is the StatefulSet volumeClaimTemplate name. The claim
+	// it provisions is <claim>-<set>-<ordinal> (K8s PVC naming), i.e.
+	// workspace-<env>-0, created by the StatefulSet controller rather than by
+	// this one.
 	workspaceClaimName = "workspace"
 
 	// workspaceStorageClassName is the platform-predefined workspace StorageClass.
