@@ -37,6 +37,12 @@ Every image:
 - **Build context is `images/`** for every Dockerfile. Build with
   `make -C images build` (or `docker build -f <img>/Dockerfile ... images/`). The shared logic under
   `common/` is `COPY`ed into each image from this context.
+- **Name the platform on every build.** `make -C images build` builds `$(PLATFORM)`, default
+  `linux/amd64` — the architecture the cluster's nodes run. A bare `docker build` resolves each
+  multi-arch base (ubuntu, quay.io/jupyter) to the **host** architecture instead, which is how an
+  arm64-only pair was once published and then failed on every amd64 node with *no match for platform
+  in manifest*. Check what a registry actually received with
+  `docker buildx imagetools inspect --raw <ref>` rather than assuming the build host's architecture.
 - **Keep ignore rules in `images/.dockerignore`** (deny-by-default). Docker only honors the
   context-root ignore file; a per-subdir `.dockerignore` is inert and misleading.
 - **Shared runtime logic lives in `common/`**: `entrypoint.sh` (mode selection + optional sshd +
@@ -58,11 +64,17 @@ Every image:
 ## Build & smoke
 
 ```bash
-make -C images build    # builds both images, tagged $(REGISTRY)/$(PROJECT)/<image>:$(TAG)
+make -C images build    # builds both images ($(PLATFORM), default linux/amd64), tagged
+                        # $(REGISTRY)/$(PROJECT)/<image>:$(TAG)
 make -C images smoke    # local Docker smoke (ssh key-auth login; jupyter + optional sshd)
 make -C images push TAG=<tag>   # build, then add :latest to that image and push both refs to
                                 # $(REGISTRY)/$(PROJECT); TAG defaults to the commit SHA
+make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt-in)
 ```
+
+`PLATFORM` takes a single value; a list fails in `check-platform` with that reason. On a host of a
+different architecture the build (and the smoke's throwaway containers) run emulated — slower, but
+they exercise the artifact that is actually published.
 
 There is no cluster and no CI wiring yet; `make -C images smoke` is the acceptance gate. When this
 workspace gains CI, it must add a build + smoke job like the other sub-projects.

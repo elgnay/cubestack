@@ -193,6 +193,25 @@ tag; publishing an older commit therefore moves `:latest` backwards, which is ex
 tag but worth knowing before rebuilding a previous release. `REGISTRY` / `PROJECT` relocate the whole
 destination.
 
+### Platform
+
+Every published image is built for `$(PLATFORM)`, default `linux/amd64` — the architecture the
+cluster's nodes run. Both Dockerfiles start from a multi-arch base (`ubuntu`, `quay.io/jupyter`), so
+without `--platform` `docker build` resolves that base to the **host** architecture: a build on an
+arm64 machine produces an arm64-only image, which every amd64 node then refuses to pull
+(`no match for platform in manifest`). The Makefile passes `--platform` on every build, so the result
+does not depend on the architecture of the machine building it. `PLATFORM=linux/arm64` is the explicit
+opt-in to build for a different architecture; it takes one value (a list fails in `check-platform`,
+since a single `docker build` cannot produce a manifest list). On a host of another architecture the
+build and the smoke's throwaway containers run emulated — slower, but they exercise the artifact that
+is actually published.
+
+Verify what a registry received rather than assuming the build host's architecture:
+
+```bash
+docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest
+```
+
 ### Overrides / mirror builds (CN or offline)
 
 ```bash
@@ -201,7 +220,8 @@ PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 make -C images build
 ```
 
-`IMG_SSH` / `IMG_JUPYTER` override the output tags; `CONTAINER_TOOL` overrides `docker` (e.g. `podman`).
+`IMG_SSH` / `IMG_JUPYTER` override the output tags; `CONTAINER_TOOL` overrides `docker` (e.g. `podman`);
+`PLATFORM` the build architecture (see Platform).
 
 ## Layout
 
