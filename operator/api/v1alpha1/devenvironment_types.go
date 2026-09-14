@@ -133,10 +133,14 @@ type StorageSpec struct {
 	// environment is deleted. Stopping the environment does not delete the PVC:
 	// stopping scales the workload to zero but the workspace data survives
 	// stop/start regardless of this field.
-	// retain=keep the PVC (default, prevents accidental data loss on deletion)
-	// / delete=remove the PVC together with the environment.
+	// delete=remove the PVC together with the environment (default: the
+	// workspace claim is provisioned and owned by the platform, so it is
+	// reclaimed with the environment) / retain=keep the PVC for a later
+	// environment to reuse. A retained claim is not garbage-collected and not
+	// trackable back to its environment afterwards, so it is only ever reclaimed
+	// by explicit administrative action.
 	// +kubebuilder:validation:Enum=retain;delete
-	// +kubebuilder:default=retain
+	// +kubebuilder:default=delete
 	// +optional
 	PVCRetention PVCRetentionPolicy `json:"pvcRetention,omitempty"`
 
@@ -361,8 +365,7 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
-	// Conditions: PodScheduled / StorageReady / BrandMatchValid / Ready (type
-	// constants below).
+	// Conditions: PodScheduled / BrandMatchValid / Ready (type constants below).
 	// +listType=map
 	// +listMapKey=type
 	// +optional

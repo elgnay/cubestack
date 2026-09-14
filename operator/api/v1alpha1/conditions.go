@@ -83,10 +83,6 @@ const (
 	// (DevEnvironment)
 	ConditionPodScheduled ConditionType = "PodScheduled"
 
-	// ConditionStorageReady indicates that the workspace PVC is Bound.
-	// (DevEnvironment)
-	ConditionStorageReady ConditionType = "StorageReady"
-
 	// ConditionBrandMatchValid indicates that gpuType matches the image brand
 	// (nvidia<->base-cuda, metax<->base-maca). (DevEnvironment)
 	ConditionBrandMatchValid ConditionType = "BrandMatchValid"

@@ -398,14 +398,18 @@ spec:
                       user's home.
                     type: string
                   pvcRetention:
-                    default: retain
+                    default: delete
                     description: |-
                       PVCRetention is the workspace PVC retention policy, applied only when the
                       environment is deleted. Stopping the environment does not delete the PVC:
                       stopping scales the workload to zero but the workspace data survives
                       stop/start regardless of this field.
-                      retain=keep the PVC (default, prevents accidental data loss on deletion)
-                      / delete=remove the PVC together with the environment.
+                      delete=remove the PVC together with the environment (default: the
+                      workspace claim is provisioned and owned by the platform, so it is
+                      reclaimed with the environment) / retain=keep the PVC for a later
+                      environment to reuse. A retained claim is not garbage-collected and not
+                      trackable back to its environment afterwards, so it is only ever reclaimed
+                      by explicit administrative action.
                     enum:
                     - retain
                     - delete
@@ -468,9 +472,8 @@ spec:
             description: status defines the observed state of DevEnvironment
             properties:
               conditions:
-                description: |-
-                  Conditions: PodScheduled / StorageReady / BrandMatchValid / Ready (type
-                  constants below).
+                description: 'Conditions: PodScheduled / BrandMatchValid / Ready (type
+                  constants below).'
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

@@ -27,7 +27,12 @@ spec:
   # not user-selectable.
   storage:
     size: 200Gi
-    pvcRetention: retain         # retain / delete
+    # pvcRetention decides what happens to the workspace claim when the
+    # environment is deleted: delete reclaims it with the environment (default),
+    # retain keeps it for a later environment to reuse. Stopping is unaffected
+    # either way, and a retained claim cannot be recovered afterwards, so retain
+    # is the choice to make before deleting an environment whose data matters.
+    pvcRetention: retain         # delete / retain
     # mountPath is optional. Left out, the controller derives the workspace path
     # from runtime.user: /home/<user>, /root when running as root (runAsUser 0),
     # else /workspace. Set it to pin a path — e.g. for a bring-your-own image

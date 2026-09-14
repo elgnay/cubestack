@@ -22,7 +22,6 @@ limitations under the License.
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=tcproutes,verbs=get;list;watch;create;update;patch;delete
@@ -99,8 +98,6 @@ const (
 	reasonScheduled              = "Scheduled"
 	reasonNotScheduled           = "NotScheduled"
 	reasonNotCreated             = "PodNotCreated"
-	reasonBound                  = "Bound"
-	reasonWaiting                = "Waiting"
 	reasonNotApplicable          = "NotApplicable"
 	reasonBrandMismatch          = "BrandMismatch"
 	reasonBrandValid             = "BrandMatchValid"
@@ -242,7 +239,6 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		setBrandMatchValidCondition(&desired.Status.Conditions, false, reasonBrandMismatch, reason)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
-		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionStorageReady)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
 		desired.Status.Endpoints = nil
 		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonBrandMismatch)
@@ -306,15 +302,12 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, err
 	}
 
-	// 5. Observe the pod and workspace PVC, aggregate conditions and phase.
+	// 5. Observe the pod, aggregate conditions and phase.
 	pod, err := r.environmentPod(ctx, &env)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	setPodScheduledCondition(&desired.Status.Conditions, pod)
-	if err := r.setStorageReadyCondition(ctx, &env, &desired.Status.Conditions); err != nil {
-		return ctrl.Result{}, err
-	}
 	r.setPhaseAndReady(&env, &desired.Status, pod)
 
 	if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
@@ -359,8 +352,9 @@ func (r *DevEnvironmentReconciler) stopCompute(ctx context.Context, env *aiv1alp
 }
 
 // cleanup runs when the environment is being deleted: it reports the
-// Terminating phase, deletes the managed resources, removes the workspace PVC
-// only when pvcRetention=delete (design §7), and drops the finalizer.
+// Terminating phase, deletes the managed resources (the StatefulSet deletion
+// carries the workspace PVC's own retention policy, design §7), and drops the
+// finalizer.
 func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
 	desired := env.DeepCopy()
 	setPhase(&desired.Status, aiv1alpha1.PhaseTerminating, reasonDeleting)
@@ -393,25 +387,9 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 		return err
 	}
 
-	// The workspace PVC survives by default: the StatefulSet retains it on
-	// delete. Remove it only when pvcRetention=delete. The PVC's controller
-	// owner is the StatefulSet (created via volumeClaimTemplate), so ownership
-	// is verified by the environment label instead of a controller ownerRef.
-	if env.Spec.Storage != nil && env.Spec.Storage.PVCRetention == aiv1alpha1.PVCRetentionDelete {
-		pvc := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: workspacePVCName(env), Namespace: env.Namespace}}
-		if err := r.Get(ctx, client.ObjectKeyFromObject(pvc), pvc); err != nil {
-			if !apierrors.IsNotFound(err) {
-				return err
-			}
-			// A missing PVC is already cleaned up; fall through to the
-			// finalizer removal so the environment does not stall in
-			// Terminating.
-		} else if pvc.Labels[devEnvironmentLabelKey] == env.Name {
-			if err := r.Delete(ctx, pvc); err != nil && !apierrors.IsNotFound(err) {
-				return err
-			}
-		}
-	}
+	// The workspace PVC is not handled here: the StatefulSet owns it (created
+	// from the volumeClaimTemplate, removed per whenDeleted), so deleting the
+	// StatefulSet above is what removes it when pvcRetention=delete.
 
 	// Re-fetch for a fresh resourceVersion before mutating finalizers: the
 	// status update above bumped it, so a stale Update would 409-conflict and
@@ -477,7 +455,6 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&corev1.Secret{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
-		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvKeysSecret)).
 		Watches(&aiv1alpha1.DevEnvironment{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
 	if gatewayAPICRDsInstalled(mgr) {
@@ -705,13 +682,25 @@ func resolveMountPath(env *aiv1alpha1.DevEnvironment) string {
 }
 
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
-// spec.running, the workspace volumeClaimTemplate, and PVC retention so the
-// workspace data survives stop and delete (the finalizer removes it only when
-// pvcRetention=delete).
+// spec.running, the workspace volumeClaimTemplate, and PVC retention. The
+// workspace PVC's lifecycle belongs to the StatefulSet: it creates the claim
+// from the template and, per whenDeleted, removes it when the StatefulSet is
+// deleted — so the controller neither creates nor deletes workspace claims.
 func (r *DevEnvironmentReconciler) desiredStatefulSet(env *aiv1alpha1.DevEnvironment) *appsv1.StatefulSet {
 	replicas := int32(0)
 	if env.Spec.Running {
 		replicas = 1
+	}
+	// spec.storage.pvcRetention is carried by the StatefulSet rather than acted
+	// on by the controller: whenDeleted is the field that expresses it, and the
+	// StatefulSet controller removes the claim it created. The fallback mirrors
+	// the schema default (delete), so an object that reached the controller
+	// without the field defaulted behaves as the API server would have made it.
+	// Stopping must never discard the workspace, so whenScaled stays Retain
+	// regardless.
+	whenDeleted := appsv1.DeletePersistentVolumeClaimRetentionPolicyType
+	if env.Spec.Storage != nil && env.Spec.Storage.PVCRetention == aiv1alpha1.PVCRetentionRetain {
+		whenDeleted = appsv1.RetainPersistentVolumeClaimRetentionPolicyType
 	}
 	return &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
@@ -725,7 +714,7 @@ func (r *DevEnvironmentReconciler) desiredStatefulSet(env *aiv1alpha1.DevEnviron
 			},
 			VolumeClaimTemplates: r.desiredVolumeClaimTemplates(env),
 			PersistentVolumeClaimRetentionPolicy: &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
-				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenDeleted: whenDeleted,
 				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
 			},
 		},
@@ -816,7 +805,7 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 }
 
 // desiredVolumeClaimTemplates renders the workspace claim template, creating
-// the PVC <env>-workspace-0 that survives stop/start. The claim always uses the
+// the PVC workspace-<env>-0 that survives stop/start. The claim always uses the
 // platform-predefined workspaceStorageClassName and requests ReadWriteMany so
 // the volume can be mounted on any node and follow the pod across node faults.
 func (r *DevEnvironmentReconciler) desiredVolumeClaimTemplates(env *aiv1alpha1.DevEnvironment) []corev1.PersistentVolumeClaim {
@@ -967,8 +956,15 @@ func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *ai
 	if err := ensureDevEnvOwned(existing, env); err != nil {
 		return err
 	}
+	// The retention policy is a mutable field the controller owns now, but it is
+	// derived from spec.storage, which stsSpecHash already covers — so a
+	// StatefulSet stored by a controller that hardcoded Retain hashes identically
+	// and would otherwise never be corrected. Compare it explicitly.
+	sameRetention := existing.Spec.PersistentVolumeClaimRetentionPolicy != nil &&
+		existing.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted == sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted &&
+		existing.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled == sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled
 	if existing.Annotations[stsSpecHashAnnotationKey] == sts.Annotations[stsSpecHashAnnotationKey] &&
-		existing.Spec.Replicas != nil && *existing.Spec.Replicas == *sts.Spec.Replicas {
+		existing.Spec.Replicas != nil && *existing.Spec.Replicas == *sts.Spec.Replicas && sameRetention {
 		return nil
 	}
 	// spec.volumeClaimTemplates is immutable once the StatefulSet exists, so an
@@ -1627,10 +1623,6 @@ func podName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-0"
 }
 
-func workspacePVCName(env *aiv1alpha1.DevEnvironment) string {
-	return env.Name + "-" + workspaceClaimName + "-0"
-}
-
 // envLabels are the labels every managed resource carries: the owning
 // environment and the controller identity.
 func (r *DevEnvironmentReconciler) envLabels(envName string) map[string]string {
@@ -1690,38 +1682,6 @@ func setPodScheduledCondition(conditions *[]metav1.Condition, pod *corev1.Pod) {
 			Type: aiv1alpha1.ConditionPodScheduled, Status: metav1.ConditionTrue, Reason: reasonScheduled, Message: "The environment pod is scheduled",
 		})
 	}
-}
-
-// setStorageReadyCondition sets the StorageReady condition from the workspace
-// PVC. When no workspace storage is configured it is True/NotApplicable.
-func (r *DevEnvironmentReconciler) setStorageReadyCondition(ctx context.Context, env *aiv1alpha1.DevEnvironment, conditions *[]metav1.Condition) error {
-	if env.Spec.Storage == nil {
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionStorageReady, Status: metav1.ConditionTrue, Reason: reasonNotApplicable, Message: "No workspace storage is configured",
-		})
-		return nil
-	}
-	pvc := &corev1.PersistentVolumeClaim{}
-	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: workspacePVCName(env)}, pvc)
-	if apierrors.IsNotFound(err) {
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionStorageReady, Status: metav1.ConditionFalse, Reason: reasonWaiting, Message: "The workspace PVC has not been created yet",
-		})
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if pvc.Status.Phase != corev1.ClaimBound {
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionStorageReady, Status: metav1.ConditionFalse, Reason: reasonWaiting, Message: fmt.Sprintf("The workspace PVC is %s", pvc.Status.Phase),
-		})
-		return nil
-	}
-	meta.SetStatusCondition(conditions, metav1.Condition{
-		Type: aiv1alpha1.ConditionStorageReady, Status: metav1.ConditionTrue, Reason: reasonBound, Message: "The workspace PVC is bound",
-	})
-	return nil
 }
 
 // setDevEnvironmentRouteReadyCondition sets the RouteReady condition from the gateway

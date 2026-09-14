@@ -18,7 +18,6 @@ package controller
 
 import (
 	"fmt"
-	"slices"
 	"strings"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -120,34 +119,6 @@ func createStatefulPod(env *aiv1alpha1.DevEnvironment, ready bool, waiting *core
 		}}
 	}
 	Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
-}
-
-// createBoundPVC fabricates the workspace PVC the StatefulSet controller would
-// create and bind; envtest has no provisioner, so the test sets Bound status.
-func createBoundPVC(env *aiv1alpha1.DevEnvironment) {
-	pvc := &corev1.PersistentVolumeClaim{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      workspacePVCName(env),
-			Namespace: env.Namespace,
-			Labels:    map[string]string{devEnvironmentLabelKey: env.Name},
-		},
-		Spec: corev1.PersistentVolumeClaimSpec{
-			AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany},
-			Resources: corev1.VolumeResourceRequirements{
-				Requests: corev1.ResourceList{corev1.ResourceStorage: resource.MustParse("200Gi")},
-			},
-		},
-	}
-	Expect(k8sClient.Create(ctx, pvc)).To(Succeed())
-	pvc.Status.Phase = corev1.ClaimBound
-	Expect(k8sClient.Status().Update(ctx, pvc)).To(Succeed())
-
-	// envtest runs no PVC protection controller, so the apiserver adds a
-	// kubernetes.io/pvc-protection finalizer at create time that would block
-	// deletion of the workspace PVC. Remove it to simulate a bound-but-idle
-	// PVC, which a real protection controller would release on delete.
-	pvc.Finalizers = slices.DeleteFunc(pvc.Finalizers, func(f string) bool { return f == "kubernetes.io/pvc-protection" })
-	Expect(k8sClient.Update(ctx, pvc)).To(Succeed())
 }
 
 // createGateway creates the shared test Gateway, optionally programming its
@@ -907,55 +878,6 @@ var _ = Describe("DevEnvironment controller", func() {
 		})
 	})
 
-	Context("storage", func() {
-		It("reports StorageReady true once the workspace PVC is bound", func() {
-			env := validDevEnvironment("de-storage-bound")
-			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			defer deleteEnv(env.Name)
-			createBoundPVC(env)
-
-			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionStorageReady)
-				g.Expect(cond).NotTo(BeNil())
-				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-				g.Expect(cond.Reason).To(Equal(reasonBound))
-			}, "15s", "200ms").Should(Succeed())
-		})
-
-		It("reports StorageReady false while the workspace PVC is missing", func() {
-			env := validDevEnvironment("de-storage-missing")
-			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			defer deleteEnv(env.Name)
-
-			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionStorageReady)
-				g.Expect(cond).NotTo(BeNil())
-				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
-				g.Expect(cond.Reason).To(Equal(reasonWaiting))
-			}, "15s", "200ms").Should(Succeed())
-		})
-
-		It("treats environments without workspace storage as StorageReady", func() {
-			env := validDevEnvironment("de-storage-none")
-			env.Spec.Storage = nil
-			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			defer deleteEnv(env.Name)
-
-			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionStorageReady)
-				g.Expect(cond).NotTo(BeNil())
-				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-				g.Expect(cond.Reason).To(Equal(reasonNotApplicable))
-			}, "15s", "200ms").Should(Succeed())
-		})
-	})
-
 	Context("phase", func() {
 		It("reports Pending while the pod does not exist", func() {
 			env := validDevEnvironment("de-phase-no-pod")
@@ -977,7 +899,6 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 			createStatefulPod(env, true, nil)
-			createBoundPVC(env)
 
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
@@ -1412,50 +1333,88 @@ var _ = Describe("DevEnvironment controller", func() {
 	})
 
 	Context("retention", func() {
-		It("deletes the workspace PVC when pvcRetention=delete", func() {
+		// The workspace PVC's lifecycle belongs to the StatefulSet, so what the
+		// controller owes the user is the retention policy it renders: the claim
+		// dies with the StatefulSet when whenDeleted=Delete. envtest runs no
+		// StatefulSet controller, so the claim's actual removal is not observable
+		// here — the rendered policy, and the StatefulSet deletion that triggers
+		// it, are what this asserts. The retain case is covered by the
+		// provisioning spec above.
+		It("delegates pvcRetention=delete to the StatefulSet", func() {
 			env := validDevEnvironment("de-retention-delete")
 			env.Spec.Storage.PVCRetention = aiv1alpha1.PVCRetentionDelete
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			createBoundPVC(env)
 
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+				// Stopping scales the workload to zero and must never discard the
+				// workspace, so whenScaled is Retain whatever pvcRetention says.
+				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 			}, "15s", "200ms").Should(Succeed())
 
 			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
 
+			// Deleting the StatefulSet is the whole cleanup mechanism for the claim,
+			// so the StatefulSet must actually be gone.
 			Eventually(func(g Gomega) {
 				err := k8sClient.Get(ctx, envKey(env.Name), &aiv1alpha1.DevEnvironment{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 				err = k8sClient.Get(ctx, envKey(env.Name), &appsv1.StatefulSet{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
-				err = k8sClient.Get(ctx, client.ObjectKey{Name: workspacePVCName(env), Namespace: env.Namespace}, &corev1.PersistentVolumeClaim{})
-				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("retains the workspace PVC when pvcRetention=retain", func() {
-			env := validDevEnvironment("de-retention-retain")
+		// The delegated field is only a delegation if it is kept converged. A
+		// StatefulSet stored by an earlier controller carries a hardcoded Retain
+		// while hashing identically (the hash covers spec.storage, which already
+		// implies the policy), so without an explicit comparison it would never be
+		// corrected and the claim would outlive a pvcRetention=delete environment.
+		It("corrects a StatefulSet whose retention policy drifted", func() {
+			env := validDevEnvironment("de-retention-drift")
+			env.Spec.Storage.PVCRetention = aiv1alpha1.PVCRetentionDelete
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			createBoundPVC(env)
+			defer deleteEnv(env.Name)
+
+			sts := &appsv1.StatefulSet{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Simulate the pre-delegation form: the policy the old controller wrote.
+			sts.Spec.PersistentVolumeClaimRetentionPolicy = &appsv1.StatefulSetPersistentVolumeClaimRetentionPolicy{
+				WhenDeleted: appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+				WhenScaled:  appsv1.RetainPersistentVolumeClaimRetentionPolicyType,
+			}
+			Expect(k8sClient.Update(ctx, sts)).To(Succeed())
 
 			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
+				got := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
+				g.Expect(got.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
 			}, "15s", "200ms").Should(Succeed())
+		})
 
-			Expect(k8sClient.Delete(ctx, env)).To(Succeed())
+		// The portal sends no pvcRetention at all, so the schema default is the
+		// policy every console-created environment actually gets — this is the
+		// path that decides whether a user's workspace survives the delete button.
+		It("defaults an omitted pvcRetention to delete", func() {
+			env := validDevEnvironment("de-retention-default")
+			env.Spec.Storage.PVCRetention = ""
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
 
 			Eventually(func(g Gomega) {
-				err := k8sClient.Get(ctx, envKey(env.Name), &aiv1alpha1.DevEnvironment{})
-				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.DeletePersistentVolumeClaimRetentionPolicyType))
+				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 			}, "15s", "200ms").Should(Succeed())
-
-			pvc := &corev1.PersistentVolumeClaim{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: workspacePVCName(env), Namespace: env.Namespace}, pvc)).To(Succeed())
 		})
 
 		It("does not delete foreign resources that share the environment's name or labels", func() {
@@ -1574,7 +1533,6 @@ var _ = Describe("DevEnvironment controller", func() {
 			}
 			Expect(controllerutil.SetControllerReference(env, legacySTS, k8sClient.Scheme())).To(Succeed())
 			Expect(k8sClient.Create(ctx, legacySTS)).To(Succeed())
-			createBoundPVC(env)
 
 			// The first post-upgrade drift (a real spec edit) must reconcile:
 			// repair the image and scale back up without touching the immutable
@@ -1599,11 +1557,6 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.AccessModes).To(ContainElement(corev1.ReadWriteOnce))
 				g.Expect(sts.Spec.VolumeClaimTemplates[0].Spec.StorageClassName).To(BeNil())
 			}, "15s", "200ms").Should(Succeed())
-
-			// The retained workspace claim survives the upgrade untouched.
-			pvc := &corev1.PersistentVolumeClaim{}
-			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: workspacePVCName(env), Namespace: env.Namespace}, pvc)).To(Succeed())
-			Expect(pvc.Status.Phase).To(Equal(corev1.ClaimBound))
 		})
 	})
 
