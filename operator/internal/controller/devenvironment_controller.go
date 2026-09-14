@@ -753,6 +753,29 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 	}
 }
 
+// desiredPodSecurityContext returns the pod-level security context, whose one
+// field is fsGroup: the group the volume mounts are chowned to. A workspace claim
+// is mounted root:root, and a non-root account can neither write it nor create the
+// ~/.ssh it keeps there, so without an fsGroup every environment with storage has
+// a read-only home (design Gap A). fsGroup is the only knob that triggers that
+// mount-time chown — runAsGroup is a container-level field and does not, the two
+// are unrelated to Kubernetes — so it is set to the container's own runAsGroup,
+// the value the process will actually run with (README: jupyter-minimal's stock
+// gid 100 included).
+//
+// The chown reaches every volume in the pod, not just the workspace claim, which
+// is what makes an environment's own home writable and also what a PVC shared
+// through spec.volumes would be chowned to (design Gap A).
+//
+// The change policy is OnRootMismatch rather than the default Always so a pod
+// start does not walk an entire workspace that already has the right group.
+func desiredPodSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.PodSecurityContext {
+	return &corev1.PodSecurityContext{
+		FSGroup:             desiredSecurityContext(rt).RunAsGroup,
+		FSGroupChangePolicy: ptr(corev1.FSGroupChangeOnRootMismatch),
+	}
+}
+
 // jupyterTokenPodAnnotations returns the pod-template annotations derived from
 // env for a jupyter environment: a non-sensitive sha256 digest of the managed
 // token carried from reconcileJupyterAuthSecret via env.Annotations (in-memory
@@ -878,8 +901,9 @@ func desiredWhenDeleted(env *aiv1alpha1.DevEnvironment) appsv1.PersistentVolumeC
 	return appsv1.DeletePersistentVolumeClaimRetentionPolicyType
 }
 
-// desiredPodSpec renders the pod spec: compute-pool nodeSelector, the main
-// container with the workspace and data volume mounts, and the SSH keys volume.
+// desiredPodSpec renders the pod spec: compute-pool nodeSelector, the pod-level
+// security context that makes the workspace writable, the main container with the
+// workspace and data volume mounts, and the SSH keys volume.
 func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment) corev1.PodSpec {
 	mainPort := mainContainerPort(env.Spec.Type)
 	container := corev1.Container{
@@ -950,8 +974,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 
 	podSpec := corev1.PodSpec{
-		NodeSelector: map[string]string{computeNodePoolLabelKey: computeNodePoolValue},
-		Containers:   []corev1.Container{container},
+		NodeSelector:    map[string]string{computeNodePoolLabelKey: computeNodePoolValue},
+		SecurityContext: desiredPodSecurityContext(env.Spec.Runtime),
+		Containers:      []corev1.Container{container},
 	}
 	for _, v := range env.Spec.Volumes {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{

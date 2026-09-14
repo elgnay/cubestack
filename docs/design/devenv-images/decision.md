@@ -29,8 +29,8 @@ images are final** — they cannot be solved inside the images themselves.
 | 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** `base-cuda` / `base-maca`. Checked **only when a GPU is requested** — `gpuCount: 0` is exempt | Image registry path must include the `base-cuda` / `base-maca` segment **when it is a GPU image**; CPU images are named freely | ✅ consistent with the brand gate |
 | 2 | Type → port | `::mainContainerPort`: jupyter 8888 / vscode 8080 / ssh `sshContainerPort`; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP — **except ssh**, where the container listens on the unprivileged **2222** (see B) and the Service publishes that as 22 | ✅ implemented (#173): the probe targets the container port (2222 for ssh) and the Service publishes `port: 22 → targetPort: 2222` |
 | 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as the **uid/gid the spec resolves to** (`spec.runtime.securityContext`, platform default 1000/1000), non-root, incl. writing `$HOME` (stock images ship uid 1000) | ✅ (but see #6, #9) |
-| 4 | `$HOME` / working dir = the workspace mount | comment in `devenvironment_types.go`: PVC mounted at the derived workspace path; the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — docker-stacks images keep `/home/jovyan` by naming `jovyan`; the self-authored images get `/home/ubuntu` | ⚠️ see "Gap A" + §2 contract |
-| 5 | SSH key mount | `assets.go:63`: Secret data keys `ssh_host_ed25519_key`(+`.pub`), `authorized_keys`; `::desiredPodSpec` mounts the two as read-only `subPath` files with default mode 0644; the host key is minted as an **OpenSSH-format** private key (`::generateSSHKeyPair`) and is **never rotated** (persistence provided by the Secret) | The operator mounts two of those keys **as files with `subPath`** — `ssh_host_ed25519_key` → `/etc/ssh/ssh_host_ed25519_key` and `authorized_keys` → `/run/ssh/authorized_keys` — and sshd reads them **in place: no staging, no copy, no chmod**. Both paths are absolute, so they follow no home: a claim mounts over `$HOME`, and a file mount target created beneath it is created root-owned, which the account cannot write. A root-owned `0644` private key is accepted because OpenSSH enforces that check only on files **owned by the uid reading them**, which a Secret volume file never is | ✅ implemented (#173, mount path moved out of `$HOME`). The private key must be in OpenSSH's own format: sshd **rejects PKCS#8 Ed25519** ("invalid format"), which is what the controller used to mint and why the reworked images had no working host key |
+| 4 | `$HOME` / working dir = the workspace mount | comment in `devenvironment_types.go`: PVC mounted at the derived workspace path; the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — docker-stacks images keep `/home/jovyan` by naming `jovyan`; the self-authored images get `/home/ubuntu`. A non-root account must be able to **write** that mount, which no image can arrange for itself | ✅ Gap A closed: the pod's `fsGroup` is the container's `runAsGroup`, which chowns the mount on the way in |
+| 5 | SSH key mount | `assets.go:63`: Secret data keys `ssh_host_ed25519_key`(+`.pub`), `authorized_keys`; `::desiredPodSpec` mounts the two as read-only `subPath` files with default mode 0644; the host key is minted as an **OpenSSH-format** private key (`::generateSSHKeyPair`) and is **never rotated** (persistence provided by the Secret) | The operator mounts two of those keys **as files with `subPath`** — `ssh_host_ed25519_key` → `/etc/ssh/ssh_host_ed25519_key` and `authorized_keys` → `/run/ssh/authorized_keys` — and sshd reads them **in place: no staging, no copy, no chmod**. Both paths are absolute and outside `$HOME`: a claim mounts over the home, and a mount target created beneath it is root-owned and unwritable (Gap A). A root-owned `0644` private key is accepted because OpenSSH enforces that check only on files **owned by the uid reading them**, which a Secret volume file never is | ✅ implemented (#173, mount path moved out of `$HOME` with the fsGroup change). The private key must be in OpenSSH's own format: sshd **rejects PKCS#8 Ed25519** ("invalid format"), which is what the controller used to mint and why the reworked images had no working host key |
 | 6 | sshd listening on :22 as uid 1000 | the ssh Service maps `sshServicePort` 22 → `sshContainerPort` 2222; `desiredSecurityContext` grants no capabilities | sshd listens on the unprivileged **2222**. Binding a port <1024 as non-root needs `NET_BIND_SERVICE`, which this closes **by port choice rather than by granting a privilege** — no capability, no `securityContext.sysctls` reliance, nothing for a Restricted PSA to drop. The operator publishes it as the Service's 22 and probes the container port | ✅ Gap B closed, no capability needed; implemented in #173 |
 | 7 | `JUPYTER_TOKEN` | `jupyterTokenEnv="JUPYTER_TOKEN"` (:144), injected only for the jupyter type, from `<env>-auth` Secret `data[token]` | The jupyter server must authenticate with this env value | ✅ (jupyter-server reads `JUPYTER_TOKEN` natively, see §3.B4) |
 | 8 | `base_url` = `/dev/<ns>/<env>/` | HTTPRoute forwards the prefix **unchanged** (no URLRewrite filter); the controller never injects the prefix into the container — yet the route design states "container serves under that base_url" | Jupyter must serve under that prefix via `ServerApp.base_url`, but nothing hands the prefix to the container | 🚩 **Gap C** |
@@ -81,25 +81,49 @@ rather than as a rejected spec. A non-root sshd can only serve the uid it runs a
 numerics, and the mount path have to agree. `images/README.md` lists the correct values per shipped
 image.
 
-### Gap A — the home mount writable by uid 1000
+### Gap A — closed: the home mount is writable by uid 1000
 
-The pod sets no `fsGroup`; the workspace PVC uses `cephfs-ephemeral` (RWX, `assets.go:85`). The
-container runs as uid 1000 with `$HOME` on the mount, so the **RWX StorageClass's mount behavior must
-make the mount path writable by 1000** (cephfs owner/mode) — regardless of whether that path is
-`/home/ubuntu` or `/home/jovyan`. The image cannot chown itself (non-root). This belongs to
-workspace-storage work for verification; the image only commits to pointing `$HOME` at the mount point.
+The pod carries `fsGroup` = the container's own `runAsGroup` (`::desiredPodSecurityContext`), and the
+workspace PVC uses `cephfs-ephemeral` (RWX, `assets.go:85`). The container runs as uid 1000 with `$HOME`
+on the mount — `/home/ubuntu` or `/home/jovyan` in the derived case. The image cannot chown itself
+(non-root), so the group has to come from the pod.
 
-The ssh probes settled the `~/.ssh` design independently of it: **the subPath file mount does not need
-the parent to exist.** `subPath` mounts are delegated to the runtime, and runc's `createMountpoint`
-creates a file bind target's parent directory (`MkdirAllInRootOpen`, 0755) as root *inside the volume it
-is mounted over* — verified with `/proc/self/mountinfo` showing the created `~/.ssh` on the ceph mount.
-The pod starts and ssh works, but that directory is root-owned and unwritable by the account. So the
-platform keys are **not** mounted into `$HOME` at all: the Secret's `authorized_keys` lands at the
-absolute `/run/ssh/authorized_keys`, which the drop-in's `AuthorizedKeysFile` names, and nothing is
-mounted at `$HOME/.ssh`. The account's `~/.ssh` is then entirely its own — on a claim-mounted home it
-does not exist until the account creates it, which needs the writable home above; with no claim, or a
-claim elsewhere, the image's baked `0700` directory serves. No `emptyDir` stand-in is needed for either
-case, and no mount depends on the order in which volumes and containers are set up.
+**Measured without an `fsGroup` (2026-09-14, cs2, `cephfs-ephemeral`, uid/gid 1000): the mount path is
+`root:root 0755` and a uid-1000 process cannot create anything in it** — not in the claim's root and not
+in a subdirectory of it. Both CSIDrivers report `fsGroupPolicy: File`, so the missing pod `fsGroup` was
+why nothing chowned the volume. This was broader than ssh: an environment with `spec.storage` could not
+write its own workspace at all.
+
+**Measured with `fsGroup: 1000` (probe pod, same day): solved.** The claim root becomes
+`root:ubuntu 2775` and a uid-1000 process writes it. The driver gives the group the owner's permissions
+and adds the setgid bit — `0755` → `2775` on directories, `0644` → `0664` on files — and applies that
+**recursively, to what exists when the volume is mounted**. Two qualifications carry into the design:
+
+- It is **driver behavior, not a Kubernetes guarantee**. `fsGroupPolicy: File` delegates to the CSI
+  driver, and this mode change is ceph-csi's; a driver that implemented only the chgrp half of the
+  contract would leave the mount unwritable. Kubernetes guarantees the delegation, not the result.
+- The chown reaches what exists **at mount time**. A directory created afterwards — by the account, or
+  by the runtime creating a `subPath` mount target — inherits only the parent's group: measured
+  `2755 root:ubuntu`, not writable. That is why no platform mount target is created inside `$HOME`.
+
+`fsGroup` applies to every volume in the pod, so a PVC shared through `spec.volumes` is chowned to the
+container's group as well — the price of a writable workspace, and worth knowing before sharing one
+across environments that run with different groups. The change policy is `FSGroupChangeOnRootMismatch`
+rather than the default `Always`, so a pod start does not walk an entire workspace that already carries
+the right group.
+
+The same probes settled the `~/.ssh` design: **the subPath file mount does not need the parent to
+exist.** `subPath` mounts are delegated to the runtime, and runc's `createMountpoint` creates a file bind
+target's parent directory (`MkdirAllInRootOpen`, 0755) as root *inside the volume it is mounted over* —
+verified with `/proc/self/mountinfo` showing the created `~/.ssh` on the ceph mount. The pod starts and
+ssh works, but that directory is root-owned and, per the second qualification above, stays unwritable
+even with an `fsGroup`. So the platform keys are **not** mounted into `$HOME` at all: the Secret's
+`authorized_keys` lands at the absolute `/run/ssh/authorized_keys`, which the drop-in's
+`AuthorizedKeysFile` names, and nothing is mounted at `$HOME/.ssh`. The account's `~/.ssh` is then
+entirely its own — on a claim-mounted home it does not exist until the account creates it, which the
+`fsGroup` above now makes possible; with no claim, or a claim elsewhere, the image's baked `0700`
+directory serves. No `emptyDir` stand-in is needed for either case, and no mount depends on the order in
+which volumes and containers are set up.
 
 ### Gap B — closed: sshd listens on the unprivileged 2222
 

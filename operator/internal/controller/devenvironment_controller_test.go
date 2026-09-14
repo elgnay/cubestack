@@ -559,6 +559,35 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 	})
 
+	// fsGroup is the only field that makes a claim-backed home writable by the
+	// container account, and it has to be the group the account runs with:
+	// runAsGroup alone does not trigger the mount-time chown (design Gap A).
+	Describe("desiredPodSecurityContext", func() {
+		It("defaults fsGroup to the container's own uid-1000 group", func() {
+			psc := desiredPodSecurityContext(nil)
+			Expect(psc.FSGroup).To(Equal(ptrTo(int64(1000))))
+			Expect(psc.FSGroupChangePolicy).To(Equal(ptrTo(corev1.FSGroupChangeOnRootMismatch)))
+			Expect(desiredSecurityContext(nil).RunAsGroup).To(Equal(psc.FSGroup))
+		})
+
+		It("follows an explicit runAsGroup, such as the jupyter image's stock gid", func() {
+			rt := func(user, group int64) *aiv1alpha1.RuntimeSpec {
+				return &aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
+					RunAsUser: ptrTo(user), RunAsGroup: ptrTo(group),
+				}}
+			}
+			psc := desiredPodSecurityContext(rt(1000, 100))
+			Expect(psc.FSGroup).To(Equal(ptrTo(int64(100))))
+			Expect(desiredSecurityContext(rt(1000, 100)).RunAsGroup).To(Equal(psc.FSGroup))
+
+			// The documented root exception still carries whatever group was
+			// resolved, so the two can never disagree.
+			psc = desiredPodSecurityContext(rt(0, 2000))
+			Expect(psc.FSGroup).To(Equal(ptrTo(int64(2000))))
+			Expect(desiredSecurityContext(rt(0, 2000)).RunAsGroup).To(Equal(psc.FSGroup))
+		})
+	})
+
 	Describe("resolveMountPath", func() {
 		// The path depends only on spec.storage.mountPath and the runtime identity,
 		// so the fixture carries nothing else.
@@ -671,6 +700,13 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}
 		})
 
+		It("carries a pod-level fsGroup matching the container's runAsGroup", func() {
+			spec := render(nil)
+			Expect(spec.SecurityContext).To(Equal(desiredPodSecurityContext(nil)))
+			Expect(spec.SecurityContext.FSGroup).To(Equal(spec.Containers[0].SecurityContext.RunAsGroup))
+			Expect(spec.SecurityContext.FSGroup).To(Equal(ptrTo(int64(1000))))
+		})
+
 		It("copies runtime command, args and env onto the container", func() {
 			command := []string{"/bin/sh"}
 			args := []string{"-c", "sleep infinity"}
@@ -745,9 +781,9 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 
 		// A claim mounted on the account's home hides the ~/.ssh the image bakes.
-		// Nothing is mounted in its place: the platform keys live under /run, so no
-		// mount target is built inside the claim and the account's own ~/.ssh is left
-		// alone — for it to create itself once the home is writable (design Gap A).
+		// Nothing is mounted in its place: the platform keys live under /run, the
+		// account creates its own ~/.ssh (which the pod's fsGroup makes possible),
+		// and no mount target is built inside the claim.
 		It("keeps every mount out of a home the workspace claim covers", func() {
 			var env *aiv1alpha1.DevEnvironment
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {

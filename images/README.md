@@ -92,9 +92,8 @@ The platform keys deliberately do **not** live in `$HOME`, where the images bake
 claim is mounted over the home, its root is not writable by the account, and the runtime creates a file
 mount target's parent directory root-owned — so keys mounted there would sit in a directory the account
 cannot write, alongside the account's own files it could not add. Under `/run` the platform keys stay
-out of the user's way entirely, and `~/.ssh` is the account's own: with a claim mounted over the home
-it does not exist until the account creates it, which needs a home the account can write (design
-**Gap A**). With no claim, or a claim mounted elsewhere, the image's baked `0700` directory serves.
+out of the user's way entirely, and `~/.ssh` is the account's own (the pod's `fsGroup` is what makes the
+claim, and so that directory, writable at all — see the operator requirement below).
 
 That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
 serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
@@ -132,6 +131,13 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
   there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
   from the account's passwd entry for its own `AuthorizedKeysFile` entry.
+- **Give the pod an `fsGroup` equal to the container's `runAsGroup`.** A workspace claim mounts
+  `root:root` and a non-root account can write nothing in it — no `~/.ssh`, no workspace files at all.
+  `fsGroup` is the only field that makes kubelet (or the CSI driver) chown the mount: `runAsGroup` is
+  container-level and does not, the two being unrelated to Kubernetes. It is applied to the mounted
+  volume, so it does not reach a directory the runtime creates *afterwards* — which is why the platform
+  keys are mounted outside `$HOME` rather than into it, and why the account's own `~/.ssh` no longer
+  needs anything mounted at all.
 - **Publish the container's `2222`** as the Service's ssh port (`port: 22`, `targetPort: 2222`) and
   point the readiness probe at `2222` — the probe targets the container, not the Service.
 

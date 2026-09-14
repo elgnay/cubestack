@@ -53,8 +53,10 @@ spec:
   # host key and the authorized_keys assembled from keysSecret, and mounts those
   # two keys as files: the host key at /etc/ssh/ssh_host_ed25519_key (its presence
   # is what enables ssh in the image) and the keys at /run/ssh/authorized_keys.
-  # Both paths are outside the account's home, which the workspace claim may cover.
-  # sshd listens on 2222 in the container and the Service publishes it as 22.
+  # Both paths are outside the account's home, which the workspace claim may cover
+  # and make unwritable; the pod's fsGroup is set to the container's runAsGroup so
+  # the workspace itself is writable. sshd listens on 2222 in the container and the
+  # Service publishes it as 22.
   ssh:
     enabled: true                # enable extra SSH for jupyter/vscode types
     keysSecret:
