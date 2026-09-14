@@ -127,7 +127,10 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(got.Spec.Resources.GPUType).To(Equal(GPUTypeNVIDIA))
 			Expect(got.Spec.Resources.GPUCount).To(Equal(ptrTo(int32(1))))
 			Expect(got.Spec.Storage.Size).To(Equal("10Gi"))
-			Expect(got.Spec.Storage.PVCRetention).To(Equal(PVCRetentionRetain))
+			// The workspace claim is provisioned and owned by the platform, so
+			// omitting the policy reclaims it with the environment; keeping the
+			// data is the explicit choice.
+			Expect(got.Spec.Storage.PVCRetention).To(Equal(PVCRetentionDelete))
 			// No schema default: an unset mountPath stays empty so the controller
 			// can derive it from the runtime identity (resolveMountPath).
 			Expect(got.Spec.Storage.MountPath).To(BeEmpty())

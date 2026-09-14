@@ -133,10 +133,17 @@ type StorageSpec struct {
 	// environment is deleted. Stopping the environment does not delete the PVC:
 	// stopping scales the workload to zero but the workspace data survives
 	// stop/start regardless of this field.
-	// retain=keep the PVC (default, prevents accidental data loss on deletion)
-	// / delete=remove the PVC together with the environment.
+	// delete=remove the workspace claim together with the environment (default:
+	// the claim is provisioned for the environment from the platform's
+	// volumeClaimTemplate, so it is reclaimed with it) / retain=keep the claim.
+	// A retained claim outlives the environment: nothing garbage-collects it, and
+	// it is identified by its name — workspace-<metadata.name>-0 — and its
+	// ai.cubestack.io/dev-environment label. Recreating a DevEnvironment with the
+	// same name in the same namespace reuses it, because the new StatefulSet
+	// adopts the claim it finds instead of provisioning another; an unwanted
+	// claim is reclaimed by deleting it administratively.
 	// +kubebuilder:validation:Enum=retain;delete
-	// +kubebuilder:default=retain
+	// +kubebuilder:default=delete
 	// +optional
 	PVCRetention PVCRetentionPolicy `json:"pvcRetention,omitempty"`
 
@@ -361,7 +368,7 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
-	// Conditions: PodScheduled / StorageReady / BrandMatchValid / Ready (type
+	// Conditions: PodScheduled / RouteReady / BrandMatchValid / Ready (type
 	// constants below).
 	// +listType=map
 	// +listMapKey=type
