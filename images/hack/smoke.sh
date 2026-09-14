@@ -16,7 +16,8 @@
 # The operator mounts the Secret keys with subPath; docker has no subPath, so the
 # smoke reproduces it with per-file bind mounts:
 #   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key
-#   authorized_keys      -> $HOME/.ssh/authorized_keys2
+#   authorized_keys      -> /run/ssh/authorized_keys   (absolute: outside $HOME,
+#                           which a workspace claim may cover and make unwritable)
 #
 # Reads IMG_SSH / IMG_JUPYTER from the environment (the Makefile sets them).
 # Usage: hack/smoke.sh [--ssh|--jupyter]    (default: both)
@@ -153,7 +154,7 @@ if [ "$run_ssh" = 1 ]; then
     --user 1000:1000 \
     -p 127.0.0.1::2222 \
     -v "$tmp/ssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/ssh/host/authorized_keys:/home/ubuntu/.ssh/authorized_keys2:ro" \
+    -v "$tmp/ssh/host/authorized_keys:/run/ssh/authorized_keys:ro" \
     "$IMG_SSH" >/dev/null
   # `docker port` fails on a container that is not running; `|| true` keeps that
   # from aborting the run before the checks below can report it (pipefail is on).
@@ -184,7 +185,7 @@ if [ "$run_ssh" = 1 ]; then
     "$CONTAINER_TOOL" logs "$ssh_cont" 2>&1 | tail -n 20
     echo "  mounted files as the container sees them:"
     "$CONTAINER_TOOL" exec --user 0 "$ssh_cont" ls -ln \
-      /etc/ssh/ssh_host_ed25519_key /home/ubuntu/.ssh/authorized_keys2 2>&1 || true
+      /etc/ssh/ssh_host_ed25519_key /run/ssh/authorized_keys 2>&1 || true
   fi
   "$CONTAINER_TOOL" rm -f "$ssh_cont" >/dev/null 2>&1 || true
   ssh_cont=""
@@ -210,7 +211,7 @@ if [ "$run_jupyter" = 1 ]; then
     -e JUPYTER_TOKEN=testtoken \
     -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
     -v "$tmp/jupssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/jupssh/host/authorized_keys:/home/jovyan/.ssh/authorized_keys2:ro" \
+    -v "$tmp/jupssh/host/authorized_keys:/run/ssh/authorized_keys:ro" \
     "$IMG_JUPYTER" >/dev/null
   # See the ssh block: a stopped container makes `docker port` fail, which must not
   # abort the run before the Jupyter checks and the summary.
@@ -280,7 +281,7 @@ if [ "$run_jupyter" = 1 ]; then
     "$CONTAINER_TOOL" logs "$jup_cont" 2>&1 | tail -n 20
     echo "  mounted files as the container sees them:"
     "$CONTAINER_TOOL" exec --user 0 "$jup_cont" ls -ln \
-      /etc/ssh/ssh_host_ed25519_key /home/jovyan/.ssh/authorized_keys2 2>&1 || true
+      /etc/ssh/ssh_host_ed25519_key /run/ssh/authorized_keys 2>&1 || true
   fi
   "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
   jup_cont=""

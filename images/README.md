@@ -72,17 +72,29 @@ as files** with `subPath` — nothing is copied, staged, or re-permissioned in t
 | Secret key | Mounted at | Used by |
 |------------|-----------|---------|
 | `ssh_host_ed25519_key` | `/etc/ssh/ssh_host_ed25519_key` | sshd host identity; its presence gates ssh |
-| `authorized_keys` | `$HOME/.ssh/authorized_keys2` | platform keys that may log in |
+| `authorized_keys` | `/run/ssh/authorized_keys` | platform keys that may log in |
 
-`$HOME` is the account's home (`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`), and the
-workspace PVC mounts there when the path is derived — an explicit `spec.storage.mountPath` is
-authoritative and may point elsewhere (see above), in which case `$HOME` stays on the container's own
-filesystem and only the workspace is durable. The rest of this contract holds either way: the subPath
-mount targets `$HOME` regardless, and the image bakes `$HOME/.ssh`. sshd reads both files in place via
-the drop-in's `HostKey` and `AuthorizedKeysFile %h/.ssh/authorized_keys2 %h/.ssh/authorized_keys` — the
-second path is the user's own file, so `ssh-copy-id` and similar tools keep working alongside the
-platform keys. No `.pub` and no host-key-per-algorithm files are needed: sshd derives the public half
-from the private key.
+The private key has to be in **OpenSSH's own format** (`-----BEGIN OPENSSH PRIVATE KEY-----`): sshd
+does not read a PKCS#8 Ed25519 key at all, and exits with *invalid format* if handed one. The
+`.pub` is informational — sshd derives the public half from the private key.
+
+Both mount paths are **absolute and outside `$HOME`**, so neither depends on the account an image runs
+as, and the account's own `~/.ssh` is left to the account. `$HOME` is that account's home
+(`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`); the workspace PVC mounts there when the path
+is derived — an explicit `spec.storage.mountPath` is authoritative and may point elsewhere (see above),
+in which case `$HOME` stays on the container's own filesystem and only the workspace is durable. sshd
+reads both files in place via the drop-in's `HostKey` and
+`AuthorizedKeysFile /run/ssh/authorized_keys %h/.ssh/authorized_keys` — the second path is the user's
+own file, so `ssh-copy-id` and similar tools keep working alongside the platform keys. No `.pub` and no
+host-key-per-algorithm files are needed: sshd derives the public half from the private key.
+
+The platform keys deliberately do **not** live in `$HOME`, where the images bake `~/.ssh`: the workspace
+claim is mounted over the home, its root is not writable by the account, and the runtime creates a file
+mount target's parent directory root-owned — so keys mounted there would sit in a directory the account
+cannot write, alongside the account's own files it could not add. Under `/run` the platform keys stay
+out of the user's way entirely, and `~/.ssh` is the account's own: with a claim mounted over the home
+it does not exist until the account creates it, which needs a home the account can write (design
+**Gap A**). With no claim, or a claim mounted elsewhere, the image's baked `0700` directory serves.
 
 That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
 serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
@@ -99,22 +111,27 @@ backgrounding sshd and exits if it fails, rather than serving a ready notebook w
 
 ### Requirements on the operator
 
-The operator side of this contract is not implemented yet — it still mounts the Secret as a directory
-at `/etc/cubestack/ssh`. The changes below are tracked in **#173**.
+Implemented in **#173**; the controller code is in `operator/internal/controller/devenvironment_controller.go`.
 
+- **Mint the host key in OpenSSH format.** `::generateSSHKeyPair` writes the private key as an
+  OpenSSH-format PEM block — sshd rejects a PKCS#8 Ed25519 key, so a Secret carrying one leaves the
+  environment with no ssh at all. The controller regenerates such a key in place when it finds one,
+  which the revision annotation below then rolls the pod onto.
 - **Restart the workload when the Secret changes.** Kubernetes does not propagate Secret updates to
   `subPath` mounts — the container keeps the bytes it started with
   ([Secret docs](https://kubernetes.io/docs/concepts/configuration/secret/)). Rotated keys are
-  therefore inert until the pod is recreated.
+  therefore inert until the pod is recreated. The controller stamps a digest of the mounted material on
+  the pod template (`ai.cubestack.io/ssh-keys-revision`, from `::sshKeysDigest`), which changes the
+  StatefulSet's spec hash and rolls the pod — the same mechanism the Jupyter token uses.
 - **Keep the files readable by the container uid.** The default Secret `defaultMode` `0644` is
   correct: the files are root-owned, and OpenSSH only enforces its private-key permission check on
   files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
   Tightening `defaultMode` to `0600`/`0400` makes the key unreadable to that uid and sshd exits with
   *no hostkeys available*.
 - **Mount the PVC at the account's home** — the controller derives it from `spec.runtime.user` (see
-  above), unless the spec pins an explicit `mountPath`, which wins — so the platform keys land in the
-  user's home. It must also provide `~/.ssh`: the image bakes the directory, but the PVC shadows it,
-  and the subPath mount needs the parent to exist.
+  above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
+  there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
+  from the account's passwd entry for its own `AuthorizedKeysFile` entry.
 - **Publish the container's `2222`** as the Service's ssh port (`port: 22`, `targetPort: 2222`) and
   point the readiness probe at `2222` — the probe targets the container, not the Service.
 

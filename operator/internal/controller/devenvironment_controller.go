@@ -35,12 +35,12 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
+	"maps"
 	"net"
 	"slices"
 	"strconv"
@@ -134,6 +134,25 @@ const (
 	mainPortName      = "main"
 	sshKeysVolumeName = "ssh-keys"
 
+	// sshServicePort is the port the platform publishes ssh on — the Service
+	// port, the TCPRoute backendRef and the endpoint address — while
+	// sshContainerPort is where the base images' sshd actually listens. sshd
+	// runs as the container account and cannot bind a privileged port, so it
+	// chooses the unprivileged one and the Service maps the two (design Gap B).
+	sshServicePort   = 22
+	sshContainerPort = 2222
+
+	// Where the images read the mounted ssh material: sshd's host identity (its
+	// presence gates ssh) and the platform keys. Both are absolute paths outside
+	// any home. The platform keys cannot live in $HOME: the workspace claim is
+	// mounted there, its root is not writable by the account, and the mount target
+	// for a file beneath it is created root-owned by the runtime — which would both
+	// hide and break the ~/.ssh the images bake. Under /run the platform keys stay
+	// out of the user's way and the account keeps ~/.ssh for its own files
+	// (images/README.md).
+	sshHostKeyPath        = "/etc/ssh/ssh_host_ed25519_key"
+	sshAuthorizedKeysPath = "/run/ssh/authorized_keys"
+
 	// defaultRuntimeUser is the account an environment logs in as when
 	// spec.runtime.user names none; it is also the account the platform's base
 	// images conventionally use.
@@ -157,12 +176,21 @@ const (
 	// token is created or refilled without ever putting the plaintext on the pod.
 	jupyterTokenRevisionAnnotationKey = "ai.cubestack.io/jupyter-token-revision"
 
+	// sshKeysRevisionAnnotationKey records a non-sensitive digest of the ssh
+	// material mounted into the pod on the StatefulSet pod template. The mounts
+	// are subPath, and Kubernetes does not propagate Secret updates into those,
+	// so a rotated authorized_keys is inert until the pod is recreated; the
+	// digest makes the template (and stsSpecHash) change when the Secret's
+	// content does, which rolls the workload onto it.
+	sshKeysRevisionAnnotationKey = "ai.cubestack.io/ssh-keys-revision"
+
 	// compute node pool labels: development pods are pinned to the compute
 	// pool, isolated from the inference pool (design §8.1).
 	computeNodePoolLabelKey = "cubestack.io/node-pool"
 	computeNodePoolValue    = "compute"
 
 	sshEd25519Algorithm = "ssh-ed25519"
+	sshHostKeyPEMType   = "OPENSSH PRIVATE KEY"
 
 	// Kubernetes Event reasons emitted on lifecycle transitions (design §11.2):
 	// Created on adoption, Started/Stopped on phase transitions into
@@ -271,11 +299,21 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// 2. SSH secret: a managed host keypair + authorized_keys when SSH is
 	// exposed (design §6.3).
 	if sshExposed(&env) {
-		keysSecret, err := r.reconcileSSHSecret(ctx, &env)
+		keysSecret, digest, err := r.reconcileSSHSecret(ctx, &env)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		desired.Status.SSHKeysSecret = keysSecret
+		// Carry the key revision to applyStatefulSet below, like the jupyter
+		// token: the keys are subPath mounts, so only a roll picks up changed
+		// Secret bytes. env is re-fetched every reconcile and only its status is
+		// persisted, so this in-memory annotation never lands on the
+		// DevEnvironment object; it only drives the pod template and stsSpecHash
+		// (see desiredStatefulSet).
+		if env.Annotations == nil {
+			env.Annotations = map[string]string{}
+		}
+		env.Annotations[sshKeysRevisionAnnotationKey] = digest
 	} else {
 		desired.Status.SSHKeysSecret = nil
 	}
@@ -634,7 +672,10 @@ func sshExposed(env *aiv1alpha1.DevEnvironment) bool {
 }
 
 // mainContainerPort is the primary container port by type: jupyter 8888,
-// ssh 22, vscode 8080 (design §6.1).
+// vscode 8080, ssh the unprivileged port the base images' sshd binds
+// (design §6.1, Gap B). It is the port the container listens on, which is what
+// the readiness probe targets; the Service publishes ssh on sshServicePort
+// instead, since only the container side had to move.
 func mainContainerPort(t aiv1alpha1.DevEnvironmentType) int32 {
 	switch t {
 	case aiv1alpha1.DevEnvironmentTypeJupyter:
@@ -642,7 +683,7 @@ func mainContainerPort(t aiv1alpha1.DevEnvironmentType) int32 {
 	case aiv1alpha1.DevEnvironmentTypeVSCode:
 		return 8080
 	default:
-		return 22
+		return sshContainerPort
 	}
 }
 
@@ -731,6 +772,35 @@ func jupyterTokenPodAnnotations(env *aiv1alpha1.DevEnvironment) map[string]strin
 	return map[string]string{jupyterTokenRevisionAnnotationKey: rev}
 }
 
+// sshKeysPodAnnotations is jupyterTokenPodAnnotations for the ssh material: the
+// digest carried from reconcileSSHSecret via env.Annotations (in-memory only,
+// never persisted on the DevEnvironment) changes the pod template — and so
+// stsSpecHash — whenever the mounted Secret bytes change, which is the only way
+// a subPath mount ever picks them up. It also rolls the workload once on upgrade
+// from a controller that stamped no revision at all.
+func sshKeysPodAnnotations(env *aiv1alpha1.DevEnvironment) map[string]string {
+	if !sshExposed(env) {
+		return nil
+	}
+	rev := env.Annotations[sshKeysRevisionAnnotationKey]
+	if rev == "" {
+		return nil
+	}
+	return map[string]string{sshKeysRevisionAnnotationKey: rev}
+}
+
+// podTemplateAnnotations merges the annotations that roll the workload when
+// controller-managed secret material changes.
+func podTemplateAnnotations(env *aiv1alpha1.DevEnvironment) map[string]string {
+	ann := map[string]string{}
+	maps.Copy(ann, jupyterTokenPodAnnotations(env))
+	maps.Copy(ann, sshKeysPodAnnotations(env))
+	if len(ann) == 0 {
+		return nil
+	}
+	return ann
+}
+
 // runtimeUser is the account the environment's sshd serves: spec.runtime.user,
 // else the platform default.
 func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
@@ -783,7 +853,7 @@ func (r *DevEnvironmentReconciler) desiredStatefulSet(env *aiv1alpha1.DevEnviron
 			Replicas:    &replicas,
 			Selector:    &metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			Template: corev1.PodTemplateSpec{
-				ObjectMeta: metav1.ObjectMeta{Labels: r.envLabels(env.Name), Annotations: jupyterTokenPodAnnotations(env)},
+				ObjectMeta: metav1.ObjectMeta{Labels: r.envLabels(env.Name), Annotations: podTemplateAnnotations(env)},
 				Spec:       r.desiredPodSpec(env),
 			},
 			VolumeClaimTemplates: r.desiredVolumeClaimTemplates(env),
@@ -859,12 +929,24 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		container.VolumeMounts = append(container.VolumeMounts, mount)
 	}
 	if sshExposed(env) {
-		// Base images read the sshd host keys and authorized_keys from this
-		// path (documented in the sample CR); permissions are 0644 so a
-		// non-root sshd can read them, and the image's setup may tighten them.
-		container.VolumeMounts = append(container.VolumeMounts, corev1.VolumeMount{
-			Name: sshKeysVolumeName, MountPath: "/etc/cubestack/ssh", ReadOnly: true,
-		})
+		// The images read the ssh material in place — no staging, no copy, no
+		// chmod (images/README.md) — so the Secret's keys are mounted as files
+		// with subPath: the host key where sshd looks for its identity, and the
+		// platform keys at the absolute path the images' AuthorizedKeysFile names.
+		// Neither needs a directory to exist in the image: the runtime creates a
+		// file mount target's parent. DefaultMode stays 0644: the files are
+		// root-owned and OpenSSH only enforces its private-key check on files owned
+		// by the uid reading them, so a tighter mode would make a non-root sshd
+		// exit with "no hostkeys available".
+		container.VolumeMounts = append(container.VolumeMounts,
+			corev1.VolumeMount{
+				Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true,
+			},
+			corev1.VolumeMount{
+				Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath,
+				SubPath: sshAuthorizedKeysKey, ReadOnly: true,
+			},
+		)
 	}
 
 	podSpec := corev1.PodSpec{
@@ -919,11 +1001,18 @@ func (r *DevEnvironmentReconciler) desiredVolumeClaimTemplates(env *aiv1alpha1.D
 // port (when exposed and not the main port), and the extra application ports.
 func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment) *corev1.Service {
 	mainPort := mainContainerPort(env.Spec.Type)
+	// The ssh container listens on the unprivileged sshContainerPort but is
+	// published on the conventional sshServicePort; every other type publishes
+	// the port it listens on.
+	mainServicePort := mainPort
+	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeSSH {
+		mainServicePort = sshServicePort
+	}
 	ports := []corev1.ServicePort{
-		{Name: mainPortName, Port: mainPort, TargetPort: intstr.FromInt32(mainPort), Protocol: corev1.ProtocolTCP},
+		{Name: mainPortName, Port: mainServicePort, TargetPort: intstr.FromInt32(mainPort), Protocol: corev1.ProtocolTCP},
 	}
 	if sshExposed(env) && env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
-		ports = append(ports, corev1.ServicePort{Name: sshPortName, Port: 22, TargetPort: intstr.FromInt32(22), Protocol: corev1.ProtocolTCP})
+		ports = append(ports, corev1.ServicePort{Name: sshPortName, Port: sshServicePort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP})
 	}
 	for _, p := range env.Spec.Ports {
 		if p.Type == aiv1alpha1.PortTypeUDP {
@@ -1067,9 +1156,10 @@ func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *ai
 
 // stsSpecHash hashes the pod-template-affecting fields so applyStatefulSet can
 // detect template changes without comparing server-defaulted fields. It mirrors
-// the pod template exactly: in particular it includes the Jupyter token revision
-// (see jupyterTokenPodAnnotations), so creating or refilling a token changes the
-// hash and applyStatefulSet issues an update that rolls the workload.
+// the pod template exactly: in particular it includes the secret revisions the
+// template carries (see podTemplateAnnotations), so creating or refilling a
+// managed Secret changes the hash and applyStatefulSet issues an update that
+// rolls the workload.
 func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 	type templateInput struct {
 		Type       aiv1alpha1.DevEnvironmentType
@@ -1085,6 +1175,9 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		// a later token refill rolls them again. The plaintext never enters the
 		// hash input, only its non-sensitive digest.
 		JupyterTokenRevision string
+		// SSHKeysRevision is the equivalent digest for the ssh material the pod
+		// mounts as subPath files, which never see a Secret update in place.
+		SSHKeysRevision string
 	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
@@ -1096,27 +1189,36 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		Volumes:              env.Spec.Volumes,
 		SSHExposed:           sshExposed(env),
 		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
+		SSHKeysRevision:      env.Annotations[sshKeysRevisionAnnotationKey],
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
 
 // reconcileSSHSecret creates or updates the managed SSH secret holding the
 // ed25519 host keypair and the authorized_keys content assembled from
-// spec.ssh.keysSecret. The host keypair is generated once and never rotated
-// (design §6.3); authorized_keys is refreshed when the user's keys change.
-func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretKeySelector, error) {
+// spec.ssh.keysSecret. The host keypair is generated once and not rotated
+// (design §6.3), except to replace one sshd cannot read; authorized_keys is
+// refreshed when the user's keys change.
+//
+// It returns the non-sensitive digest of the mounted material alongside the
+// key selector, so the caller can record a revision on the pod template: the
+// pod reads the Secret through subPath mounts, which never see an update in
+// place, so refreshed authorized_keys only reach it when the workload rolls
+// (see sshKeysPodAnnotations).
+func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretKeySelector, string, error) {
 	name := sshSecretName(env)
 	authorized, err := r.userAuthorizedKeys(ctx, env)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	selector := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: sshAuthorizedKeysKey}
 
 	secret := &corev1.Secret{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
 	if apierrors.IsNotFound(err) {
 		privPEM, pubOpenSSH, err := generateSSHKeyPair()
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		desired := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
@@ -1128,26 +1230,50 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *
 			},
 		}
 		if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		if err := r.Create(ctx, desired); err != nil {
-			return nil, err
+			return nil, "", err
 		}
-		return &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: sshAuthorizedKeysKey}, nil
+		return selector, sshKeysDigest(desired), nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := ensureDevEnvOwned(secret, env); err != nil {
-		return nil, err
+		return nil, "", err
+	}
+	changed := false
+	if hostKeyUnreadable(secret.Data[sshHostKeyKey]) {
+		privPEM, pubOpenSSH, err := generateSSHKeyPair()
+		if err != nil {
+			return nil, "", err
+		}
+		secret.Data[sshHostKeyKey] = privPEM
+		secret.Data[sshHostPubKeyKey] = pubOpenSSH
+		changed = true
 	}
 	if string(secret.Data[sshAuthorizedKeysKey]) != authorized {
 		secret.Data[sshAuthorizedKeysKey] = []byte(authorized)
+		changed = true
+	}
+	if changed {
 		if err := r.Update(ctx, secret); err != nil {
-			return nil, err
+			return nil, "", err
 		}
 	}
-	return &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: sshAuthorizedKeysKey}, nil
+	return selector, sshKeysDigest(secret), nil
+}
+
+// sshKeysDigest hashes the Secret content the pod mounts — the host key and the
+// platform authorized_keys — into the non-sensitive revision recorded on the
+// pod template. The host key never rotates in place (design §6.3), but a Secret
+// deleted and regenerated mints a new one, and that must roll the pod too.
+func sshKeysDigest(secret *corev1.Secret) string {
+	return assetDataHash(map[string]string{
+		sshHostKeyKey:        string(secret.Data[sshHostKeyKey]),
+		sshAuthorizedKeysKey: string(secret.Data[sshAuthorizedKeysKey]),
+	})
 }
 
 func sshSecretName(env *aiv1alpha1.DevEnvironment) string {
@@ -1261,24 +1387,61 @@ func (r *DevEnvironmentReconciler) userAuthorizedKeys(ctx context.Context, env *
 	return string(s.Data[key]), nil
 }
 
-// generateSSHKeyPair produces an ed25519 host keypair: the private key as a
-// PKCS8 PEM block (readable by sshd) and the public key in OpenSSH one-line
-// format. The base image contract defines how they are consumed.
+// generateSSHKeyPair produces an ed25519 host keypair: the private key as an
+// OpenSSH-format PEM block (sshHostKeyPEMType) and the public key in OpenSSH
+// one-line format. The base image contract defines how they are consumed —
+// sshd reads the private key in place, so the format has to be one sshd
+// accepts: OpenSSH has no PKCS#8 support for Ed25519 and rejects the generic
+// "PRIVATE KEY" block with "invalid format".
 func generateSSHKeyPair() (privPEM, pubOpenSSH []byte, err error) {
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		return nil, nil, err
 	}
-	privDER, err := x509.MarshalPKCS8PrivateKey(priv)
-	if err != nil {
-		return nil, nil, err
-	}
-	privPEM = pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: privDER})
-
 	pub := priv.Public().(ed25519.PublicKey)
+	privPEM = pem.EncodeToMemory(&pem.Block{Type: sshHostKeyPEMType, Bytes: sshEd25519PrivateKeyBlob(pub, priv)})
 	pubOpenSSH = append([]byte(sshEd25519Algorithm+" "), base64.StdEncoding.EncodeToString(sshEd25519Blob(pub))...)
 	pubOpenSSH = append(pubOpenSSH, '\n')
 	return privPEM, pubOpenSSH, nil
+}
+
+// sshEd25519PrivateKeyBlob serialises the keypair in OpenSSH's own private key
+// format (PROTOCOL.key), unencrypted: the "openssh-key-v1" magic, the cipher
+// and KDF names ("none"), the public key blob, then the private section — two
+// check integers, the raw public key, the 64-byte private key (seed followed
+// by the public key, as crypto/ed25519 lays it out), an empty comment, and the
+// 1,2,3… padding up to the cipher's 8-byte block size.
+func sshEd25519PrivateKeyBlob(pub ed25519.PublicKey, priv ed25519.PrivateKey) []byte {
+	buf := []byte("openssh-key-v1\x00")
+	buf = appendSSHString(buf, []byte("none"))  // ciphername
+	buf = appendSSHString(buf, []byte("none"))  // kdfname
+	buf = appendSSHString(buf, nil)             // kdfoptions
+	buf = binary.BigEndian.AppendUint32(buf, 1) // number of keys
+	buf = appendSSHString(buf, sshEd25519Blob(pub))
+
+	var section []byte
+	// The two check integers must be equal; they detect a wrong passphrase, so
+	// any value works for an unencrypted key.
+	section = binary.BigEndian.AppendUint32(section, 0)
+	section = binary.BigEndian.AppendUint32(section, 0)
+	section = appendSSHString(section, []byte(sshEd25519Algorithm))
+	section = appendSSHString(section, pub) // raw key, not the blob
+	section = appendSSHString(section, priv)
+	section = appendSSHString(section, nil) // comment
+	for i := 1; len(section)%8 != 0; i++ {
+		section = append(section, byte(i))
+	}
+	return appendSSHString(buf, section)
+}
+
+// hostKeyUnreadable reports whether the stored host key is not in a format
+// sshd can read, so a Secret written before the format change above — or by
+// hand — is regenerated instead of leaving the environment without ssh. A
+// regenerated host key changes the host fingerprint, which is unavoidable: the
+// key it replaces never authenticated anything.
+func hostKeyUnreadable(pemBytes []byte) bool {
+	block, _ := pem.Decode(pemBytes)
+	return block == nil || block.Type != sshHostKeyPEMType
 }
 
 // sshEd25519Blob builds the SSH wire-format public key blob: two
@@ -1594,11 +1757,11 @@ func serviceBackendRef(serviceName string, port int32) gatewayv1.BackendRef {
 }
 
 // servicePortFor is the Service port number behind a named endpoint: the ssh
-// port is always 22 (main port for the ssh container type), extras use the
-// declared containerPort.
+// port is always sshServicePort (which the Service maps to the container's
+// sshContainerPort), extras use the declared containerPort.
 func servicePortFor(env *aiv1alpha1.DevEnvironment, name string) int32 {
 	if name == sshPortName {
-		return 22
+		return sshServicePort
 	}
 	for _, p := range env.Spec.Ports {
 		if p.Name == name {
