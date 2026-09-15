@@ -404,7 +404,14 @@ type Endpoint struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced
 
-// DevEnvironment is the Schema for the devenvironments API
+// DevEnvironment is the Schema for the devenvironments API.
+//
+// An environment with spec.storage starts from an init container that takes
+// ownership of its workspace claim, running as root with every capability
+// dropped and CAP_CHOWN, CAP_FOWNER and CAP_FSETID added back, so the namespace
+// hosting it has to be at the Baseline Pod Security Standard rather than
+// Restricted: root and any capability beyond NET_BIND_SERVICE are rejected
+// there, and Pod Security Admission has no per-container exemption.
 type DevEnvironment struct {
 	metav1.TypeMeta `json:",inline"`
 
