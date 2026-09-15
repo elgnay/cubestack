@@ -753,26 +753,55 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 	}
 }
 
-// desiredPodSecurityContext returns the pod-level security context, whose one
-// field is fsGroup: the group the volume mounts are chowned to. A workspace claim
-// is mounted root:root, and a non-root account can neither write it nor create the
-// ~/.ssh it keeps there, so without an fsGroup every environment with storage has
-// a read-only home (design Gap A). fsGroup is the only knob that triggers that
-// mount-time chown — runAsGroup is a container-level field and does not, the two
-// are unrelated to Kubernetes — so it is set to the container's own runAsGroup,
-// the value the process will actually run with (README: jupyter-minimal's stock
-// gid 100 included).
+// desiredPermissionInitContainer returns the init container that makes the
+// workspace claim writable by the account the environment runs as. A claim is
+// mounted root:root, and a non-root account can neither write it nor create the
+// ~/.ssh it keeps there, so something has to establish the ownership on the way
+// in.
 //
-// The chown reaches every volume in the pod, not just the workspace claim, which
-// is what makes an environment's own home writable and also what a PVC shared
-// through spec.volumes would be chowned to (design Gap A).
+// It is the workspace claim, and only the workspace claim. The pod-level fsGroup
+// this replaces was the alternative, and it is Pod-scoped: it chowns every volume
+// in the pod mounted read-write, including a PVC shared through spec.volumes that
+// this platform does not own. Kubernetes has no per-mount fsGroup, so the only
+// way to scope the operation to the storage the platform provisions for the
+// environment is to perform it here — and an init container that does not mount a
+// volume has no path through which it could modify one.
 //
-// The change policy is OnRootMismatch rather than the default Always so a pod
-// start does not walk an entire workspace that already has the right group.
-func desiredPodSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.PodSecurityContext {
-	return &corev1.PodSecurityContext{
-		FSGroup:             desiredSecurityContext(rt).RunAsGroup,
-		FSGroupChangePolicy: ptr(corev1.FSGroupChangeOnRootMismatch),
+// The privilege is correspondingly narrow: root, with every capability dropped
+// and CAP_CHOWN added back, which is what changing the owner of a file the
+// process does not own requires. It is not privileged, cannot escalate, and
+// reaches no host path. Note that a namespace enforcing the Restricted Pod
+// Security Standard rejects exactly this — root and any capability beyond
+// NET_BIND_SERVICE — so a namespace hosting DevEnvironments has to be at
+// Baseline, where CHOWN is one of the capabilities that remain allowed. What the
+// container actually runs is ::permissionInitScript.
+func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Container {
+	// Both pointers are always set by desiredSecurityContext, which defaults them
+	// to the platform's 1000/1000 when the spec names neither.
+	sc := desiredSecurityContext(env.Spec.Runtime)
+	return corev1.Container{
+		Name:    permissionInitContainerName,
+		Image:   permissionInitImage,
+		Command: []string{"/bin/sh", "-c", permissionInitScript},
+		Env: []corev1.EnvVar{
+			{Name: permissionInitPathEnv, Value: permissionInitMountPath},
+			{Name: permissionInitUIDEnv, Value: strconv.FormatInt(*sc.RunAsUser, 10)},
+			{Name: permissionInitGIDEnv, Value: strconv.FormatInt(*sc.RunAsGroup, 10)},
+		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:                ptr(int64(0)),
+			RunAsGroup:               ptr(int64(0)),
+			RunAsNonRoot:             ptr(false),
+			Privileged:               ptr(false),
+			AllowPrivilegeEscalation: ptr(false),
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN"},
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{Name: workspaceClaimName, MountPath: permissionInitMountPath},
+		},
 	}
 }
 
@@ -901,9 +930,10 @@ func desiredWhenDeleted(env *aiv1alpha1.DevEnvironment) appsv1.PersistentVolumeC
 	return appsv1.DeletePersistentVolumeClaimRetentionPolicyType
 }
 
-// desiredPodSpec renders the pod spec: compute-pool nodeSelector, the pod-level
-// security context that makes the workspace writable, the main container with the
-// workspace and data volume mounts, and the SSH keys volume.
+// desiredPodSpec renders the pod spec: compute-pool nodeSelector, the main
+// container with the workspace and data volume mounts, the SSH keys volume, and —
+// when the environment has its own storage — the init container that makes that
+// storage writable (::desiredPermissionInitContainer).
 func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment) corev1.PodSpec {
 	mainPort := mainContainerPort(env.Spec.Type)
 	container := corev1.Container{
@@ -974,9 +1004,13 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 
 	podSpec := corev1.PodSpec{
-		NodeSelector:    map[string]string{computeNodePoolLabelKey: computeNodePoolValue},
-		SecurityContext: desiredPodSecurityContext(env.Spec.Runtime),
-		Containers:      []corev1.Container{container},
+		NodeSelector: map[string]string{computeNodePoolLabelKey: computeNodePoolValue},
+		Containers:   []corev1.Container{container},
+	}
+	if env.Spec.Storage != nil {
+		// The workspace claim is the platform's storage for this environment; a
+		// referenced PVC is not, and is never mounted into the init container.
+		podSpec.InitContainers = []corev1.Container{desiredPermissionInitContainer(env)}
 	}
 	for _, v := range env.Spec.Volumes {
 		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
@@ -1268,7 +1302,14 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *
 	if err := ensureDevEnvOwned(secret, env); err != nil {
 		return nil, "", err
 	}
+	// A managed Secret can exist without carrying any data — created by hand, or
+	// emptied by hand — and both repairs below write into its map, so an empty map
+	// has to be in place first. reconcileJupyterAuthSecret needs the same guard
+	// for its token.
 	changed := false
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
 	if hostKeyUnreadable(secret.Data[sshHostKeyKey]) {
 		privPEM, pubOpenSSH, err := generateSSHKeyPair()
 		if err != nil {
@@ -1278,7 +1319,11 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *
 		secret.Data[sshHostPubKeyKey] = pubOpenSSH
 		changed = true
 	}
-	if string(secret.Data[sshAuthorizedKeysKey]) != authorized {
+	// The key has to be written even when authorized is empty: the pod mounts it
+	// by subPath, and a key that is missing from the Secret — rather than present
+	// and empty — leaves the mount with nothing to resolve, so the environment
+	// never starts. This is the shape Create already gives it.
+	if cur, ok := secret.Data[sshAuthorizedKeysKey]; !ok || string(cur) != authorized {
 		secret.Data[sshAuthorizedKeysKey] = []byte(authorized)
 		changed = true
 	}

@@ -84,7 +84,76 @@ const (
 	// requests ReadWriteMany so the volume can be mounted on any node and follow
 	// the pod during drift rescheduling (design §7.2).
 	workspaceStorageClassName = "cephfs-ephemeral"
+
+	// permissionInitContainerName is the init container that establishes the
+	// workspace claim's root ownership before the environment starts.
+	permissionInitContainerName = "initialize-managed-volume"
+
+	// permissionInitImage is the image that container runs: the upstream busybox
+	// base, mirrored into the platform registry so nodes never reach Docker Hub.
+	// It is deliberately not the environment's own image — a bring-your-own image
+	// may be distroless, and the init container fails closed, so an image without
+	// a shell would leave the environment unable to start at all. An offline
+	// deployment mirrors it under the same name/host as its other images.
+	permissionInitImage = "harbor.isuanova.com/suanova/busybox:1.38.0"
+
+	// permissionInitMountPath is where that container mounts the workspace claim.
+	// It is a path of the init container's own — the claim is also mounted at the
+	// environment's workspace path by the main container, and the two mounts are
+	// independent.
+	permissionInitMountPath = "/managed"
+
+	// The variables permissionInitScript reads. They are passed as environment
+	// rather than interpolated into the script so the values the container acted
+	// on are visible on the pod itself.
+	permissionInitPathEnv = "WORKSPACE_PATH"
+	permissionInitUIDEnv  = "WORKSPACE_UID"
+	permissionInitGIDEnv  = "WORKSPACE_GID"
 )
+
+// permissionInitScript establishes the workspace claim's root ownership: the
+// account the environment runs as has to own the directory it works in.
+//
+// `set -e` is the fail-closed requirement, not decoration: if `stat` or `chown`
+// fails — a read-only filesystem, a driver that refuses the change, storage that
+// is not there — the init container exits non-zero and the environment never
+// starts, rather than coming up with a home it cannot write.
+//
+// The chown is conditional and recursive — the same pair of choices the
+// fsGroupChangePolicy: OnRootMismatch it replaces made: a workspace whose root
+// already carries the right owner is left alone, and one whose root does not is
+// repaired all the way down. A claim provisioned from the volumeClaimTemplate
+// belongs to this environment alone, so everything already in it is the
+// environment's to own, and the walk therefore runs once — on the start after an
+// ownership change — rather than on every start. The setgid bit is what makes
+// everything the account creates afterwards inherit the directory's group.
+//
+// The chmod has to come *before* the chown, and that ordering is load-bearing
+// twice over — measured on cs2 against cephfs with this exact securityContext:
+//
+//   - After the chown the directory belongs to the workspace identity, not to
+//     root. chmod needs ownership or CAP_FOWNER, and this container holds
+//     CAP_CHOWN alone, so chmod-ing afterwards fails with EPERM and `set -e`
+//     takes the whole environment down.
+//   - Granting CAP_FOWNER does not rescue it. The chmod would then succeed, but
+//     it is now a write by a process outside the file's group, which Linux
+//     answers by silently clearing S_ISGID: the root ends up 0775, not 2775.
+//     Restoring the bit that way would cost CAP_FSETID as well.
+//
+// Setting the mode while the directory is still root's avoids both, because root
+// is in the group it is about to hand the directory to, and a chown preserves
+// S_ISGID on a directory (the kernel clears it only on non-directories).
+const permissionInitScript = `set -e
+current="$(stat -c '%u:%g' "$WORKSPACE_PATH")"
+if [ "$current" != "$WORKSPACE_UID:$WORKSPACE_GID" ]; then
+	echo "permission-init: chown -R $WORKSPACE_PATH $current -> $WORKSPACE_UID:$WORKSPACE_GID"
+	chmod 2775 "$WORKSPACE_PATH"
+	chown -R "$WORKSPACE_UID:$WORKSPACE_GID" "$WORKSPACE_PATH"
+else
+	echo "permission-init: $WORKSPACE_PATH already owned by $current"
+fi
+echo "permission-init: $WORKSPACE_PATH ready"
+`
 
 // modelKeyMain is the model key of the main model; model volumes are named
 // model-<key> (design §4.5, v1alpha1 fixes the key to main).

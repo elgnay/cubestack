@@ -13,7 +13,6 @@ CONTAINER_TOOL ?= docker
 # build independent of the host; PLATFORM=linux/arm64 is the explicit opt-in to build for
 # another one. `docker buildx imagetools inspect --raw <ref>` shows what a registry received.
 PLATFORM ?= linux/amd64
-PLATFORM_ARG = --platform $(PLATFORM)
 
 # Optional mirror overrides for CN/offline builds (empty = upstream).
 APT_MIRROR    ?=
@@ -87,11 +86,11 @@ check-platform:
 build: build-ssh build-jupyter ## Build both images
 
 build-ssh: check-tag check-platform ## Build the self-authored ssh image
-	$(CONTAINER_TOOL) build $(PLATFORM_ARG) $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) .
 
 build-jupyter: check-tag check-platform ## Build the jupyter image
-	$(CONTAINER_TOOL) build $(PLATFORM_ARG) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
+	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f jupyter/Dockerfile -t $(IMG_JUPYTER) .
 
 smoke: build ## Build and run the full local Docker smoke

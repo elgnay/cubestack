@@ -55,15 +55,23 @@ type DevEnvironmentSpec struct {
 
 	// Storage is the workspace storage: a PVC created with the environment and
 	// mounted at the workspace path (spec.storage.mountPath, else derived from
-	// spec.runtime). Omit it to avoid creating a managed workspace PVC; to use an
-	// existing PVC as the workspace, mount it via spec.volumes at the workspace
-	// path (e.g. /workspace).
+	// spec.runtime). Before the environment starts, the claim's root is made
+	// writable by the environment's identity (spec.runtime.securityContext), so
+	// an environment with storage always comes up with a usable home. Omit it to
+	// avoid creating a managed workspace PVC; to use an existing PVC as the
+	// workspace, mount it via spec.volumes at the workspace path (e.g.
+	// /workspace).
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
 
 	// Volumes are data volume mounts referencing existing PVCs. If spec.storage
 	// is omitted, mount an existing PVC at the workspace path (e.g. /workspace)
-	// to use it as the environment's workspace.
+	// to use it as the environment's workspace. The controller changes the
+	// ownership of nothing but the workspace claim spec.storage provisions: a
+	// referenced PVC is mounted as it is, so it has to carry permissions the
+	// environment's account can work with (spec.runtime.securityContext
+	// .runAsUser / runAsGroup) — the platform does not modify storage it merely
+	// references.
 	// +optional
 	Volumes []VolumeMount `json:"volumes,omitempty"`
 
@@ -272,7 +280,10 @@ type RuntimeSecurityContext struct {
 	// +optional
 	RunAsUser *int64 `json:"runAsUser,omitempty"`
 
-	// RunAsGroup is the group ID to run the container as.
+	// RunAsGroup is the group ID to run the container as. Together with
+	// runAsUser it is the identity the workspace claim is initialized to, so
+	// everything the environment creates in its workspace — including the
+	// workspace root itself — belongs to that group.
 	// +optional
 	RunAsGroup *int64 `json:"runAsGroup,omitempty"`
 }

@@ -559,32 +559,79 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 	})
 
-	// fsGroup is the only field that makes a claim-backed home writable by the
-	// container account, and it has to be the group the account runs with:
-	// runAsGroup alone does not trigger the mount-time chown (design Gap A).
-	Describe("desiredPodSecurityContext", func() {
-		It("defaults fsGroup to the container's own uid-1000 group", func() {
-			psc := desiredPodSecurityContext(nil)
-			Expect(psc.FSGroup).To(Equal(ptrTo(int64(1000))))
-			Expect(psc.FSGroupChangePolicy).To(Equal(ptrTo(corev1.FSGroupChangeOnRootMismatch)))
-			Expect(desiredSecurityContext(nil).RunAsGroup).To(Equal(psc.FSGroup))
+	// The init container is the only thing that makes a claim-backed home
+	// writable, and it is deliberately a narrower mechanism than the pod-level
+	// fsGroup it replaces: it sees the workspace claim and nothing else, and the
+	// privilege it carries is bounded to what changing an owner takes.
+	Describe("desiredPermissionInitContainer", func() {
+		rt := func(user, group int64) *aiv1alpha1.RuntimeSpec {
+			return &aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
+				RunAsUser: ptrTo(user), RunAsGroup: ptrTo(group),
+			}}
+		}
+		initContainer := func(mut func(*aiv1alpha1.DevEnvironment)) corev1.Container {
+			// The container reads the spec only, so the fixture carries no metadata.
+			env := &aiv1alpha1.DevEnvironment{
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeSSH, Image: testDevImage,
+				},
+			}
+			if mut != nil {
+				mut(env)
+			}
+			return desiredPermissionInitContainer(env)
+		}
+
+		It("initializes the workspace claim to the identity the container runs as", func() {
+			c := initContainer(nil)
+			Expect(c.Env).To(ContainElements(
+				corev1.EnvVar{Name: permissionInitPathEnv, Value: permissionInitMountPath},
+				corev1.EnvVar{Name: permissionInitUIDEnv, Value: "1000"},
+				corev1.EnvVar{Name: permissionInitGIDEnv, Value: "1000"},
+			))
 		})
 
-		It("follows an explicit runAsGroup, such as the jupyter image's stock gid", func() {
-			rt := func(user, group int64) *aiv1alpha1.RuntimeSpec {
-				return &aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
-					RunAsUser: ptrTo(user), RunAsGroup: ptrTo(group),
-				}}
-			}
-			psc := desiredPodSecurityContext(rt(1000, 100))
-			Expect(psc.FSGroup).To(Equal(ptrTo(int64(100))))
-			Expect(desiredSecurityContext(rt(1000, 100)).RunAsGroup).To(Equal(psc.FSGroup))
+		It("follows an explicit runtime identity, such as the jupyter image's stock gid", func() {
+			c := initContainer(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Runtime = rt(1000, 100) })
+			Expect(c.Env).To(ContainElements(
+				corev1.EnvVar{Name: permissionInitUIDEnv, Value: "1000"},
+				corev1.EnvVar{Name: permissionInitGIDEnv, Value: "100"},
+			))
+		})
 
-			// The documented root exception still carries whatever group was
-			// resolved, so the two can never disagree.
-			psc = desiredPodSecurityContext(rt(0, 2000))
-			Expect(psc.FSGroup).To(Equal(ptrTo(int64(2000))))
-			Expect(desiredSecurityContext(rt(0, 2000)).RunAsGroup).To(Equal(psc.FSGroup))
+		It("runs as root with CAP_CHOWN and nothing else", func() {
+			sc := initContainer(nil).SecurityContext
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(false)))
+			Expect(sc.Privileged).To(Equal(ptrTo(false)))
+			Expect(sc.AllowPrivilegeEscalation).To(Equal(ptrTo(false)))
+			Expect(sc.Capabilities.Drop).To(ConsistOf(corev1.Capability("ALL")))
+			Expect(sc.Capabilities.Add).To(ConsistOf(corev1.Capability("CHOWN")))
+		})
+
+		It("mounts the workspace claim and no other volume", func() {
+			Expect(initContainer(nil).VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: workspaceClaimName, MountPath: permissionInitMountPath},
+			}))
+		})
+
+		// The properties the security model rests on: the script fails the
+		// environment rather than letting it start against a volume it could not
+		// initialize; the repair is conditional and recursive, so a workspace with
+		// the right owner is never walked; and the mode is set while the directory
+		// is still root's — afterwards root no longer owns it, holds no CAP_FOWNER,
+		// and a chmod would strip the very setgid bit it asks for.
+		It("fails closed, and repairs only on a mismatch, all the way down", func() {
+			script := initContainer(nil).Command[2]
+			Expect(script).To(HavePrefix("set -e\n"))
+			Expect(script).To(ContainSubstring(
+				`if [ "$current" != "$WORKSPACE_UID:$WORKSPACE_GID" ]; then`))
+			Expect(script).To(ContainSubstring(`chown -R "$WORKSPACE_UID:$WORKSPACE_GID" "$WORKSPACE_PATH"`))
+			chmod, chown := strings.Index(script, "chmod 2775"),
+				strings.Index(script, `chown -R "$WORKSPACE_UID`)
+			Expect(chmod).To(BeNumerically("<", chown),
+				"the chmod has to precede the chown: see ::permissionInitScript")
 		})
 	})
 
@@ -700,11 +747,38 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}
 		})
 
-		It("carries a pod-level fsGroup matching the container's runAsGroup", func() {
-			spec := render(nil)
-			Expect(spec.SecurityContext).To(Equal(desiredPodSecurityContext(nil)))
-			Expect(spec.SecurityContext.FSGroup).To(Equal(spec.Containers[0].SecurityContext.RunAsGroup))
-			Expect(spec.SecurityContext.FSGroup).To(Equal(ptrTo(int64(1000))))
+		// The environment's own storage is initialized by an init container, so
+		// the pod carries no fsGroup: an fsGroup is Pod-scoped and would chown
+		// every read-write volume in the pod, including a referenced PVC.
+		It("initializes the workspace claim from an init container, without an fsGroup", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "10Gi"}
+			})
+			Expect(spec.SecurityContext).To(BeNil())
+			Expect(spec.InitContainers).To(HaveLen(1))
+			Expect(spec.InitContainers[0].Name).To(Equal(permissionInitContainerName))
+			Expect(spec.InitContainers[0].Image).To(Equal(permissionInitImage))
+		})
+
+		It("has no init container when the environment has no storage of its own", func() {
+			Expect(render(nil).InitContainers).To(BeEmpty())
+		})
+
+		It("never mounts a referenced PVC into the init container", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "10Gi"}
+				env.Spec.Volumes = []aiv1alpha1.VolumeMount{
+					{Name: "datasets", PVCName: "shared-dataset", MountPath: "/datasets", ReadOnly: true},
+				}
+			})
+			Expect(spec.InitContainers).To(HaveLen(1))
+			Expect(spec.InitContainers[0].VolumeMounts).To(ConsistOf(corev1.VolumeMount{
+				Name: workspaceClaimName, MountPath: permissionInitMountPath,
+			}))
+			// The volume itself still reaches the main container, mounted as asked.
+			Expect(spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name: "datasets", MountPath: "/datasets", ReadOnly: true,
+			}))
 		})
 
 		It("copies runtime command, args and env onto the container", func() {
@@ -782,8 +856,8 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 
 		// A claim mounted on the account's home hides the ~/.ssh the image bakes.
 		// Nothing is mounted in its place: the platform keys live under /run, the
-		// account creates its own ~/.ssh (which the pod's fsGroup makes possible),
-		// and no mount target is built inside the claim.
+		// account creates its own ~/.ssh (which the init container's chown of the
+		// claim makes possible), and no mount target is built inside the claim.
 		It("keeps every mount out of a home the workspace claim covers", func() {
 			var env *aiv1alpha1.DevEnvironment
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
@@ -1443,6 +1517,34 @@ var _ = Describe("DevEnvironment controller", func() {
 				sts := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
 				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("repairs a managed Secret that has no data", func() {
+			env := validDevEnvironment("de-ssh-secret-empty")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// A managed Secret can exist without carrying any data — created by hand
+			// before the environment, or emptied by hand — and recovering the host
+			// key then writes into an empty map rather than a missing one.
+			emptied := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), emptied)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+			emptied.Data = nil
+			Expect(k8sClient.Update(ctx, emptied)).To(Succeed())
+
+			// The Secret is owned by the environment, so emptying it re-reconciles:
+			// the repair has to come back with a readable host keypair.
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
+				g.Expect(s.Data).To(HaveKey(sshHostPubKeyKey))
+				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(s.Data).To(HaveKey(sshAuthorizedKeysKey))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

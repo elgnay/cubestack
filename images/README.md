@@ -92,8 +92,8 @@ The platform keys deliberately do **not** live in `$HOME`, where the images bake
 claim is mounted over the home, its root is not writable by the account, and the runtime creates a file
 mount target's parent directory root-owned — so keys mounted there would sit in a directory the account
 cannot write, alongside the account's own files it could not add. Under `/run` the platform keys stay
-out of the user's way entirely, and `~/.ssh` is the account's own (the pod's `fsGroup` is what makes the
-claim, and so that directory, writable at all — see the operator requirement below).
+out of the user's way entirely, and `~/.ssh` is the account's own (the controller's init container is
+what makes the claim, and so that directory, writable at all — see the operator requirement below).
 
 That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
 serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
@@ -131,13 +131,16 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
   there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
   from the account's passwd entry for its own `AuthorizedKeysFile` entry.
-- **Give the pod an `fsGroup` equal to the container's `runAsGroup`.** A workspace claim mounts
-  `root:root` and a non-root account can write nothing in it — no `~/.ssh`, no workspace files at all.
-  `fsGroup` is the only field that makes kubelet (or the CSI driver) chown the mount: `runAsGroup` is
-  container-level and does not, the two being unrelated to Kubernetes. It is applied to the mounted
-  volume, so it does not reach a directory the runtime creates *afterwards* — which is why the platform
-  keys are mounted outside `$HOME` rather than into it, and why the account's own `~/.ssh` no longer
-  needs anything mounted at all.
+- **Initialize the workspace claim's ownership.** A workspace claim mounts `root:root` and a non-root
+  account can write nothing in it — no `~/.ssh`, no workspace files at all. The controller runs an init
+  container before the environment starts (`::desiredPermissionInitContainer`) that chowns the claim
+  root to the identity the container runs as (`spec.runtime.securityContext`, platform default
+  1000:1000). It is deliberately not a pod-level `fsGroup`: that would chown every read-write volume in
+  the pod, including a referenced PVC the platform does not own. It mounts the workspace claim and
+  nothing else, repairs that claim's owner (and, on a mismatch, everything under it, as
+  `fsGroupChangePolicy: OnRootMismatch` did), and leaves a directory the runtime creates *after* it runs
+  alone — which is why the platform keys are mounted outside `$HOME` rather than into it, and why the
+  account's own `~/.ssh` no longer needs anything mounted at all.
 - **Publish the container's `2222`** as the Service's ssh port (`port: 22`, `targetPort: 2222`) and
   point the readiness probe at `2222` — the probe targets the container, not the Service.
 
