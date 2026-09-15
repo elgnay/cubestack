@@ -128,21 +128,27 @@ const (
 // ownership change — rather than on every start. The setgid bit is what makes
 // everything the account creates afterwards inherit the directory's group.
 //
-// The chmod has to come *before* the chown, and that ordering is load-bearing
-// twice over — measured on cs2 against cephfs with this exact securityContext:
+// The chmod comes before the chown because that direction costs nothing on the
+// common path: a claim the init container owns — every freshly provisioned one —
+// is owned and grouped by the caller, so the mode is set with no capability
+// involved and no chance of losing S_ISGID, and a chown preserves S_ISGID on a
+// directory (the kernel clears it only on non-directories).
 //
-//   - After the chown the directory belongs to the workspace identity, not to
-//     root. chmod needs ownership or CAP_FOWNER, and this container holds
-//     CAP_CHOWN alone, so chmod-ing afterwards fails with EPERM and `set -e`
-//     takes the whole environment down.
-//   - Granting CAP_FOWNER does not rescue it. The chmod would then succeed, but
-//     it is now a write by a process outside the file's group, which Linux
-//     answers by silently clearing S_ISGID: the root ends up 0775, not 2775.
-//     Restoring the bit that way would cost CAP_FSETID as well.
+// That ordering is not what makes the sequence correct, though, and must not be
+// mistaken for it. A claim outlives the identity it was initialized for: edit
+// spec.runtime.securityContext on a live environment and the init container
+// finds a root owned by the *previous* uid, which is neither the caller nor
+// grouped with it. That path needs the container's other two capabilities, and
+// both were measured on cs2 against cephfs:
 //
-// Setting the mode while the directory is still root's avoids both, because root
-// is in the group it is about to hand the directory to, and a chown preserves
-// S_ISGID on a directory (the kernel clears it only on non-directories).
+//   - Without CAP_FOWNER the chmod is EPERM — root does not own the directory
+//     and CAP_CHOWN does not help — so `set -e` takes the environment down and
+//     the ownership repair never runs.
+//   - With CAP_FOWNER alone it succeeds and silently does not stick: a mode
+//     change from outside the file's group drops S_ISGID, leaving 0775.
+//
+// Measured end state for that path with all three held: 2000:2000 2775, the
+// tree chowned, every level writable by the new identity.
 const permissionInitScript = `set -e
 current="$(stat -c '%u:%g' "$WORKSPACE_PATH")"
 if [ "$current" != "$WORKSPACE_UID:$WORKSPACE_GID" ]; then

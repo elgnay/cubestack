@@ -768,13 +768,19 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 // volume has no path through which it could modify one.
 //
 // The privilege is correspondingly narrow: root, with every capability dropped
-// and CAP_CHOWN added back, which is what changing the owner of a file the
-// process does not own requires. It is not privileged, cannot escalate, and
-// reaches no host path. Note that a namespace enforcing the Restricted Pod
-// Security Standard rejects exactly this — root and any capability beyond
+// and three added back. CAP_CHOWN is what changing the owner of a file the
+// process does not own requires. CAP_FOWNER and CAP_FSETID are what setting the
+// mode on a claim root that belongs to a *previous* identity requires: a claim
+// outlives the identity it was initialized for, so editing
+// spec.runtime.securityContext leaves one owned by a uid the container is
+// neither the owner nor grouped with. Without CAP_FOWNER the chmod is EPERM and
+// the environment never starts; without CAP_FSETID it succeeds and silently
+// drops the setgid bit. It is not privileged, cannot escalate, and reaches no
+// host path. Note that a namespace enforcing the Restricted Pod Security
+// Standard rejects exactly this — root and any capability beyond
 // NET_BIND_SERVICE — so a namespace hosting DevEnvironments has to be at
-// Baseline, where CHOWN is one of the capabilities that remain allowed. What the
-// container actually runs is ::permissionInitScript.
+// Baseline, where these three are among the capabilities that remain allowed.
+// What the container actually runs is ::permissionInitScript.
 func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Container {
 	// Both pointers are always set by desiredSecurityContext, which defaults them
 	// to the platform's 1000/1000 when the spec names neither.
@@ -796,7 +802,7 @@ func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Conta
 			AllowPrivilegeEscalation: ptr(false),
 			Capabilities: &corev1.Capabilities{
 				Drop: []corev1.Capability{"ALL"},
-				Add:  []corev1.Capability{"CHOWN"},
+				Add:  []corev1.Capability{"CHOWN", "FOWNER", "FSETID"},
 			},
 		},
 		VolumeMounts: []corev1.VolumeMount{

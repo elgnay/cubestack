@@ -118,10 +118,11 @@ read-only (`csiMountMgr.supportsFSGroup`), and a driver advertising `VOLUME_MOUN
 itself — so the exemption was one driver's behavior to keep, not a platform guarantee to rely on.
 
 An init container that mounts the workspace claim and nothing else has no path through which it could
-reach a referenced PVC. It runs as root with every capability dropped and `CAP_CHOWN` added back, sets
-the claim root's mode and owner (`chmod 2775` **before** the `chown` — see below), and runs under `set -e`
-so a step that fails stops the environment rather than starting it against a volume it could not
-initialize. Four consequences follow:
+reach a referenced PVC. It runs as root with every capability dropped and `CAP_CHOWN`, `CAP_FOWNER` and
+`CAP_FSETID` added back (see below for which of the three each path needs), sets the claim root's mode
+and owner (`chmod 2775` **before** the `chown` — see below), and runs under `set -e` so a step that fails
+stops the environment rather than starting it against a volume it could not initialize. Four
+consequences follow:
 
 - **The pod carries no `fsGroup`, and no pod-level security context at all.** Nothing else mounted into
   the pod is touched.
@@ -141,23 +142,36 @@ initialize. Four consequences follow:
   `1000:1000`. The condition is the owner alone, as it was for `OnRootMismatch`; a root whose owner is
   already right but whose mode has drifted from `2775` is left as the account set it, and content an
   account deliberately left root-owned inside an otherwise-correct workspace is not reclaimed.
-- **The namespace must not enforce the Restricted Pod Security Standard.** Root and `CAP_CHOWN` are both
-  rejected there, and Pod Security Admission has no per-container exemption — confirmed on cs2 with
-  `--dry-run=server`: the pod is admitted under `baseline` and refused under `restricted` with
-  `runAsUser=0` and `CHOWN` in `capabilities.add` named among the violations. Baseline is the floor, and
-  it is enough: `CHOWN` is one of the capabilities Baseline still allows, and Baseline does not constrain
-  `runAsUser`. This is the one place the design takes a policy exception rather than removing the
-  dependency — unlike Gap B, where removing it was possible.
+- **The namespace must not enforce the Restricted Pod Security Standard.** Root and any of the three
+  capabilities are rejected there, and Pod Security Admission has no per-container exemption — confirmed
+  on cs2 with `--dry-run=server`: the pod is admitted under `baseline` and refused under `restricted`
+  with `runAsUser=0` and the added capabilities named among the violations. Baseline is the floor, and it
+  is enough: `CHOWN`, `FOWNER` and `FSETID` are all capabilities Baseline still allows, and Baseline does
+  not constrain `runAsUser`. This is the one place the design takes a policy exception rather than
+  removing the dependency — unlike Gap B, where removing it was possible.
 
-**The `chmod` has to precede the `chown`, and that ordering is not cosmetic.** Both orders were run on
-cs2 against a cephfs claim with this exact securityContext. Chowning first leaves root not owning the
-directory but still holding `CAP_CHOWN` alone — no `CAP_FOWNER` — so the `chmod` that follows fails with
-`EPERM` and takes the environment down with it. Adding `CAP_FOWNER` lets the `chmod` succeed but not
-stick: the write now comes from a process outside the file's group, which Linux answers by clearing
-`S_ISGID`, leaving `0775` instead of `2775` (holding the bit would cost `CAP_FSETID` as well). Setting
-the mode while the directory is still root's — root being in the group it is about to hand the directory
-to — avoids both, and a `chown` preserves `S_ISGID` because the kernel clears it only on non-directories.
-Measured end state: `1000:1000 2775`, uid 1000 writes, and a directory it creates inherits gid 1000.
+**A claim outlives the identity it was initialized for, and that is what the capabilities are for.** The
+root of a claim is repaired to whatever identity `spec.runtime.securityContext` names *now*, but the
+claim is not re-provisioned when that spec is edited — `runAsUser` and `runAsGroup` are mutable and the
+PVC persists. So the init container can find a root owned by the identity the environment **used to
+run as**: a uid it is neither the owner of nor grouped with. All three cases were run on cs2 against a
+cephfs claim whose root was left `1000:1000` and re-targeted to `2000:2000`:
+
+- **`CAP_CHOWN` alone fails the environment.** The `chmod` on a directory root does not own is `EPERM` —
+  `CAP_CHOWN` does not help — and `set -e` stops the init container, so the environment never starts and
+  the ownership repair behind it never runs. Measured: `chmod: /managed: Operation not permitted`.
+- **`CAP_FOWNER` makes it succeed but not stick.** The mode change now comes from a process outside the
+  file's group, which Linux answers by clearing `S_ISGID`: measured `2000:2000 0775`, setgid lost.
+  `CAP_FSETID` is what keeps the bit.
+- **`CAP_CHOWN` + `CAP_FOWNER` + `CAP_FSETID` repairs it.** Measured `2000:2000 2775`, the tree chowned,
+  every level writable by the new identity, and a directory it creates afterwards coming out gid 2000.
+
+The `chmod` still precedes the `chown`, but that order is no longer what decides correctness — it is the
+cheaper direction on the common path, where the claim is fresh: the init container owns that root and is
+grouped with it, so the mode is set with no capability involved and no chance of losing `S_ISGID`, and
+the `chown` that follows preserves `S_ISGID` because the kernel clears it only on non-directories.
+Measured on a fresh claim with all three held: `1000:1000 2775`, uid 1000 writes, and a directory it
+creates inherits gid 1000.
 
 The same probes settled the `~/.ssh` design: **the subPath file mount does not need the parent to
 exist.** `subPath` mounts are delegated to the runtime, and runc's `createMountpoint` creates a file bind

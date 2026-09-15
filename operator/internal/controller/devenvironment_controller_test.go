@@ -599,7 +599,13 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			))
 		})
 
-		It("runs as root with CAP_CHOWN and nothing else", func() {
+		// FOWNER and FSETID are part of the contract, not incidental: the claim
+		// outlives the identity it was initialized for, so a root that belongs to
+		// the identity the spec used to name is one the container neither owns nor
+		// is grouped with — the chmod needs FOWNER to succeed at all, and FSETID to
+		// keep the setgid bit. Measured on cs2: without FOWNER the init container
+		// dies on EPERM; with FOWNER alone the root lands 0775.
+		It("runs as root with CAP_CHOWN, CAP_FOWNER and CAP_FSETID and nothing else", func() {
 			sc := initContainer(nil).SecurityContext
 			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(0))))
 			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(0))))
@@ -607,7 +613,8 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			Expect(sc.Privileged).To(Equal(ptrTo(false)))
 			Expect(sc.AllowPrivilegeEscalation).To(Equal(ptrTo(false)))
 			Expect(sc.Capabilities.Drop).To(ConsistOf(corev1.Capability("ALL")))
-			Expect(sc.Capabilities.Add).To(ConsistOf(corev1.Capability("CHOWN")))
+			Expect(sc.Capabilities.Add).To(ConsistOf(
+				corev1.Capability("CHOWN"), corev1.Capability("FOWNER"), corev1.Capability("FSETID")))
 		})
 
 		It("mounts the workspace claim and no other volume", func() {
@@ -619,9 +626,10 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		// The properties the security model rests on: the script fails the
 		// environment rather than letting it start against a volume it could not
 		// initialize; the repair is conditional and recursive, so a workspace with
-		// the right owner is never walked; and the mode is set while the directory
-		// is still root's — afterwards root no longer owns it, holds no CAP_FOWNER,
-		// and a chmod would strip the very setgid bit it asks for.
+		// the right owner is never walked; and the chmod precedes the chown, so the
+		// common path — a claim the container owns — sets the mode with no
+		// capability involved. Correctness on the identity-change path rests on the
+		// capabilities asserted above, not on that order.
 		It("fails closed, and repairs only on a mismatch, all the way down", func() {
 			script := initContainer(nil).Command[2]
 			Expect(script).To(HavePrefix("set -e\n"))
@@ -631,7 +639,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			chmod, chown := strings.Index(script, "chmod 2775"),
 				strings.Index(script, `chown -R "$WORKSPACE_UID`)
 			Expect(chmod).To(BeNumerically("<", chown),
-				"the chmod has to precede the chown: see ::permissionInitScript")
+				"the chmod precedes the chown: see ::permissionInitScript")
 		})
 	})
 
