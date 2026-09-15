@@ -30,6 +30,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -49,11 +50,15 @@ const (
 	testCPUImage          = "harbor.local/ai-images/ssh-ubuntu22.04:latest"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
-	testGatewayIP         = "1.2.3.4"
-	testGRPCPortName      = "grpc"
-	testJupyterName       = "jupyter"
-	testRuntimeUser       = "jovyan"
-	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	// testGatewayDataplaneNamespace is where the test Gateway's proxy pods run.
+	// It is deliberately not the Gateway's own namespace: they are separate
+	// deployments, and the ingress rule admits the former.
+	testGatewayDataplaneNamespace = "envoy-gateway-system"
+	testGatewayIP                 = "1.2.3.4"
+	testGRPCPortName              = "grpc"
+	testJupyterName               = "jupyter"
+	testRuntimeUser               = "jovyan"
+	testUserSSHKey                = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 	// testSSHUser is the account the self-authored ssh images ship, selected
 	// with spec.runtime.user; testSSHHome is the home it implies.
 	testSSHUser = "ubuntu"
@@ -326,6 +331,52 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			setDevEnvironmentReadyCondition(&conditions, metav1.ConditionFalse, reasonStopped, "stopped")
 
 			Expect(meta.FindStatusCondition(conditions, aiv1alpha1.ConditionReady).LastTransitionTime).NotTo(Equal(first))
+		})
+	})
+
+	Describe("desiredNetworkPolicy", func() {
+		env := &aiv1alpha1.DevEnvironment{
+			ObjectMeta: metav1.ObjectMeta{Name: "de-netpol", Namespace: "ns"},
+		}
+
+		It("admits nothing while no dataplane namespace is configured", func() {
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env)
+
+			Expect(np.Spec.Ingress).To(BeEmpty())
+			Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress,
+			}))
+			Expect(np.Spec.Egress).To(HaveLen(1))
+		})
+
+		It("admits the configured Gateway's dataplane", func() {
+			r := &DevEnvironmentReconciler{Config: DevEnvironmentControllerConfig{
+				GatewayDataplaneNamespace: testGatewayDataplaneNamespace,
+			}}
+
+			np := r.desiredNetworkPolicy(env)
+
+			Expect(np.Spec.Ingress).To(HaveLen(1))
+			Expect(np.Spec.Ingress[0].From).To(HaveLen(1))
+			Expect(np.Spec.Ingress[0].From[0].NamespaceSelector.MatchLabels).To(Equal(map[string]string{
+				namespaceNameLabel: testGatewayDataplaneNamespace,
+			}))
+			// The Gateway's own name and namespace are defaulted, not required
+			// from config, and both label the peer.
+			Expect(np.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(Equal(map[string]string{
+				gatewayDataplaneNameLabel:      defaultGatewayName,
+				gatewayDataplaneNamespaceLabel: systemNamespace,
+			}))
+		})
+
+		It("admits the peer without naming a port", func() {
+			r := &DevEnvironmentReconciler{Config: DevEnvironmentControllerConfig{
+				GatewayDataplaneNamespace: testGatewayDataplaneNamespace,
+			}}
+
+			// An environment's ports vary by spec.type and spec.ports, so naming
+			// one here would admit it and silently refuse the rest.
+			Expect(r.desiredNetworkPolicy(env).Spec.Ingress[0].Ports).To(BeEmpty())
 		})
 	})
 })
@@ -1002,6 +1053,24 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(metav1.GetControllerOf(sts).UID).To(Equal(env.UID))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("admits the platform Gateway's dataplane into the environment", func() {
+			env := validDevEnvironment("de-netpol")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				np := &networkingv1.NetworkPolicy{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), np)).To(Succeed())
+				g.Expect(np.Spec.Ingress).To(HaveLen(1))
+				g.Expect(np.Spec.Ingress[0].From).To(HaveLen(1))
+				g.Expect(np.Spec.Ingress[0].From[0].NamespaceSelector.MatchLabels).To(HaveKeyWithValue(
+					"kubernetes.io/metadata.name", testGatewayDataplaneNamespace))
+				g.Expect(np.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(HaveKeyWithValue(
+					gatewayDataplaneNameLabel, testDevEnvGatewayName))
+				g.Expect(metav1.GetControllerOf(np).UID).To(Equal(env.UID))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

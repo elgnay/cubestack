@@ -63,10 +63,11 @@ sed -i 's|namespace: cubestack-system|namespace: {{ .Release.Namespace }}|g' "${
 # Rewrite the manager's platform-Gateway args into values-driven Go template
 # conditionals: --gateway-name / --gateway-namespace (literals from the
 # config/manager base) become {{- with .Values.gateway.* }} blocks and the
-# domain flag — deliberately absent from the kustomize base, see
-# config/manager/manager.yaml — is injected as {{- if .Values.gateway.domain
-# }}. Each flag renders only while its value is non-empty, so the empty
-# defaults reproduce the unconfigured state (no gateway flags at all).
+# flags deliberately absent from the kustomize base, see
+# config/manager/manager.yaml — the domain and the dataplane namespace — are
+# injected as {{- if/with .Values.gateway.* }} blocks. Each flag renders only
+# while its value is non-empty, so the empty defaults reproduce the
+# unconfigured state (no gateway flags at all).
 awk '
 /^[[:space:]]*- --gateway-name=cubestack-gateway$/ {
   if (gateway_name++) { print "duplicate --gateway-name line in kustomize output" > "/dev/stderr"; exit 1 }
@@ -79,6 +80,9 @@ awk '
   print ind "{{- end }}"
   print ind "{{- if .Values.gateway.domain }}"
   print ind "- --gateway-domain={{ .Values.gateway.domain }}"
+  print ind "{{- end }}"
+  print ind "{{- with .Values.gateway.dataplaneNamespace }}"
+  print ind "- --gateway-dataplane-namespace={{ . }}"
   print ind "{{- end }}"
   next
 }
@@ -130,11 +134,13 @@ rm -f "${OUT}"
 # The manager's platform-Gateway args are injected into the deployment
 # template from .Values.gateway (section 2 rewrite). Assert the rendered args
 # for every value combination that changes behavior: defaults pass
-# name/namespace (the platform conventions) but no domain; an explicit domain
-# is passed verbatim; an emptied name/namespace drops its flag; and emptying
-# all three reproduces the pre-entry state — no gateway flags at all
-# (RouteReady=False, GatewayNotConfigured). A silent no-op here would ship a
-# chart whose publish feature cannot be enabled by values.
+# name/namespace (the platform conventions) and the dataplane namespace but no
+# domain; an explicit domain is passed verbatim; an emptied name/namespace or
+# dataplane namespace drops its flag; and emptying all four reproduces the
+# pre-entry state — no gateway flags at all (RouteReady=False,
+# GatewayNotConfigured, and environments left default-deny inbound). A silent
+# no-op here would ship a chart whose publish feature cannot be enabled by
+# values.
 command -v helm >/dev/null 2>&1 || { echo "helm not found — required to validate the rendered chart (section 3 of update-helm-resources.sh)"; exit 1; }
 # expect_render <case> <present|absent> <grep pattern (anchored at the arg line)> [helm --set args...]
 expect_render() {
@@ -153,6 +159,9 @@ GW_ARG='^[[:space:]]*- --gateway-'
 expect_render defaults present '^[[:space:]]*- --gateway-name=cubestack-gateway$'
 expect_render defaults present '^[[:space:]]*- --gateway-namespace=cubestack-system$'
 expect_render defaults absent  '^[[:space:]]*- --gateway-domain='
+# The dataplane namespace is passed by default: it is what lets the DevEnvironment
+# controller admit the Gateway's proxies into environment pods.
+expect_render defaults present '^[[:space:]]*- --gateway-dataplane-namespace=envoy-gateway-system$'
 # Setting the domain enables route publishing.
 expect_render domain-set present '^[[:space:]]*- --gateway-domain=example\.com$' --set gateway.domain=example.com
 # Emptied name/namespace drop their flags while the other keeps rendering; a
@@ -162,6 +171,10 @@ expect_render name-empty present '^[[:space:]]*- --gateway-namespace=cubestack-s
 expect_render namespace-empty absent '^[[:space:]]*- --gateway-namespace=' --set gateway.namespace=
 expect_render namespace-empty present '^[[:space:]]*- --gateway-name=cubestack-gateway$' --set gateway.namespace=
 expect_render name-custom present '^[[:space:]]*- --gateway-name=my-gateway$' --set gateway.name=my-gateway
-# All three empty: reproduce the unconfigured state (no gateway flags at all).
-expect_render all-empty absent "${GW_ARG}" --set gateway.name= --set gateway.namespace= --set gateway.domain=
+# Emptied dataplane namespace drops its flag alone, leaving environments default-deny.
+expect_render dataplane-empty absent '^[[:space:]]*- --gateway-dataplane-namespace=' --set gateway.dataplaneNamespace=
+expect_render dataplane-empty present '^[[:space:]]*- --gateway-name=cubestack-gateway$' --set gateway.dataplaneNamespace=
+# All four empty: reproduce the unconfigured state (no gateway flags at all).
+expect_render all-empty absent "${GW_ARG}" \
+  --set gateway.name= --set gateway.namespace= --set gateway.domain= --set gateway.dataplaneNamespace=
 echo "chart resources regenerated under ${CHART}"

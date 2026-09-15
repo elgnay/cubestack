@@ -12,6 +12,12 @@ gateway:
   name: cubestack-gateway       # --gateway-name
   namespace: cubestack-system   # --gateway-namespace
   domain: ""                    # --gateway-domain
+  # Namespace the Gateway's dataplane (proxy) pods run in — not the namespace
+  # of the Gateway object itself. Read by the DevEnvironment controller: it is
+  # where each environment's NetworkPolicy admits ingress from, so a route
+  # through the Gateway can reach the environment pod. Empty keeps environment
+  # pods default-deny inbound.
+  dataplaneNamespace: envoy-gateway-system  # --gateway-dataplane-namespace
 
 replicaCount: 1
 

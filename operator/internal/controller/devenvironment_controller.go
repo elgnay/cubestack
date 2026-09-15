@@ -76,6 +76,13 @@ type DevEnvironmentControllerConfig struct {
 	GatewayName string
 	// GatewayNamespace is the namespace of the shared Gateway.
 	GatewayNamespace string
+	// GatewayDataplaneNamespace is the namespace the shared Gateway's dataplane
+	// pods run in, which is where its traffic to an environment originates. It
+	// is not GatewayNamespace: the Gateway object and its Envoy dataplane are
+	// separate deployments and Envoy Gateway places the latter in its own
+	// namespace. Empty disables the ingress allowance in desiredNetworkPolicy,
+	// leaving environments at the default-deny floor.
+	GatewayDataplaneNamespace string
 	// GatewayIP is a static fallback address used when the Gateway has no
 	// status address yet.
 	GatewayIP string
@@ -126,6 +133,17 @@ const (
 	gatewayAPIGroup = "gateway.networking.k8s.io"
 	gatewayKind     = "Gateway"
 	serviceKind     = "Service"
+
+	// Labels Envoy Gateway puts on the dataplane pods it creates for a Gateway.
+	// They identify which Gateway a proxy pod belongs to, which is what lets a
+	// NetworkPolicy admit that dataplane specifically rather than every pod that
+	// happens to share its namespace.
+	gatewayDataplaneNameLabel      = "gateway.envoyproxy.io/owning-gateway-name"
+	gatewayDataplaneNamespaceLabel = "gateway.envoyproxy.io/owning-gateway-namespace"
+
+	// namespaceNameLabel carries a Namespace's own name; it is what a
+	// NetworkPolicy peer uses to select a namespace by name.
+	namespaceNameLabel = "kubernetes.io/metadata.name"
 
 	// sshPortName names the SSH Service port and the "ssh" endpoint; the ssh
 	// endpoint address carries the environment's login account, which is
@@ -1095,25 +1113,49 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 	}
 }
 
-// desiredNetworkPolicy enforces default-deny ingress with DNS egress
+// desiredNetworkPolicy enforces default-deny ingress — widened by exactly one
+// rule when the platform Gateway's dataplane is configured — with DNS egress
 // whitelisted (design §9.1).
 func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvironment) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
 	dnsPort := intstr.FromInt32(53)
+	cfg := r.defaultedConfig()
+	// Ingress is default-deny: an empty rule list admits nothing, and this is
+	// the only place an environment's inbound allowance is widened. The
+	// allowance below is the dataplane serving the environment's published
+	// routes, which reaches the pod from another namespace and would otherwise
+	// be refused.
+	//
+	// It carries no ports. An environment listens on its type's main port
+	// (jupyter 8888, vscode 8080, ssh 2222) plus whatever spec.ports declares, so
+	// naming any one of them would silently break the rest. The peer is already
+	// narrowed to a single Gateway's proxy pods, and a policy can admit no more
+	// ports than the container binds.
+	ingress := []networkingv1.NetworkPolicyIngressRule{}
+	if ns := cfg.GatewayDataplaneNamespace; ns != "" {
+		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{
+			From: []networkingv1.NetworkPolicyPeer{{
+				NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					namespaceNameLabel: ns,
+				}},
+				PodSelector: &metav1.LabelSelector{MatchLabels: map[string]string{
+					gatewayDataplaneNameLabel:      cfg.GatewayName,
+					gatewayDataplaneNamespaceLabel: cfg.GatewayNamespace,
+				}},
+			}},
+		})
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
-			// Ingress is an empty rule list: default-deny inbound. The platform
-			// gateway/portal whitelist rules are installed outside this
-			// controller (design §9.1).
-			Ingress: []networkingv1.NetworkPolicyIngressRule{},
+			Ingress:     ingress,
 			Egress: []networkingv1.NetworkPolicyEgressRule{
 				{
 					To: []networkingv1.NetworkPolicyPeer{{
-						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"kubernetes.io/metadata.name": "kube-system"}},
+						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{namespaceNameLabel: "kube-system"}},
 						PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "kube-dns"}},
 					}},
 					Ports: []networkingv1.NetworkPolicyPort{

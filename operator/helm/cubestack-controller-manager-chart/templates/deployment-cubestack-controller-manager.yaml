@@ -36,6 +36,9 @@ spec:
         {{- if .Values.gateway.domain }}
         - --gateway-domain={{ .Values.gateway.domain }}
         {{- end }}
+        {{- with .Values.gateway.dataplaneNamespace }}
+        - --gateway-dataplane-namespace={{ . }}
+        {{- end }}
         command:
         - /manager
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

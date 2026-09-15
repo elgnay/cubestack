@@ -93,6 +93,15 @@ omits the flag entirely** (keeping the manager's own default):
 | `gateway.name` | `--gateway-name` | `cubestack-gateway` | Empty = flag omitted; publishing is disabled (`RouteReady=False`, `GatewayNotConfigured`). |
 | `gateway.namespace` | `--gateway-namespace` | `cubestack-system` | Empty = flag omitted (the manager flag default is `cubestack-system` anyway). |
 | `gateway.domain` | `--gateway-domain` | `""` | Empty = flag omitted. **Set this to enable publishing** — the public hostname of a published service is `<modelName>.<domain>`. |
+| `gateway.dataplaneNamespace` | `--gateway-dataplane-namespace` | `envoy-gateway-system` | **Not** a publishing switch. Names the namespace the Gateway's dataplane pods run in, so that environment pods admit ingress from that Gateway. Empty = flag omitted, and environments stay default-deny inbound (reachable in-cluster only). |
+
+`dataplaneNamespace` is the one key here the **DevEnvironment** controller
+reads: it is where its NetworkPolicy allowance points, and it is not the
+Gateway's own namespace — Envoy Gateway runs the proxy pods in a namespace of
+its own, separate from the one holding the `Gateway` object. The other keys
+configure the InferenceService publishing path only; the DevEnvironment
+controller's Gateway name and namespace are platform constants
+(`cubestack-gateway` in `cubestack-system`) rather than values.
 
 The `name`/`namespace` defaults follow the platform convention (the same
 `cubestack-gateway` in `cubestack-system` the DevEnvironment controller uses),
@@ -111,7 +120,8 @@ values and do not pick up these new chart defaults.
 
 The kustomize deployment (`make deploy`) carries the same `--gateway-name` /
 `--gateway-namespace` args in `operator/config/manager/manager.yaml`;
-`--gateway-domain` is left to your overlay there.
+`--gateway-domain` and `--gateway-dataplane-namespace` are left to your overlay
+there, so a kustomize install keeps environment pods default-deny inbound.
 
 ## Uninstall
 
