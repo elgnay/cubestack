@@ -72,17 +72,28 @@ as files** with `subPath` — nothing is copied, staged, or re-permissioned in t
 | Secret key | Mounted at | Used by |
 |------------|-----------|---------|
 | `ssh_host_ed25519_key` | `/etc/ssh/ssh_host_ed25519_key` | sshd host identity; its presence gates ssh |
-| `authorized_keys` | `$HOME/.ssh/authorized_keys2` | platform keys that may log in |
+| `authorized_keys` | `/run/ssh/authorized_keys` | platform keys that may log in |
 
-`$HOME` is the account's home (`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`), and the
-workspace PVC mounts there when the path is derived — an explicit `spec.storage.mountPath` is
-authoritative and may point elsewhere (see above), in which case `$HOME` stays on the container's own
-filesystem and only the workspace is durable. The rest of this contract holds either way: the subPath
-mount targets `$HOME` regardless, and the image bakes `$HOME/.ssh`. sshd reads both files in place via
-the drop-in's `HostKey` and `AuthorizedKeysFile %h/.ssh/authorized_keys2 %h/.ssh/authorized_keys` — the
-second path is the user's own file, so `ssh-copy-id` and similar tools keep working alongside the
-platform keys. No `.pub` and no host-key-per-algorithm files are needed: sshd derives the public half
-from the private key.
+The private key has to be in **OpenSSH's own format** (`-----BEGIN OPENSSH PRIVATE KEY-----`): sshd
+does not read a PKCS#8 Ed25519 key at all, and exits with *invalid format* if handed one. The
+`.pub` is informational — sshd derives the public half from the private key.
+
+Both mount paths are **absolute and outside `$HOME`**, so neither depends on the account an image runs
+as, and the account's own `~/.ssh` is left to the account. `$HOME` is that account's home
+(`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`); the workspace PVC mounts there when the path
+is derived — an explicit `spec.storage.mountPath` is authoritative and may point elsewhere (see above),
+in which case `$HOME` stays on the container's own filesystem and only the workspace is durable. sshd
+reads both files in place via the drop-in's `HostKey` and
+`AuthorizedKeysFile /run/ssh/authorized_keys %h/.ssh/authorized_keys` — the second path is the user's
+own file, so `ssh-copy-id` and similar tools keep working alongside the platform keys. No `.pub` and no
+host-key-per-algorithm files are needed: sshd derives the public half from the private key.
+
+The platform keys deliberately do **not** live in `$HOME`, where the images bake `~/.ssh`: the workspace
+claim is mounted over the home, its root is not writable by the account, and the runtime creates a file
+mount target's parent directory root-owned — so keys mounted there would sit in a directory the account
+cannot write, alongside the account's own files it could not add. Under `/run` the platform keys stay
+out of the user's way entirely, and `~/.ssh` is the account's own (the controller's init container is
+what makes the claim, and so that directory, writable at all — see the operator requirement below).
 
 That second path is a **deliberate, bounded trade-off**: the account that can write it is the one sshd
 serves (a non-root sshd can serve no other) and `AllowUsers` fixes the login account, so a key left
@@ -99,22 +110,37 @@ backgrounding sshd and exits if it fails, rather than serving a ready notebook w
 
 ### Requirements on the operator
 
-The operator side of this contract is not implemented yet — it still mounts the Secret as a directory
-at `/etc/cubestack/ssh`. The changes below are tracked in **#173**.
+Implemented in **#173**; the controller code is in `operator/internal/controller/devenvironment_controller.go`.
 
+- **Mint the host key in OpenSSH format.** `::generateSSHKeyPair` writes the private key as an
+  OpenSSH-format PEM block — sshd rejects a PKCS#8 Ed25519 key, so a Secret carrying one leaves the
+  environment with no ssh at all. The controller regenerates such a key in place when it finds one,
+  which the revision annotation below then rolls the pod onto.
 - **Restart the workload when the Secret changes.** Kubernetes does not propagate Secret updates to
   `subPath` mounts — the container keeps the bytes it started with
   ([Secret docs](https://kubernetes.io/docs/concepts/configuration/secret/)). Rotated keys are
-  therefore inert until the pod is recreated.
+  therefore inert until the pod is recreated. The controller stamps a digest of the mounted material on
+  the pod template (`ai.cubestack.io/ssh-keys-revision`, from `::sshKeysDigest`), which changes the
+  StatefulSet's spec hash and rolls the pod — the same mechanism the Jupyter token uses.
 - **Keep the files readable by the container uid.** The default Secret `defaultMode` `0644` is
   correct: the files are root-owned, and OpenSSH only enforces its private-key permission check on
   files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
   Tightening `defaultMode` to `0600`/`0400` makes the key unreadable to that uid and sshd exits with
   *no hostkeys available*.
 - **Mount the PVC at the account's home** — the controller derives it from `spec.runtime.user` (see
-  above), unless the spec pins an explicit `mountPath`, which wins — so the platform keys land in the
-  user's home. It must also provide `~/.ssh`: the image bakes the directory, but the PVC shadows it,
-  and the subPath mount needs the parent to exist.
+  above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
+  there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
+  from the account's passwd entry for its own `AuthorizedKeysFile` entry.
+- **Initialize the workspace claim's ownership.** A workspace claim mounts `root:root` and a non-root
+  account can write nothing in it — no `~/.ssh`, no workspace files at all. The controller runs an init
+  container before the environment starts (`::desiredPermissionInitContainer`) that chowns the claim
+  root to the identity the container runs as (`spec.runtime.securityContext`, platform default
+  1000:1000). It is deliberately not a pod-level `fsGroup`: that would chown every read-write volume in
+  the pod, including a referenced PVC the platform does not own. It mounts the workspace claim and
+  nothing else, repairs that claim's owner (and, on a mismatch, everything under it, as
+  `fsGroupChangePolicy: OnRootMismatch` did), and leaves a directory the runtime creates *after* it runs
+  alone — which is why the platform keys are mounted outside `$HOME` rather than into it, and why the
+  account's own `~/.ssh` no longer needs anything mounted at all.
 - **Publish the container's `2222`** as the Service's ssh port (`port: 22`, `targetPort: 2222`) and
   point the readiness probe at `2222` — the probe targets the container, not the Service.
 
@@ -170,6 +196,25 @@ tag; publishing an older commit therefore moves `:latest` backwards, which is ex
 tag but worth knowing before rebuilding a previous release. `REGISTRY` / `PROJECT` relocate the whole
 destination.
 
+### Platform
+
+Every published image is built for `$(PLATFORM)`, default `linux/amd64` — the architecture the
+cluster's nodes run. Both Dockerfiles start from a multi-arch base (`ubuntu`, `quay.io/jupyter`), so
+without `--platform` `docker build` resolves that base to the **host** architecture: a build on an
+arm64 machine produces an arm64-only image, which every amd64 node then refuses to pull
+(`no match for platform in manifest`). The Makefile passes `--platform` on every build, so the result
+does not depend on the architecture of the machine building it. `PLATFORM=linux/arm64` is the explicit
+opt-in to build for a different architecture; it takes one value (a list fails in `check-platform`,
+since a single `docker build` cannot produce a manifest list). On a host of another architecture the
+build and the smoke's throwaway containers run emulated — slower, but they exercise the artifact that
+is actually published.
+
+Verify what a registry received rather than assuming the build host's architecture:
+
+```bash
+docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest
+```
+
 ### Overrides / mirror builds (CN or offline)
 
 ```bash
@@ -178,7 +223,8 @@ PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 make -C images build
 ```
 
-`IMG_SSH` / `IMG_JUPYTER` override the output tags; `CONTAINER_TOOL` overrides `docker` (e.g. `podman`).
+`IMG_SSH` / `IMG_JUPYTER` override the output tags; `CONTAINER_TOOL` overrides `docker` (e.g. `podman`);
+`PLATFORM` the build architecture (see Platform).
 
 ## Layout
 

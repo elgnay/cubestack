@@ -17,6 +17,10 @@ limitations under the License.
 package controller
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/pem"
 	"fmt"
 	"strings"
 
@@ -50,11 +54,42 @@ const (
 	testJupyterName       = "jupyter"
 	testRuntimeUser       = "jovyan"
 	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	// testSSHUser is the account the self-authored ssh images ship, selected
+	// with spec.runtime.user; testSSHHome is the home it implies.
+	testSSHUser = "ubuntu"
+	testSSHHome = "/home/" + testSSHUser
 )
 
 // webRootPath is the published web path prefix for environments in the test
 // namespace (design §6.4: /dev/<ns>/<env>/).
 var webRootPath = "/dev/" + testNamespace + "/"
+
+// testPKCS8HostKey is the shape this controller used to mint the host key in.
+// sshd cannot read it — OpenSSH has no PKCS#8 support for Ed25519 — so a Secret
+// carrying it has to be migrated.
+const testPKCS8HostKey = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n"
+
+// hostKeyPairMatches reports whether the private key is an OpenSSH-format PEM
+// block and the one-line public key describes the same key: the private blob
+// embeds the raw public key, so it must contain the bytes the .pub encodes.
+func hostKeyPairMatches(privPEM, pubOpenSSH []byte) bool {
+	block, _ := pem.Decode(privPEM)
+	if block == nil || block.Type != sshHostKeyPEMType {
+		return false
+	}
+	if !bytes.HasPrefix(block.Bytes, []byte("openssh-key-v1\x00")) {
+		return false
+	}
+	fields := strings.Fields(string(pubOpenSSH))
+	if len(fields) != 2 || fields[0] != sshEd25519Algorithm {
+		return false
+	}
+	blob, err := base64.StdEncoding.DecodeString(fields[1])
+	if err != nil || len(blob) < ed25519.PublicKeySize {
+		return false
+	}
+	return bytes.Contains(block.Bytes, blob[len(blob)-ed25519.PublicKeySize:])
+}
 
 // validDevEnvironment mirrors the API package fixture (minus the SSH config,
 // which individual tests enable when they need it).
@@ -74,7 +109,7 @@ func validDevEnvironment(name string) *aiv1alpha1.DevEnvironment {
 			Storage: &aiv1alpha1.StorageSpec{
 				Size:         "200Gi",
 				PVCRetention: aiv1alpha1.PVCRetentionRetain,
-				MountPath:    "/workspace",
+				MountPath:    defaultWorkspacePath,
 			},
 		},
 	}
@@ -379,8 +414,8 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)).To(Equal(int32(8888)))
 		})
 
-		It("maps ssh to the 22 sshd port", func() {
-			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeSSH)).To(Equal(int32(22)))
+		It("maps ssh to the unprivileged port the images' sshd binds", func() {
+			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeSSH)).To(Equal(int32(2222)))
 		})
 
 		It("maps vscode to the 8080 code-server port", func() {
@@ -524,6 +559,90 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 	})
 
+	// The init container is the only thing that makes a claim-backed home
+	// writable, and it is deliberately a narrower mechanism than the pod-level
+	// fsGroup it replaces: it sees the workspace claim and nothing else, and the
+	// privilege it carries is bounded to what changing an owner takes.
+	Describe("desiredPermissionInitContainer", func() {
+		rt := func(user, group int64) *aiv1alpha1.RuntimeSpec {
+			return &aiv1alpha1.RuntimeSpec{SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
+				RunAsUser: ptrTo(user), RunAsGroup: ptrTo(group),
+			}}
+		}
+		initContainer := func(mut func(*aiv1alpha1.DevEnvironment)) corev1.Container {
+			// The container reads the spec only, so the fixture carries no metadata.
+			env := &aiv1alpha1.DevEnvironment{
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeSSH, Image: testDevImage,
+				},
+			}
+			if mut != nil {
+				mut(env)
+			}
+			return desiredPermissionInitContainer(env)
+		}
+
+		It("initializes the workspace claim to the identity the container runs as", func() {
+			c := initContainer(nil)
+			Expect(c.Env).To(ContainElements(
+				corev1.EnvVar{Name: permissionInitPathEnv, Value: permissionInitMountPath},
+				corev1.EnvVar{Name: permissionInitUIDEnv, Value: "1000"},
+				corev1.EnvVar{Name: permissionInitGIDEnv, Value: "1000"},
+			))
+		})
+
+		It("follows an explicit runtime identity, such as the jupyter image's stock gid", func() {
+			c := initContainer(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Runtime = rt(1000, 100) })
+			Expect(c.Env).To(ContainElements(
+				corev1.EnvVar{Name: permissionInitUIDEnv, Value: "1000"},
+				corev1.EnvVar{Name: permissionInitGIDEnv, Value: "100"},
+			))
+		})
+
+		// FOWNER and FSETID are part of the contract, not incidental: the claim
+		// outlives the identity it was initialized for, so a root that belongs to
+		// the identity the spec used to name is one the container neither owns nor
+		// is grouped with — the chmod needs FOWNER to succeed at all, and FSETID to
+		// keep the setgid bit. Measured on cs2: without FOWNER the init container
+		// dies on EPERM; with FOWNER alone the root lands 0775.
+		It("runs as root with CAP_CHOWN, CAP_FOWNER and CAP_FSETID and nothing else", func() {
+			sc := initContainer(nil).SecurityContext
+			Expect(sc.RunAsUser).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsGroup).To(Equal(ptrTo(int64(0))))
+			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(false)))
+			Expect(sc.Privileged).To(Equal(ptrTo(false)))
+			Expect(sc.AllowPrivilegeEscalation).To(Equal(ptrTo(false)))
+			Expect(sc.Capabilities.Drop).To(ConsistOf(corev1.Capability("ALL")))
+			Expect(sc.Capabilities.Add).To(ConsistOf(
+				corev1.Capability("CHOWN"), corev1.Capability("FOWNER"), corev1.Capability("FSETID")))
+		})
+
+		It("mounts the workspace claim and no other volume", func() {
+			Expect(initContainer(nil).VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: workspaceClaimName, MountPath: permissionInitMountPath},
+			}))
+		})
+
+		// The properties the security model rests on: the script fails the
+		// environment rather than letting it start against a volume it could not
+		// initialize; the repair is conditional and recursive, so a workspace with
+		// the right owner is never walked; and the chmod precedes the chown, so the
+		// common path — a claim the container owns — sets the mode with no
+		// capability involved. Correctness on the identity-change path rests on the
+		// capabilities asserted above, not on that order.
+		It("fails closed, and repairs only on a mismatch, all the way down", func() {
+			script := initContainer(nil).Command[2]
+			Expect(script).To(HavePrefix("set -e\n"))
+			Expect(script).To(ContainSubstring(
+				`if [ "$current" != "$WORKSPACE_UID:$WORKSPACE_GID" ]; then`))
+			Expect(script).To(ContainSubstring(`chown -R "$WORKSPACE_UID:$WORKSPACE_GID" "$WORKSPACE_PATH"`))
+			chmod, chown := strings.Index(script, "chmod 2775"),
+				strings.Index(script, `chown -R "$WORKSPACE_UID`)
+			Expect(chmod).To(BeNumerically("<", chown),
+				"the chmod precedes the chown: see ::permissionInitScript")
+		})
+	})
+
 	Describe("resolveMountPath", func() {
 		// The path depends only on spec.storage.mountPath and the runtime identity,
 		// so the fixture carries nothing else.
@@ -538,7 +657,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		It("falls back to the platform default when nothing is set", func() {
 			// The default account is "user", but an unset spec.runtime.user means
 			// /workspace — not /home/user.
-			Expect(resolveMountPath(env(nil))).To(Equal("/workspace"))
+			Expect(resolveMountPath(env(nil))).To(Equal(defaultWorkspacePath))
 		})
 
 		It("derives /home/<user> from a named account", func() {
@@ -622,7 +741,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 				port int32
 			}{
 				{typ: aiv1alpha1.DevEnvironmentTypeJupyter, port: 8888},
-				{typ: aiv1alpha1.DevEnvironmentTypeSSH, port: 22},
+				{typ: aiv1alpha1.DevEnvironmentTypeSSH, port: 2222},
 				{typ: aiv1alpha1.DevEnvironmentTypeVSCode, port: 8080},
 			} {
 				spec := render(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Type = tt.typ })
@@ -634,6 +753,40 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 				Expect(c.ReadinessProbe).NotTo(BeNil())
 				Expect(c.ReadinessProbe.ProbeHandler.TCPSocket.Port.IntVal).To(Equal(tt.port))
 			}
+		})
+
+		// The environment's own storage is initialized by an init container, so
+		// the pod carries no fsGroup: an fsGroup is Pod-scoped and would chown
+		// every read-write volume in the pod, including a referenced PVC.
+		It("initializes the workspace claim from an init container, without an fsGroup", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "10Gi"}
+			})
+			Expect(spec.SecurityContext).To(BeNil())
+			Expect(spec.InitContainers).To(HaveLen(1))
+			Expect(spec.InitContainers[0].Name).To(Equal(permissionInitContainerName))
+			Expect(spec.InitContainers[0].Image).To(Equal(permissionInitImage))
+		})
+
+		It("has no init container when the environment has no storage of its own", func() {
+			Expect(render(nil).InitContainers).To(BeEmpty())
+		})
+
+		It("never mounts a referenced PVC into the init container", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "10Gi"}
+				env.Spec.Volumes = []aiv1alpha1.VolumeMount{
+					{Name: "datasets", PVCName: "shared-dataset", MountPath: "/datasets", ReadOnly: true},
+				}
+			})
+			Expect(spec.InitContainers).To(HaveLen(1))
+			Expect(spec.InitContainers[0].VolumeMounts).To(ConsistOf(corev1.VolumeMount{
+				Name: workspaceClaimName, MountPath: permissionInitMountPath,
+			}))
+			// The volume itself still reaches the main container, mounted as asked.
+			Expect(spec.Containers[0].VolumeMounts).To(ContainElement(corev1.VolumeMount{
+				Name: "datasets", MountPath: "/datasets", ReadOnly: true,
+			}))
 		})
 
 		It("copies runtime command, args and env onto the container", func() {
@@ -655,7 +808,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 
 		It("mounts the workspace claim at spec.storage.mountPath and none when storage is omitted", func() {
-			mountPath := "/workspace"
+			mountPath := "/data/workspace"
 			spec := render(func(env *aiv1alpha1.DevEnvironment) {
 				env.Spec.Storage = &aiv1alpha1.StorageSpec{MountPath: mountPath}
 			})
@@ -684,12 +837,50 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}))
 		})
 
-		It("mounts the ssh keys secret for an exposed ssh type", func() {
+		// The images' sshd reads both files in place, so the Secret's keys are
+		// subPath file mounts: the host key where sshd looks for its identity, and
+		// the platform keys at the absolute path the images' AuthorizedKeysFile
+		// names — outside any home, since a claim mounted on the home is not
+		// writable by the account and a mount target created beneath it would be
+		// root-owned.
+		It("mounts the ssh keys as subPath files at absolute paths", func() {
 			var env *aiv1alpha1.DevEnvironment
-			spec := render(func(e *aiv1alpha1.DevEnvironment) { env = e; e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH })
-			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{{
-				Name: sshKeysVolumeName, MountPath: "/etc/cubestack/ssh", ReadOnly: true,
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				env = e
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: testSSHUser}
+			})
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
+				{Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+			}))
+			// 0644 is load-bearing: a tighter mode makes a non-root sshd refuse
+			// its own root-owned host key and exit.
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{{
+				Name:         sshKeysVolumeName,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
 			}}))
+		})
+
+		// A claim mounted on the account's home hides the ~/.ssh the image bakes.
+		// Nothing is mounted in its place: the platform keys live under /run, the
+		// account creates its own ~/.ssh (which the init container's chown of the
+		// claim makes possible), and no mount target is built inside the claim.
+		It("keeps every mount out of a home the workspace claim covers", func() {
+			var env *aiv1alpha1.DevEnvironment
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				env = e
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: testSSHUser}
+				// No mountPath: the claim lands on the account's home.
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "1Gi"}
+			})
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: workspaceClaimName, MountPath: testSSHHome},
+				{Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
+				{Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+			}))
+			// The ssh Secret alone: no emptyDir stands in for ~/.ssh any more.
 			Expect(spec.Volumes).To(Equal([]corev1.Volume{{
 				Name:         sshKeysVolumeName,
 				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
@@ -713,6 +904,69 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}))
 			// A jupyter environment without ssh.enabled mounts no ssh volume.
 			Expect(c.VolumeMounts).To(BeEmpty())
+		})
+	})
+
+	Describe("desiredService", func() {
+		render := func(mut func(*aiv1alpha1.DevEnvironment)) *corev1.Service {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-svc", Namespace: "default"},
+				Spec:       aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeVSCode, Image: testDevImage},
+			}
+			if mut != nil {
+				mut(env)
+			}
+			return (&DevEnvironmentReconciler{}).desiredService(env)
+		}
+
+		// The container's sshd binds the unprivileged 2222, so the Service has
+		// to bridge the conventional 22 onto it. publishPort is the Service
+		// port; the container side is asserted in the pod-spec specs above.
+		It("publishes the ssh container port as the Service's 22", func() {
+			svc := render(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH })
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].Name).To(Equal(mainPortName))
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(22)))
+			Expect(svc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(2222)))
+		})
+
+		It("adds the ssh port beside the main port for a jupyter environment with ssh", func() {
+			svc := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			})
+			// The main port is the port the container serves, published verbatim.
+			Expect(svc.Spec.Ports).To(HaveLen(2))
+			Expect(svc.Spec.Ports[0].Name).To(Equal(mainPortName))
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8888)))
+			Expect(svc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(8888)))
+			Expect(svc.Spec.Ports[1].Name).To(Equal(sshPortName))
+			Expect(svc.Spec.Ports[1].Port).To(Equal(int32(22)))
+			Expect(svc.Spec.Ports[1].TargetPort.IntVal).To(Equal(int32(2222)))
+		})
+
+		It("publishes no ssh port when ssh is not exposed", func() {
+			svc := render(nil)
+			Expect(svc.Spec.Ports).To(HaveLen(1))
+			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
+			Expect(svc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(8080)))
+		})
+	})
+
+	Describe("podTemplateAnnotations", func() {
+		It("carries the ssh keys revision only while ssh is exposed", func() {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Annotations: map[string]string{
+					sshKeysRevisionAnnotationKey: "sha256:deadbeef",
+				}},
+				Spec: aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeSSH},
+			}
+			Expect(podTemplateAnnotations(env)).To(Equal(map[string]string{sshKeysRevisionAnnotationKey: "sha256:deadbeef"}))
+
+			// Without ssh there is no revision to record, and an annotation on
+			// the object must not leak onto the template.
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			Expect(podTemplateAnnotations(env)).To(BeNil())
 		})
 	})
 })
@@ -1132,6 +1386,9 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(s.Data).To(HaveKey(sshHostPubKeyKey))
 				g.Expect(string(s.Data[sshHostPubKeyKey])).To(HavePrefix("ssh-ed25519 "))
 				g.Expect(s.Data).To(HaveKey(sshAuthorizedKeysKey))
+				// The workload mounts the private key as-is, so it has to be in
+				// the format sshd reads — and describe the advertised public key.
+				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -1193,11 +1450,18 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env.Name)
 
 			var hostKey []byte
+			var hashBefore string
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
 				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(testUserSSHKey))
 				hostKey = s.Data[sshHostKeyKey]
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				// The revision the pod mounts by is recorded on the template; it is
+				// what rolls the workload below.
+				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).To(Equal(sshKeysDigest(s)))
+				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
 			}, "15s", "200ms").Should(Succeed())
 
 			// Rotate the user's keys: the watch on spec.ssh.keysSecret re-reconciles
@@ -1213,6 +1477,82 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
 				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(rotated))
 				g.Expect(s.Data[sshHostKeyKey]).To(Equal(hostKey))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The mounts are subPath, so the pod keeps the authorized_keys it
+			// started with: the rotated keys only reach it if the template — and
+			// with it the STS spec hash — changes, which is what rolls the pod.
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).To(Equal(sshKeysDigest(s)))
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("replaces a host key sshd cannot read", func() {
+			env := validDevEnvironment("de-hostkey-format")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var hashBefore string
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
+			}, "15s", "200ms").Should(Succeed())
+
+			// A Secret written by an older controller carries a key sshd rejects,
+			// which would leave the environment with no ssh at all.
+			stale := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), stale)).To(Succeed())
+			stale.Data[sshHostKeyKey] = []byte(testPKCS8HostKey)
+			Expect(k8sClient.Update(ctx, stale)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+
+				// Regenerating changes the mounted material, so the revision rolls
+				// the workload onto the new key without a manual restart.
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("repairs a managed Secret that has no data", func() {
+			env := validDevEnvironment("de-ssh-secret-empty")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// A managed Secret can exist without carrying any data — created by hand
+			// before the environment, or emptied by hand — and recovering the host
+			// key then writes into an empty map rather than a missing one.
+			emptied := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), emptied)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+			emptied.Data = nil
+			Expect(k8sClient.Update(ctx, emptied)).To(Succeed())
+
+			// The Secret is owned by the environment, so emptying it re-reconciles:
+			// the repair has to come back with a readable host keypair.
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
+				g.Expect(s.Data).To(HaveKey(sshHostPubKeyKey))
+				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(s.Data).To(HaveKey(sshAuthorizedKeysKey))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

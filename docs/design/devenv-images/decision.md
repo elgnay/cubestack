@@ -27,11 +27,11 @@ images are final** — they cannot be solved inside the images themselves.
 | # | Operator assumption | Code evidence | Requirement on the image | Status |
 |---|---|---|---|---|
 | 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** `base-cuda` / `base-maca`. Checked **only when a GPU is requested** — `gpuCount: 0` is exempt | Image registry path must include the `base-cuda` / `base-maca` segment **when it is a GPU image**; CPU images are named freely | ✅ consistent with the brand gate |
-| 2 | Type → port | `::mainContainerPort`: jupyter 8888 / ssh 22 / vscode 8080; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP — **except ssh**, where the container listens on the unprivileged **2222** (see B) and the Service publishes that as 22 | ⚠️ images ship 2222; Service `targetPort` + probe retarget is #173 |
+| 2 | Type → port | `::mainContainerPort`: jupyter 8888 / vscode 8080 / ssh `sshContainerPort`; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP — **except ssh**, where the container listens on the unprivileged **2222** (see B) and the Service publishes that as 22 | ✅ implemented (#173): the probe targets the container port (2222 for ssh) and the Service publishes `port: 22 → targetPort: 2222` |
 | 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as the **uid/gid the spec resolves to** (`spec.runtime.securityContext`, platform default 1000/1000), non-root, incl. writing `$HOME` (stock images ship uid 1000) | ✅ (but see #6, #9) |
-| 4 | `$HOME` / working dir = the workspace mount | comment in `devenvironment_types.go`: PVC mounted at the derived workspace path; the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — docker-stacks images keep `/home/jovyan` by naming `jovyan`; the self-authored images get `/home/ubuntu` | ⚠️ see "Gap A" + §2 contract |
-| 5 | SSH key mount | `assets.go:63`: Secret data keys `ssh_host_ed25519_key`(+`.pub`), `authorized_keys`; `devenvironment_controller.go:709` mounts read-only at `/etc/cubestack/ssh`, default mode 0644; host key is **never rotated** (persistence provided by the Secret) | The operator mounts two of those keys **as files with `subPath`** — `ssh_host_ed25519_key` → `/etc/ssh/ssh_host_ed25519_key` and `authorized_keys` → `$HOME/.ssh/authorized_keys2` — and sshd reads them **in place: no staging, no copy, no chmod**. A root-owned `0644` private key is accepted because OpenSSH enforces that check only on files **owned by the uid reading them**, which a Secret volume file never is | ⚠️ images ship this; the mount shape is #173 (the merged operator still mounts the old `/etc/cubestack/ssh` directory) |
-| 6 | sshd listening on :22 as uid 1000 | ssh Service 22→22 in the controller; `desiredSecurityContext` grants no capabilities | sshd listens on the unprivileged **2222**. Binding a port <1024 as non-root needs `NET_BIND_SERVICE`, which this closes **by port choice rather than by granting a privilege** — no capability, no `securityContext.sysctls` reliance, nothing for a Restricted PSA to drop. The operator publishes it as the Service's 22 and probes the container port | ✅ Gap B closed, no capability needed; Service/probe retarget is #173 |
+| 4 | `$HOME` / working dir = the workspace mount | comment in `devenvironment_types.go`: PVC mounted at the derived workspace path; the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — docker-stacks images keep `/home/jovyan` by naming `jovyan`; the self-authored images get `/home/ubuntu`. A non-root account must be able to **write** that mount, which no image can arrange for itself | ✅ Gap A closed: an init container repairs the claim's ownership — the root alone while it already matches, the whole tree when it does not — before the container starts |
+| 5 | SSH key mount | `assets.go:63`: Secret data keys `ssh_host_ed25519_key`(+`.pub`), `authorized_keys`; `::desiredPodSpec` mounts the two as read-only `subPath` files with default mode 0644; the host key is minted as an **OpenSSH-format** private key (`::generateSSHKeyPair`) and is **never rotated** (persistence provided by the Secret) | The operator mounts two of those keys **as files with `subPath`** — `ssh_host_ed25519_key` → `/etc/ssh/ssh_host_ed25519_key` and `authorized_keys` → `/run/ssh/authorized_keys` — and sshd reads them **in place: no staging, no copy, no chmod**. Both paths are absolute and outside `$HOME`: a claim mounts over the home, and a mount target created beneath it is root-owned and unwritable (Gap A). A root-owned `0644` private key is accepted because OpenSSH enforces that check only on files **owned by the uid reading them**, which a Secret volume file never is | ✅ implemented (#173, mount path moved out of `$HOME` with the workspace-ownership change). The private key must be in OpenSSH's own format: sshd **rejects PKCS#8 Ed25519** ("invalid format"), which is what the controller used to mint and why the reworked images had no working host key |
+| 6 | sshd listening on :22 as uid 1000 | the ssh Service maps `sshServicePort` 22 → `sshContainerPort` 2222; `desiredSecurityContext` grants no capabilities | sshd listens on the unprivileged **2222**. Binding a port <1024 as non-root needs `NET_BIND_SERVICE`, which this closes **by port choice rather than by granting a privilege** — no capability, no `securityContext.sysctls` reliance, nothing for a Restricted PSA to drop. The operator publishes it as the Service's 22 and probes the container port | ✅ Gap B closed, no capability needed; implemented in #173 |
 | 7 | `JUPYTER_TOKEN` | `jupyterTokenEnv="JUPYTER_TOKEN"` (:144), injected only for the jupyter type, from `<env>-auth` Secret `data[token]` | The jupyter server must authenticate with this env value | ✅ (jupyter-server reads `JUPYTER_TOKEN` natively, see §3.B4) |
 | 8 | `base_url` = `/dev/<ns>/<env>/` | HTTPRoute forwards the prefix **unchanged** (no URLRewrite filter); the controller never injects the prefix into the container — yet the route design states "container serves under that base_url" | Jupyter must serve under that prefix via `ServerApp.base_url`, but nothing hands the prefix to the container | 🚩 **Gap C** |
 | 9 | Runtime-mode inference | Single-container pod; `type` and `image` are independent axes; the controller injects no `type`/mode env | The same image must decide by itself whether to run jupyter or sshd (e.g. inferred from whether `JUPYTER_TOKEN` is injected / ssh keys are mounted) | ✅ defined by the images: `CUBESTACK_IMAGE` is baked per image and an optional injected `CUBESTACK_TYPE` wins when present (see Gap D) |
@@ -81,13 +81,110 @@ rather than as a rejected spec. A non-root sshd can only serve the uid it runs a
 numerics, and the mount path have to agree. `images/README.md` lists the correct values per shipped
 image.
 
-### Gap A — the home mount writable by uid 1000
+### Gap A — closed: the home mount is writable by uid 1000
 
-The pod sets no `fsGroup`; the workspace PVC uses `cephfs-ephemeral` (RWX, `assets.go:85`). The
-container runs as uid 1000 with `$HOME` on the mount, so the **RWX StorageClass's mount behavior must
-make the mount path writable by 1000** (cephfs owner/mode) — regardless of whether that path is
-`/home/ubuntu` or `/home/jovyan`. The image cannot chown itself (non-root). This belongs to
-workspace-storage work for verification; the image only commits to pointing `$HOME` at the mount point.
+An init container chowns the workspace claim's root to the identity the environment runs as, before the
+main container starts (`::desiredPermissionInitContainer`), and the workspace PVC uses
+`cephfs-ephemeral` (RWX, `assets.go`). The container runs as uid 1000 with `$HOME` on the mount —
+`/home/ubuntu` or `/home/jovyan` in the derived case. The image cannot chown itself (non-root), so the
+ownership has to be established on the way in.
+
+**Measured with no ownership mechanism at all (2026-09-14, cs2, `cephfs-ephemeral`, uid/gid 1000): the
+mount path is `root:root 0755` and a uid-1000 process cannot create anything in it** — not in the
+claim's root and not in a subdirectory of it. Both CSIDrivers report `fsGroupPolicy: File`, so nothing
+chowned the volume. This was broader than ssh: an environment with `spec.storage` could not write its
+own workspace at all.
+
+**Measured with `fsGroup: 1000` (probe pod, same day): solved.** The claim root becomes
+`root:ubuntu 2775` and a uid-1000 process writes it. The driver gives the group the owner's permissions
+and adds the setgid bit — `0755` → `2775` on directories, `0644` → `0664` on files — and applies that
+**recursively, to what exists when the volume is mounted**. Two qualifications carry into the design:
+
+- It is **driver behavior, not a Kubernetes guarantee**. `fsGroupPolicy: File` delegates to the CSI
+  driver, and this mode change is ceph-csi's; a driver that implemented only the chgrp half of the
+  contract would leave the mount unwritable. Kubernetes guarantees the delegation, not the result.
+- The chown reaches what exists **at mount time**. A directory created afterwards — by the account, or
+  by the runtime creating a `subPath` mount target — inherits only the parent's group: measured
+  `2755 root:ubuntu`, not writable. That is why no platform mount target is created inside `$HOME`.
+
+**Replaced (2026-09-15) by the init container, because `fsGroup` is Pod-scoped.** The measurements above
+hold; what sank the mechanism was its reach. `fsGroup` applies to every volume in the pod mounted
+**read-write**, so a PVC shared through `spec.volumes` was chowned to the container's group as well — an
+ownership change applied to storage the platform does not own, and one that cannot be turned off per
+mount: `fsGroup` is a Pod-level field and Kubernetes has no per-mount equivalent. The read-only exemption
+that used to cover the shared case is narrower than it reads, too: kubelet applies `fsGroup` on this
+driver's behalf (`fsGroupPolicy: File`), its CSI mounter returns before any chown when the volume is
+read-only (`csiMountMgr.supportsFSGroup`), and a driver advertising `VOLUME_MOUNT_GROUP` does the work
+itself — so the exemption was one driver's behavior to keep, not a platform guarantee to rely on.
+
+An init container that mounts the workspace claim and nothing else has no path through which it could
+reach a referenced PVC. It runs as root with every capability dropped and `CAP_CHOWN`, `CAP_FOWNER` and
+`CAP_FSETID` added back (see below for which of the three each path needs), sets the claim root's mode
+and owner (`chmod 2775` **before** the `chown` — see below), and runs under `set -e` so a step that fails
+stops the environment rather than starting it against a volume it could not initialize. Four
+consequences follow:
+
+- **The pod carries no `fsGroup`, and no pod-level security context at all.** Nothing else mounted into
+  the pod is touched.
+- **A referenced PVC is mounted exactly as it is.** A PVC supplied through `spec.volumes` — including one
+  standing in as the workspace — has to carry permissions the environment's account can work with. The
+  platform does not modify storage it merely references.
+- **The repair is conditional and recursive, like the mechanism it replaces.** The script reads the
+  claim root's owner and does nothing when it is already the environment's identity; only on a mismatch
+  does it set the mode and `chown -R` the tree. Those are the two choices `fsGroupChangePolicy:
+  OnRootMismatch` made — never walk a workspace that is already right, repair all the way down when it is
+  not — so the walk runs once, on the start after an ownership change, and not on every start. The claim
+  is provisioned empty and belongs to this environment alone, so everything *already* in it is the
+  environment's to own; measured on cs2, a `deep/nested` created by a root process is left `0:0 755` and
+  unwritable by uid 1000 under a root-only chown, and becomes `1000:1000` and writable under `chown -R`,
+  which is what the `fsGroup` walk used to deliver. The setgid bit set with the mode then carries the
+  group onto everything created afterwards — measured: a directory the account creates comes out
+  `1000:1000`. The condition is the owner alone, as it was for `OnRootMismatch`; a root whose owner is
+  already right but whose mode has drifted from `2775` is left as the account set it, and content an
+  account deliberately left root-owned inside an otherwise-correct workspace is not reclaimed.
+- **The namespace must not enforce the Restricted Pod Security Standard.** Root and any of the three
+  capabilities are rejected there, and Pod Security Admission has no per-container exemption — confirmed
+  on cs2 with `--dry-run=server`: the pod is admitted under `baseline` and refused under `restricted`
+  with `runAsUser=0` and the added capabilities named among the violations. Baseline is the floor, and it
+  is enough: `CHOWN`, `FOWNER` and `FSETID` are all capabilities Baseline still allows, and Baseline does
+  not constrain `runAsUser`. This is the one place the design takes a policy exception rather than
+  removing the dependency — unlike Gap B, where removing it was possible.
+
+**A claim outlives the identity it was initialized for, and that is what the capabilities are for.** The
+root of a claim is repaired to whatever identity `spec.runtime.securityContext` names *now*, but the
+claim is not re-provisioned when that spec is edited — `runAsUser` and `runAsGroup` are mutable and the
+PVC persists. So the init container can find a root owned by the identity the environment **used to
+run as**: a uid it is neither the owner of nor grouped with. All three cases were run on cs2 against a
+cephfs claim whose root was left `1000:1000` and re-targeted to `2000:2000`:
+
+- **`CAP_CHOWN` alone fails the environment.** The `chmod` on a directory root does not own is `EPERM` —
+  `CAP_CHOWN` does not help — and `set -e` stops the init container, so the environment never starts and
+  the ownership repair behind it never runs. Measured: `chmod: /managed: Operation not permitted`.
+- **`CAP_FOWNER` makes it succeed but not stick.** The mode change now comes from a process outside the
+  file's group, which Linux answers by clearing `S_ISGID`: measured `2000:2000 0775`, setgid lost.
+  `CAP_FSETID` is what keeps the bit.
+- **`CAP_CHOWN` + `CAP_FOWNER` + `CAP_FSETID` repairs it.** Measured `2000:2000 2775`, the tree chowned,
+  every level writable by the new identity, and a directory it creates afterwards coming out gid 2000.
+
+The `chmod` still precedes the `chown`, but that order is no longer what decides correctness — it is the
+cheaper direction on the common path, where the claim is fresh: the init container owns that root and is
+grouped with it, so the mode is set with no capability involved and no chance of losing `S_ISGID`, and
+the `chown` that follows preserves `S_ISGID` because the kernel clears it only on non-directories.
+Measured on a fresh claim with all three held: `1000:1000 2775`, uid 1000 writes, and a directory it
+creates inherits gid 1000.
+
+The same probes settled the `~/.ssh` design: **the subPath file mount does not need the parent to
+exist.** `subPath` mounts are delegated to the runtime, and runc's `createMountpoint` creates a file bind
+target's parent directory (`MkdirAllInRootOpen`, 0755) as root *inside the volume it is mounted over* —
+verified with `/proc/self/mountinfo` showing the created `~/.ssh` on the ceph mount. The pod starts and
+ssh works, but that directory is root-owned and, per the second qualification above, is not writable by
+the account. So the platform keys are **not** mounted into `$HOME` at all: the Secret's
+`authorized_keys` lands at the absolute `/run/ssh/authorized_keys`, which the drop-in's
+`AuthorizedKeysFile` names, and nothing is mounted at `$HOME/.ssh`. The account's `~/.ssh` is then
+entirely its own — on a claim-mounted home it does not exist until the account creates it, which the
+init container's ownership repair of the claim now makes possible; with no claim, or a claim elsewhere,
+the image's baked `0700` directory serves. No `emptyDir` stand-in is needed for either case, and no
+mount depends on the order in which volumes and containers are set up.
 
 ### Gap B — closed: sshd listens on the unprivileged 2222
 
@@ -367,7 +464,7 @@ platform's own publishing target, so they do not dictate the project below.
 
 | Item | Owner | Recommendation | Blocks |
 |---|---|---|---|
-| A workspace writability check (uid 1000 writing the home mount: `/home/ubuntu` self-authored, `/home/jovyan` jupyter) | workspace storage (cephfs-ephemeral) | Confirm the RWX SC makes the mount path writable by 1000 | smoke of all images |
+| A workspace writability check (uid 1000 writing the home mount: `/home/ubuntu` self-authored, `/home/jovyan` jupyter) | workspace storage (cephfs-ephemeral) | **Closed controller-side**: an init container sets the claim root's mode and chowns it — recursively, but only when the owner does not already match — to the container's own identity on the way in, measured on `cephfs-ephemeral`, so the storage class needs no change (Gap A) | — |
 | B non-root sshd binding :22 | controller | **Closed image-side**: sshd listens on 2222 and the Service publishes it as 22, so no capability is ever granted. Retargeting `targetPort`/probe is #173 | base image ssh acceptance |
 | C injecting jupyter `base_url` | controller | Inject `NOTEBOOK_ARGS=--ServerApp.base_url=/dev/<ns>/<env>/` (merge, don't clobber a user value) — the stock launcher honours it, so no image change | jupyter image acceptance, e2e |
 | D mode env (optional) | controller | Inject `CUBESTACK_TYPE`, entrypoint reads it first | vscode hook |
@@ -386,7 +483,7 @@ platform's own publishing target, so they do not dictate the project below.
 | base-maca self-build + commercial gate | §6.2 | ⚠️ **to confirm**: Metax package channel / injection model / target software versions |
 | jupyter-minimal = stock-native thin-overlay on Quay minimal-notebook + ssh only | §6.3 | ✅ decided (shipped in images work) |
 | ssh-ubuntu22.04 self-build, account `ubuntu`/`$HOME=/home/ubuntu` (`spec.runtime.user: ubuntu`) | §6.3 | ✅ recommended here |
-| Gaps A/B/C/D closure | §8 | ⚠️ **to schedule into follow-up controller work** (B closed image-side; A/C/D remain) |
+| Gaps A/B/C/D closure | §8 | ⚠️ **to schedule into follow-up controller work** (A closed controller-side, B closed image-side; C/D remain) |
 
 After review: promote the "✅ recommended" items to "decided", backfill the "to confirm" items, and
 post a summary of this document so downstream image-build work can proceed.

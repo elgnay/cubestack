@@ -13,12 +13,15 @@
 #   - openssh-server, started only when the operator mounted the ssh Secret. No
 #     key staging: the Secret keys are mounted with subPath (host key at
 #     /etc/ssh/ssh_host_ed25519_key, platform authorized_keys at
-#     $HOME/.ssh/authorized_keys2) and sshd reads them in place.
+#     /run/ssh/authorized_keys, outside $HOME) and sshd reads them in place.
 #   - Jupyter itself honors JUPYTER_TOKEN and NOTEBOOK_ARGS natively (token,
 #     base_url, ...) — no overlay jupyter logic.
 #
-# Build context MUST be images/ so common/ is COPYable:
-#   docker build -f jupyter/Dockerfile -t harbor.isuanova.com/suanova/jupyter-minimal:<tag> images/
+# Build context MUST be images/ so common/ is COPYable, and the platform must be named: the base
+# is multi-arch, so a bare `docker build` resolves it to the *host* architecture and an arm64 host
+# would publish an arm64-only image.
+#   docker build --platform linux/amd64 -f jupyter/Dockerfile \
+#     -t harbor.isuanova.com/suanova/jupyter-minimal:<tag> images/
 #   (or: make -C images build)
 
 ARG JUPYTER_BASE=quay.io/jupyter/minimal-notebook:2026-09-07

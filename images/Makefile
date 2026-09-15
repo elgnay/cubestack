@@ -5,6 +5,15 @@
 
 CONTAINER_TOOL ?= docker
 
+# The architecture every published image must run on: the cluster's nodes are amd64, and the
+# machine building them may not be. Both Dockerfiles start from a multi-arch base (ubuntu,
+# quay.io/jupyter), and without --platform `docker build` resolves that base to the *host*
+# architecture — so a build on an arm64 host publishes an arm64-only image and every amd64 node
+# then fails to pull it ("no match for platform in manifest"). Naming the platform makes the
+# build independent of the host; PLATFORM=linux/arm64 is the explicit opt-in to build for
+# another one. `docker buildx imagetools inspect --raw <ref>` shows what a registry received.
+PLATFORM ?= linux/amd64
+
 # Optional mirror overrides for CN/offline builds (empty = upstream).
 APT_MIRROR    ?=
 PIP_INDEX_URL ?=
@@ -47,8 +56,8 @@ IMG_JUPYTER ?= $(JUPYTER_REPO):$(TAG)
 LATEST_SSH     = $(SSH_REPO):latest
 LATEST_JUPYTER = $(JUPYTER_REPO):latest
 
-.PHONY: help check-tag build build-ssh build-jupyter smoke smoke-ssh smoke-jupyter \
-	push push-ssh push-jupyter
+.PHONY: help check-tag check-platform build build-ssh build-jupyter smoke smoke-ssh \
+	smoke-jupyter push push-ssh push-jupyter
 
 .DEFAULT_GOAL := help
 
@@ -60,14 +69,28 @@ check-tag:
 		echo "                (not a git checkout?); pass TAG=<tag> explicitly." >&2; \
 		exit 1; }
 
+# `docker build` takes exactly one platform, so a list would surface as an opaque BuildKit error
+# about the driver. Multi-platform would need `docker buildx build --push`, which this Makefile
+# deliberately does not use: `--push` publishes straight from the build, leaving nothing local
+# for the smoke to accept.
+check-platform:
+	@test -n "$(PLATFORM)" || { \
+		echo "make -C images: PLATFORM is empty - name the platform the images run on (e.g. linux/amd64)." >&2; \
+		exit 1; }
+	@case "$(PLATFORM)" in \
+		*,*) echo "make -C images: PLATFORM takes one platform, not a list (got '$(PLATFORM)')." >&2; \
+		     echo "                Build each platform separately, or use 'docker buildx build --platform <list> --push'." >&2; \
+		     exit 1;; \
+	esac
+
 build: build-ssh build-jupyter ## Build both images
 
-build-ssh: check-tag ## Build the self-authored ssh image
-	$(CONTAINER_TOOL) build $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
+build-ssh: check-tag check-platform ## Build the self-authored ssh image
+	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) .
 
-build-jupyter: check-tag ## Build the jupyter image
-	$(CONTAINER_TOOL) build $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
+build-jupyter: check-tag check-platform ## Build the jupyter image
+	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f jupyter/Dockerfile -t $(IMG_JUPYTER) .
 
 smoke: build ## Build and run the full local Docker smoke

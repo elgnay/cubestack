@@ -5,12 +5,15 @@
 # No key staging: the operator mounts two Secret keys as files (subPath) and sshd
 # reads them in place —
 #   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity)
-#   authorized_keys      -> $HOME/.ssh/authorized_keys2     (platform keys)
+#   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, outside $HOME)
 # The container runs as uid/gid 1000 with $HOME=/home/ubuntu (the workspace PVC).
 # See images/README.md for the mount contract and its subPath caveat.
 #
-# Build context MUST be images/ (not this directory) so common/ is COPYable:
-#   docker build -f ssh-ubuntu-server/Dockerfile -t harbor.isuanova.com/suanova/ssh-ubuntu22.04:<tag> images/
+# Build context MUST be images/ (not this directory) so common/ is COPYable, and the platform
+# must be named: the base is multi-arch, so a bare `docker build` resolves it to the *host*
+# architecture and an arm64 host would publish an arm64-only image.
+#   docker build --platform linux/amd64 -f ssh-ubuntu-server/Dockerfile \
+#     -t harbor.isuanova.com/suanova/ssh-ubuntu22.04:<tag> images/
 #   (or: make -C images build)
 
 # Base: the Ubuntu release tag, deliberately not a digest pin. The release is the
