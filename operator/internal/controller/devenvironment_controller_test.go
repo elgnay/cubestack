@@ -31,6 +31,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -205,6 +206,86 @@ func createGateway(withAddress bool) {
 		gw.Status.Addresses = []gatewayv1.GatewayStatusAddress{{Type: ptrTo(gatewayv1.IPAddressType), Value: testGatewayIP}}
 		Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
 	}
+}
+
+// gatewayRouteParents renders the status.parents a gateway controller would
+// write for a route parented by ref: Accepted and ResolvedRefs pinned to the
+// route's current generation, so the controller does not read a stale status as
+// a fresh acceptance.
+func gatewayRouteParents(ref gatewayv1.ParentReference, generation int64, accepted bool, reason, message string) []gatewayv1.RouteParentStatus {
+	acceptedCondition := metav1.Condition{
+		Type:               string(gatewayv1.RouteConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(gatewayv1.RouteReasonAccepted),
+		ObservedGeneration: generation,
+		LastTransitionTime: metav1.Now(),
+	}
+	if !accepted {
+		acceptedCondition.Status = metav1.ConditionFalse
+		acceptedCondition.Reason = reason
+		acceptedCondition.Message = message
+	}
+	return []gatewayv1.RouteParentStatus{{
+		ParentRef:      ref,
+		ControllerName: gatewayv1.GatewayController("cubestack.io/test"),
+		Conditions: []metav1.Condition{
+			acceptedCondition,
+			{
+				Type:               string(gatewayv1.RouteConditionResolvedRefs),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.RouteReasonResolvedRefs),
+				ObservedGeneration: generation,
+				LastTransitionTime: metav1.Now(),
+			},
+		},
+	}}
+}
+
+// stampDevEnvRoutes stands in for the gateway controller, which envtest does not
+// run: it writes status.parents onto every route published for the environment,
+// so RouteReady can converge. Call it from inside the Eventually that asserts on
+// the routes' effect — the routes appear one reconcile at a time, and a route
+// whose spec has since changed is re-stamped against its new generation.
+func stampDevEnvRoutes(g Gomega, envName string, accepted bool, reason, message string) {
+	web := &gatewayv1.HTTPRoute{}
+	err := k8sClient.Get(ctx, client.ObjectKey{Name: envName + "-web", Namespace: testNamespace}, web)
+	if err != nil {
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	} else {
+		wanted := gatewayRouteParents(web.Spec.ParentRefs[0], web.Generation, accepted, reason, message)
+		if !apiequality.Semantic.DeepEqual(web.Status.Parents, wanted) {
+			web.Status.Parents = wanted
+			g.Expect(k8sClient.Status().Update(ctx, web)).To(Succeed())
+		}
+	}
+
+	routes := &gatewayv1.TCPRouteList{}
+	g.Expect(k8sClient.List(ctx, routes, client.InNamespace(testNamespace), client.MatchingLabels{devEnvironmentLabelKey: envName})).To(Succeed())
+	for i := range routes.Items {
+		route := &routes.Items[i]
+		wanted := gatewayRouteParents(route.Spec.ParentRefs[0], route.Generation, accepted, reason, message)
+		if apiequality.Semantic.DeepEqual(route.Status.Parents, wanted) {
+			continue
+		}
+		route.Status.Parents = wanted
+		g.Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+	}
+}
+
+// devEnvTCPRoutePorts lists the listener ports the environment's TCPRoutes hold.
+// It reads the routes rather than status.endpoints, which are withheld while a
+// route is unaccepted — the state in which the port pool is easiest to get wrong.
+func devEnvTCPRoutePorts(g Gomega, envName string) []int32 {
+	routes := &gatewayv1.TCPRouteList{}
+	g.Expect(k8sClient.List(ctx, routes, client.InNamespace(testNamespace),
+		client.MatchingLabels{devEnvironmentLabelKey: envName})).To(Succeed())
+	ports := make([]int32, 0, len(routes.Items))
+	for i := range routes.Items {
+		if p := tcpRoutePort(routes.Items[i].Name); p != 0 {
+			ports = append(ports, p)
+		}
+	}
+	return ports
 }
 
 func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
@@ -2112,6 +2193,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			var pSSH, pGRPC int32
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
@@ -2180,6 +2262,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			var p1 int32
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env1.Name, true, "", "")
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env1.Name), got)).To(Succeed())
 				p1 = sshEndpointPort(got.Status.Endpoints)
@@ -2192,6 +2275,8 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env2.Name)
 
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env2.Name, true, "", "")
+				stampDevEnvRoutes(g, env1.Name, true, "", "")
 				got2 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env2.Name), got2)).To(Succeed())
 				p2 := sshEndpointPort(got2.Status.Endpoints)
@@ -2203,6 +2288,38 @@ var _ = Describe("DevEnvironment controller", func() {
 				got1 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env1.Name), got1)).To(Succeed())
 				g.Expect(sshEndpointPort(got1.Status.Endpoints)).To(Equal(p1))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("keeps unaccepted environments off each other's listener port", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			// Neither environment's route is accepted, so both withhold their
+			// status.endpoints. The pool has to come from the TCPRoutes: read from
+			// the endpoints instead and the second environment sees nothing
+			// reserved and takes the first one's listener port.
+			env1 := validDevEnvironment("de-port-unaccepted-a")
+			env1.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env1)).To(Succeed())
+			defer deleteEnv(env1.Name)
+
+			var first int32
+			Eventually(func(g Gomega) {
+				ports := devEnvTCPRoutePorts(g, env1.Name)
+				g.Expect(ports).To(HaveLen(1))
+				first = ports[0]
+			}, "15s", "200ms").Should(Succeed())
+
+			env2 := validDevEnvironment("de-port-unaccepted-b")
+			env2.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env2)).To(Succeed())
+			defer deleteEnv(env2.Name)
+
+			Eventually(func(g Gomega) {
+				ports := devEnvTCPRoutePorts(g, env2.Name)
+				g.Expect(ports).To(HaveLen(1))
+				g.Expect(ports[0]).NotTo(Equal(first))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -2220,6 +2337,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			var pSSH, pGRPC int32
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				pSSH = sshEndpointPort(got.Status.Endpoints)
@@ -2240,6 +2358,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Update(ctx, got)).To(Succeed())
 
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
 				tr := &gatewayv1.TCPRoute{}
 				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pGRPC), Namespace: env.Namespace}, tr))).To(BeTrue())
 				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pSSH), Namespace: env.Namespace}, tr)).To(Succeed())
@@ -2261,6 +2380,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env2.Name)
 
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env2.Name, true, "", "")
 				got2 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env2.Name), got2)).To(Succeed())
 				p2 := int32(0)
@@ -2292,6 +2412,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			var p int32
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env1.Name, true, "", "")
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env1.Name), got)).To(Succeed())
 				p = sshEndpointPort(got.Status.Endpoints)
@@ -2320,6 +2441,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env2.Name)
 
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env2.Name, true, "", "")
 				got2 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env2.Name), got2)).To(Succeed())
 				g.Expect(sshEndpointPort(got2.Status.Endpoints)).To(Equal(p))
@@ -2371,6 +2493,66 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		It("withholds the endpoints of routes the Gateway has not accepted", func() {
+			// The shape found on the cs2 cluster: the Gateway has an address and
+			// is Programmed, but carries no listener for the port an SSH route
+			// attaches to, so the route is refused with NoMatchingParent. An
+			// assigned address is not acceptance, and publishing the endpoint
+			// anyway advertises an address that does not connect.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-not-accepted")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, false, string(gatewayv1.RouteReasonNoMatchingParent), "No listeners match this parent ref")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal(reasonGatewayNotAccepted))
+				// The message names the route and repeats the Gateway's own
+				// verdict, which is what identifies the missing listener.
+				g.Expect(cond.Message).To(ContainSubstring("-tcp-"))
+				g.Expect(cond.Message).To(ContainSubstring("NoMatchingParent: No listeners match this parent ref"))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Once the Gateway accepts the route, the condition and the endpoints
+			// move together.
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				g.Expect(sshEndpointPort(got.Status.Endpoints)).To(BeNumerically(">", 0))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("reports the web route when the Gateway refuses that one instead", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-web-not-accepted")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, false, string(gatewayv1.RouteReasonNoMatchingParent), "No listeners match this parent ref")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal(reasonGatewayNotAccepted))
+				g.Expect(cond.Message).To(ContainSubstring(env.Name + "-web"))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		It("brackets an IPv6 gateway address in published endpoints", func() {
 			gw := &gatewayv1.Gateway{
 				ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace},
@@ -2397,6 +2579,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env.Name)
 
 			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				var web, ssh, tcp string

@@ -59,8 +59,9 @@ const (
 	// reachable. (InferenceService)
 	ConditionEndpointReady ConditionType = "EndpointReady"
 
-	// ConditionRouteReady indicates that the public route is published, or
-	// that publishing was not requested. (InferenceService, DevEnvironment)
+	// ConditionRouteReady indicates that the public route is published and
+	// accepted by the gateway, or that publishing was not requested.
+	// (InferenceService, DevEnvironment)
 	ConditionRouteReady ConditionType = "RouteReady"
 
 	// ConditionReady aggregates all roles per readinessPolicy, and for a
