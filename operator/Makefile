@@ -51,6 +51,10 @@ manifests: controller-gen ## Generate WebhookConfiguration, ClusterRole and Cust
 generate: controller-gen ## Generate code containing DeepCopy, DeepCopyInto, and DeepCopyObject method implementations.
 	"$(CONTROLLER_GEN)" object:headerFile="hack/boilerplate.go.txt",year=$(YEAR) paths="./..."
 
+.PHONY: generate-check
+generate-check: manifests generate ## Fail if generated code or manifests drift from the API sources.
+	git diff --exit-code || { echo "generated files out of date — run: make manifests generate"; exit 1; }
+
 .PHONY: fmt
 fmt: ## Run go fmt against code.
 	go fmt ./...
