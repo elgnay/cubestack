@@ -272,10 +272,23 @@ func routeParentFor(parents []gatewayv1.RouteParentStatus, gatewayName, gatewayN
 
 // routeParentsTo reports whether a route's spec.parentRefs attach it to the
 // named Gateway — the question routeParentFor answers for the parents status
-// reports. A parentRef without a namespace means the route's own namespace,
-// which is how the Gateway API defaults it.
+// reports. The API's defaults apply to the fields left unset: a parentRef
+// without a namespace means the route's own namespace, and one without a group
+// or kind means a Gateway in the Gateway API group. A ref that names another
+// resource — a Service of the same name, as a mesh route may parent to — is a
+// different parent however it is spelled, and holds no listener here.
 func routeParentsTo(refs []gatewayv1.ParentReference, routeNamespace, gatewayName, gatewayNamespace string) bool {
 	for _, ref := range refs {
+		group, kind := gatewayAPIGroup, gatewayKind
+		if ref.Group != nil {
+			group = string(*ref.Group)
+		}
+		if ref.Kind != nil {
+			kind = string(*ref.Kind)
+		}
+		if group != gatewayAPIGroup || kind != gatewayKind {
+			continue
+		}
 		if ref.Name != gatewayv1.ObjectName(gatewayName) {
 			continue
 		}
