@@ -781,13 +781,31 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 
 		It("ignores a HOME that does not name a path", func() {
-			// A relative HOME is not a mount path, an empty one names nothing, and a
-			// valueFrom HOME is unreadable while reconciling — each falls through to
-			// the convention rather than pinning the claim somewhere arbitrary.
+			// Each of these is unusable as a mount path — relative, empty, a
+			// valueFrom that cannot be read while reconciling, and a $(VAR) the
+			// kubelet expands elsewhere — so the convention stands rather than the
+			// claim being pinned somewhere arbitrary.
 			for _, envVars := range [][]corev1.EnvVar{
 				home("relative/home"),
 				home(""),
+				home("/home/$(USER)"),
 				{{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+			} {
+				Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+					s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: envVars}
+				}))).To(Equal("/home/jovyan"))
+			}
+		})
+
+		It("lets an unusable final HOME clear an earlier usable one", func() {
+			// The container applies the last entry, so an earlier /first is not the
+			// home it uses. Falling through beats mounting the claim at a path the
+			// workload does not read.
+			for _, envVars := range [][]corev1.EnvVar{
+				append(home("/first"), home("relative")...),
+				append(home("/first"), corev1.EnvVar{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "some-secret"}, Key: "home",
+				}}}),
 			} {
 				Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
 					s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: envVars}

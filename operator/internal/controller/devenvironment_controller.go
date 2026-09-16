@@ -925,19 +925,31 @@ func resolveMountPath(env *aiv1alpha1.DevEnvironment) string {
 }
 
 // declaredHome is the home an environment declares through HOME in
-// spec.runtime.env, empty when it declares none. Only a literal absolute path
-// counts: a valueFrom source is not readable while reconciling without watching
-// whatever it reads, and a relative value does not name a mount path. The last
-// entry wins, as it does for the container, which applies the list in order.
+// spec.runtime.env, empty when it declares none. The last entry named HOME is
+// the one the container applies, so a final entry that is not usable leaves the
+// environment declaring no home rather than reviving an earlier one the
+// container overrides.
+//
+// An absolute path written out is the only usable form. A valueFrom source
+// cannot be read while reconciling without watching whatever it reads, a
+// relative value does not name a mount path, and the kubelet expands $(VAR) —
+// the claim would be mounted at the unexpanded text while the container's home
+// is the expanded one, which is the mismatch this whole derivation exists to
+// avoid.
 func declaredHome(env *aiv1alpha1.DevEnvironment) string {
 	if env.Spec.Runtime == nil {
 		return ""
 	}
 	home := ""
 	for _, v := range env.Spec.Runtime.Env {
-		if v.Name == homeEnv && v.ValueFrom == nil && strings.HasPrefix(v.Value, "/") {
-			home = v.Value
+		if v.Name != homeEnv {
+			continue
 		}
+		if v.ValueFrom != nil || !strings.HasPrefix(v.Value, "/") || strings.Contains(v.Value, "$(") {
+			home = ""
+			continue
+		}
+		home = v.Value
 	}
 	return home
 }
