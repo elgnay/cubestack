@@ -177,8 +177,14 @@ const (
 	defaultRuntimeUser = "user"
 
 	// defaultWorkspacePath is where the workspace PVC mounts when neither
-	// spec.storage.mountPath nor the runtime identity implies another home.
+	// spec.storage.mountPath nor a declared HOME nor the runtime identity implies
+	// another home.
 	defaultWorkspacePath = "/workspace"
+
+	// homeEnv is the variable spec.runtime.env declares the account's home
+	// through; it is the second input to the workspace mount path
+	// (::resolveMountPath).
+	homeEnv = "HOME"
 
 	// Jupyter token: the managed Secret <env>-auth holds the random token under
 	// the data key jupyterTokenKey, and the workload reads it through the
@@ -887,16 +893,26 @@ func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
 }
 
 // resolveMountPath is where the workspace PVC mounts: an explicit
-// spec.storage.mountPath wins, then the home the runtime identity implies —
-// /root for root, /home/<user> for a named account — else the platform default.
-// A container account is constrained by the CRD pattern to
+// spec.storage.mountPath wins, then the home the environment declares through
+// HOME in spec.runtime.env, then the home the runtime identity implies — /root
+// for root, /home/<user> for a named account — else the platform default. A
+// container account is constrained by the CRD pattern to
 // ^[a-z_][a-z0-9_-]*$, so it cannot inject a path separator.
 //
-// The last two cases read the spec rather than runtimeUser: an environment that
+// A declared HOME precedes the home the identity implies because it is the more
+// specific statement about where the container will look: an image whose
+// launcher relocates the account's home — stock docker-stacks moves root's to
+// /home/root — says so in HOME, and any other mount leaves the claim unused
+// while the workload writes to the container filesystem.
+//
+// The identity cases read the spec rather than runtimeUser: an environment that
 // names no account gets /workspace, not /home/user.
 func resolveMountPath(env *aiv1alpha1.DevEnvironment) string {
 	if env.Spec.Storage != nil && env.Spec.Storage.MountPath != "" {
 		return env.Spec.Storage.MountPath
+	}
+	if home := declaredHome(env); home != "" {
+		return home
 	}
 	if sc := env.Spec.Runtime; sc != nil && sc.SecurityContext != nil &&
 		sc.SecurityContext.RunAsUser != nil && *sc.SecurityContext.RunAsUser == 0 {
@@ -906,6 +922,24 @@ func resolveMountPath(env *aiv1alpha1.DevEnvironment) string {
 		return "/home/" + env.Spec.Runtime.User
 	}
 	return defaultWorkspacePath
+}
+
+// declaredHome is the home an environment declares through HOME in
+// spec.runtime.env, empty when it declares none. Only a literal absolute path
+// counts: a valueFrom source is not readable while reconciling without watching
+// whatever it reads, and a relative value does not name a mount path. The last
+// entry wins, as it does for the container, which applies the list in order.
+func declaredHome(env *aiv1alpha1.DevEnvironment) string {
+	if env.Spec.Runtime == nil {
+		return ""
+	}
+	home := ""
+	for _, v := range env.Spec.Runtime.Env {
+		if v.Name == homeEnv && v.ValueFrom == nil && strings.HasPrefix(v.Value, "/") {
+			home = v.Value
+		}
+	}
+	return home
 }
 
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from

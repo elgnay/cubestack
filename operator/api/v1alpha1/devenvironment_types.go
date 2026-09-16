@@ -156,8 +156,9 @@ type StorageSpec struct {
 	PVCRetention PVCRetentionPolicy `json:"pvcRetention,omitempty"`
 
 	// MountPath is the path where the workspace PVC is mounted. Leave it unset
-	// to derive the path from spec.runtime: /root when the container runs as
-	// root, /home/<user> when spec.runtime.user names an account, and /workspace
+	// to derive the path from spec.runtime: a literal absolute HOME in
+	// spec.runtime.env, else /root when the container runs as root, else
+	// /home/<user> when spec.runtime.user names an account, and /workspace
 	// otherwise. Set it to pin a different path — e.g. for a bring-your-own
 	// image whose home is somewhere else. It should be the directory the
 	// container's home points at, otherwise the workspace does not follow the
@@ -248,6 +249,8 @@ type RuntimeSpec struct {
 	Args []string `json:"args,omitempty"`
 
 	// Env is the environment variables (name/value or valueFrom: secretKeyRef).
+	// A literal absolute HOME here also moves the workspace mount
+	// (spec.storage.mountPath), since the workspace follows the account's home.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
