@@ -23,6 +23,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"strings"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -58,8 +59,12 @@ const (
 	testGatewayIP                 = "1.2.3.4"
 	testGRPCPortName              = "grpc"
 	testJupyterName               = "jupyter"
-	testRuntimeUser               = "jovyan"
-	testUserSSHKey                = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	// testSSHPortRangeStart is the lowest listener port the suite's reconciler
+	// allocates (suite_test.go), so it is the port a fresh environment takes
+	// from an empty pool.
+	testSSHPortRangeStart = 20000
+	testRuntimeUser       = "jovyan"
+	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 	// testSSHUser is the account the self-authored ssh images ship, selected
 	// with spec.runtime.user; testSSHHome is the home it implies.
 	testSSHUser = "ubuntu"
@@ -208,6 +213,12 @@ func createGateway(withAddress bool) {
 	}
 }
 
+// testRouteConditionTime is the LastTransitionTime stamped on the synthetic
+// route conditions. It is fixed rather than metav1.Now(): stampDevEnvRoutes
+// writes the status only when it differs from what is stored, and a timestamp
+// that changes on every call makes that comparison fail forever.
+var testRouteConditionTime = metav1.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
+
 // gatewayRouteParents renders the status.parents a gateway controller would
 // write for a route parented by ref: Accepted and ResolvedRefs pinned to the
 // route's current generation, so the controller does not read a stale status as
@@ -218,7 +229,7 @@ func gatewayRouteParents(ref gatewayv1.ParentReference, generation int64, accept
 		Status:             metav1.ConditionTrue,
 		Reason:             string(gatewayv1.RouteReasonAccepted),
 		ObservedGeneration: generation,
-		LastTransitionTime: metav1.Now(),
+		LastTransitionTime: testRouteConditionTime,
 	}
 	if !accepted {
 		acceptedCondition.Status = metav1.ConditionFalse
@@ -235,7 +246,7 @@ func gatewayRouteParents(ref gatewayv1.ParentReference, generation int64, accept
 				Status:             metav1.ConditionTrue,
 				Reason:             string(gatewayv1.RouteReasonResolvedRefs),
 				ObservedGeneration: generation,
-				LastTransitionTime: metav1.Now(),
+				LastTransitionTime: testRouteConditionTime,
 			},
 		},
 	}}
@@ -2320,6 +2331,61 @@ var _ = Describe("DevEnvironment controller", func() {
 				ports := devEnvTCPRoutePorts(g, env2.Name)
 				g.Expect(ports).To(HaveLen(1))
 				g.Expect(ports[0]).NotTo(Equal(first))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("ignores listener ports held by routes on another gateway", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			// Start from an empty pool: earlier specs release their environments
+			// and routes asynchronously via the finalizer.
+			Eventually(func(g Gomega) {
+				envs := &aiv1alpha1.DevEnvironmentList{}
+				g.Expect(k8sClient.List(ctx, envs)).To(Succeed())
+				g.Expect(envs.Items).To(BeEmpty())
+				routes := &gatewayv1.TCPRouteList{}
+				g.Expect(k8sClient.List(ctx, routes, client.InNamespace(testNamespace))).To(Succeed())
+				g.Expect(routes.Items).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			// A route parented to someone else's Gateway holds the lowest port in
+			// the range. It has no listener on this Gateway, so it must not
+			// reserve that port — the pool is this Gateway's listeners.
+			foreign := &gatewayv1.TCPRoute{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("foreign-tcp-%d", testSSHPortRangeStart),
+					Namespace: testNamespace,
+				},
+				Spec: gatewayv1.TCPRouteSpec{
+					CommonRouteSpec: gatewayv1.CommonRouteSpec{
+						ParentRefs: []gatewayv1.ParentReference{{
+							Name:      gatewayv1.ObjectName("other-gw"),
+							Namespace: ptrTo(gatewayv1.Namespace(testNamespace)),
+						}},
+					},
+					Rules: []gatewayv1.TCPRouteRule{{
+						BackendRefs: []gatewayv1.BackendRef{{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Name: "foreign-backend",
+								Port: ptrTo(int32(80)),
+							},
+						}},
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, foreign) }()
+
+			env := validDevEnvironment("de-foreign-pool")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				ports := devEnvTCPRoutePorts(g, env.Name)
+				g.Expect(ports).To(HaveLen(1))
+				g.Expect(ports[0]).To(Equal(int32(testSSHPortRangeStart)))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

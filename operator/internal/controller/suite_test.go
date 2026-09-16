@@ -110,7 +110,7 @@ var _ = BeforeSuite(func() {
 			GatewayNamespace:          testNamespace,
 			GatewayDataplaneNamespace: testGatewayDataplaneNamespace,
 			HTTPPort:                  80,
-			SSHPortRangeStart:         20000,
+			SSHPortRangeStart:         testSSHPortRangeStart,
 			SSHPortRangeEnd:           20100,
 		},
 	}).SetupWithManager(testMgr)

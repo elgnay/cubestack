@@ -226,6 +226,12 @@ func routeAccepted(route *gatewayv1.HTTPRoute, gatewayName, gatewayNamespace str
 // route's generation is stale (the gateway has not processed the latest spec
 // yet). Without a matching entry the gateway has not processed the route.
 //
+// A condition with an unset (zero) ObservedGeneration counts as current. The
+// Gateway API schema leaves it optional on these conditions, so a gateway may
+// simply not report it; reading those conditions as absent would withhold every
+// environment's endpoints on such a cluster — a permanent false negative bought
+// to close a transient one.
+//
 // It takes the parents rather than a route so it applies to every route kind:
 // HTTPRoute and TCPRoute are distinct types sharing only this status shape.
 func routeParentsAccepted(parents []gatewayv1.RouteParentStatus, generation int64, gatewayName, gatewayNamespace string) bool {
@@ -262,6 +268,26 @@ func routeParentFor(parents []gatewayv1.RouteParentStatus, gatewayName, gatewayN
 		return &parents[i]
 	}
 	return nil
+}
+
+// routeParentsTo reports whether a route's spec.parentRefs attach it to the
+// named Gateway — the question routeParentFor answers for the parents status
+// reports. A parentRef without a namespace means the route's own namespace,
+// which is how the Gateway API defaults it.
+func routeParentsTo(refs []gatewayv1.ParentReference, routeNamespace, gatewayName, gatewayNamespace string) bool {
+	for _, ref := range refs {
+		if ref.Name != gatewayv1.ObjectName(gatewayName) {
+			continue
+		}
+		namespace := routeNamespace
+		if ref.Namespace != nil {
+			namespace = string(*ref.Namespace)
+		}
+		if namespace == gatewayNamespace {
+			return true
+		}
+	}
+	return false
 }
 
 // endpointPort extracts the port from the reachable internal endpoint

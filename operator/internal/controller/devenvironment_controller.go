@@ -1681,7 +1681,10 @@ func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string
 // Gateway's acceptance is read from.
 func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, []publishedRoute, error) {
 	cfg := r.defaultedConfig()
-	used := r.usedPorts(ctx, env.Namespace, env.Name)
+	used, err := r.usedPorts(ctx, env.Namespace, env.Name)
+	if err != nil {
+		return nil, nil, err
+	}
 	ports := map[string]int32{}
 	if sshExposed(env) {
 		p := r.allocatePort(env, sshPortName, used)
@@ -1795,22 +1798,31 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 // withheld while a route is unaccepted, and a reservation that disappears from
 // under an environment lets two of them claim the same listener port. The route
 // is the durable record — its name embeds the port it holds.
-func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) map[int32]bool {
+//
+// Only routes attached to the configured Gateway count: the pool is that
+// Gateway's tcp-<port> listeners, and a route parented elsewhere holds no
+// listener here. A failed List is returned rather than read as an empty pool,
+// which would hand out ports other environments' routes already hold.
+func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) (map[int32]bool, error) {
+	cfg := r.defaultedConfig()
 	used := map[int32]bool{}
 	var trs gatewayv1.TCPRouteList
 	if err := r.List(ctx, &trs); err != nil {
-		return used
+		return nil, err
 	}
 	for i := range trs.Items {
 		route := &trs.Items[i]
 		if route.Namespace == excludeNS && route.Labels[devEnvironmentLabelKey] == excludeName {
 			continue // this environment's own allocations are free for it to reuse
 		}
+		if !routeParentsTo(route.Spec.ParentRefs, route.Namespace, cfg.GatewayName, cfg.GatewayNamespace) {
+			continue
+		}
 		if p := tcpRoutePort(route.Name); p != 0 {
 			used[p] = true
 		}
 	}
-	return used
+	return used, nil
 }
 
 // allocatePort picks a port for the named endpoint, reusing the env's own

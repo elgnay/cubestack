@@ -251,3 +251,30 @@ var _ = Describe("checkRoute", func() {
 		Expect(cond.Reason).To(Equal("NotPublished"))
 	})
 })
+
+var _ = Describe("routeParentsAccepted", func() {
+	// parentsAcceptedBy renders the status.parents a gateway writes when it
+	// accepts the route, observed for the given generation (0 = a gateway that
+	// did not report one).
+	parentsAcceptedBy := func(observed int64) []gatewayv1.RouteParentStatus {
+		return gatewayRouteParents(gatewayv1.ParentReference{
+			Name:      gatewayv1.ObjectName(testGatewayName),
+			Namespace: ptrTo(gatewayv1.Namespace(testGatewayNamespace)),
+		}, observed, true, "", "")
+	}
+
+	It("accepts a status written for the current generation", func() {
+		Expect(routeParentsAccepted(parentsAcceptedBy(3), 3, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+
+	It("rejects a status written for an earlier generation", func() {
+		Expect(routeParentsAccepted(parentsAcceptedBy(2), 3, testGatewayName, testGatewayNamespace)).To(BeFalse())
+	})
+
+	It("accepts a status that leaves observedGeneration unset", func() {
+		// observedGeneration is optional in the Gateway API schema, so a gateway
+		// may omit it. Treating that as stale would withhold every environment's
+		// endpoints on such a cluster; the tolerance is deliberate.
+		Expect(routeParentsAccepted(parentsAcceptedBy(0), 3, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+})
