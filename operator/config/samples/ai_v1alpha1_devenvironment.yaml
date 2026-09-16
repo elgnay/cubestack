@@ -37,7 +37,8 @@ spec:
     # space.
     pvcRetention: retain         # delete / retain
     # mountPath is optional. Left out, the controller derives the workspace path
-    # from runtime.user: /home/<user>, /root when running as root (runAsUser 0),
+    # from runtime: HOME from runtime.env when it names an absolute path
+    # outright, else /root when running as root (runAsUser 0), else /home/<user>,
     # else /workspace. Set it to pin a path — e.g. for a bring-your-own image
     # whose home is somewhere else.
     mountPath: /home/ubuntu

@@ -695,8 +695,13 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 	})
 
 	Describe("resolveMountPath", func() {
-		// The path depends only on spec.storage.mountPath and the runtime identity,
-		// so the fixture carries nothing else.
+		// The path depends only on spec.storage.mountPath, a declared HOME in
+		// spec.runtime.env, and the runtime identity, so the fixture carries
+		// nothing else.
+		home := func(value string) []corev1.EnvVar {
+			return []corev1.EnvVar{{Name: homeEnv, Value: value}}
+		}
+
 		env := func(mutate func(*aiv1alpha1.DevEnvironmentSpec)) *aiv1alpha1.DevEnvironment {
 			e := &aiv1alpha1.DevEnvironment{}
 			if mutate != nil {
@@ -748,6 +753,73 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(1000))},
 				}
 			}))).To(Equal("/home/jovyan"))
+		})
+
+		// The notebook-root case: a stock-derived image running as root relocates
+		// root's home to /home/root, so a declared HOME has to beat the /root the
+		// identity alone implies — otherwise the claim is left unused.
+		It("lets a declared HOME override the home root's identity implies", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+					Env:             home("/home/root"),
+				}
+			}))).To(Equal("/home/root"))
+		})
+
+		It("lets a declared HOME override a named account's home", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: home("/srv/jovyan")}
+			}))).To(Equal("/srv/jovyan"))
+		})
+
+		It("lets an explicit mountPath win over a declared HOME", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: home("/home/root")}
+				s.Storage = &aiv1alpha1.StorageSpec{MountPath: "/mnt/data"}
+			}))).To(Equal("/mnt/data"))
+		})
+
+		It("ignores a HOME that does not name a path", func() {
+			// Each of these is unusable as a mount path — relative, empty, a
+			// valueFrom that cannot be read while reconciling, and a $(VAR) the
+			// kubelet expands elsewhere — so the convention stands rather than the
+			// claim being pinned somewhere arbitrary.
+			for _, envVars := range [][]corev1.EnvVar{
+				home("relative/home"),
+				home(""),
+				home("/home/$(USER)"),
+				{{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+			} {
+				Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+					s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: envVars}
+				}))).To(Equal("/home/jovyan"))
+			}
+		})
+
+		It("lets an unusable final HOME clear an earlier usable one", func() {
+			// The container applies the last entry, so an earlier /first is not the
+			// home it uses. Falling through beats mounting the claim at a path the
+			// workload does not read.
+			for _, envVars := range [][]corev1.EnvVar{
+				append(home("/first"), home("relative")...),
+				append(home("/first"), corev1.EnvVar{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "some-secret"}, Key: "home",
+				}}}),
+			} {
+				Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+					s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: envVars}
+				}))).To(Equal("/home/jovyan"))
+			}
+		})
+
+		It("takes the last of several declared HOMEs", func() {
+			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
+				s.Runtime = &aiv1alpha1.RuntimeSpec{
+					User: testRuntimeUser,
+					Env:  append(home("/first"), home("/second")...),
+				}
+			}))).To(Equal("/second"))
 		})
 	})
 
@@ -936,6 +1008,24 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 				Name:         sshKeysVolumeName,
 				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
 			}}))
+		})
+
+		// The declared HOME reaches the VolumeMount, not just resolveMountPath: a
+		// root environment telling the image its home is /home/root must have its
+		// claim mounted there, or the notebook writes to the container filesystem.
+		It("mounts the workspace claim at a declared HOME", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "1Gi"}
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					User:            "root",
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0)), RunAsGroup: ptrTo(int64(0))},
+					Env:             []corev1.EnvVar{{Name: homeEnv, Value: "/home/root"}, {Name: "NB_USER", Value: "root"}},
+				}
+			})
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: workspaceClaimName, MountPath: "/home/root"},
+			}))
 		})
 
 		It("injects JUPYTER_TOKEN from the managed auth secret and drops a user override", func() {
