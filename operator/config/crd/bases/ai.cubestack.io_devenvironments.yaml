@@ -369,8 +369,8 @@ spec:
                     description: |-
                       KeysSecret is the SSH public key Secret reference. If specified, the
                       controller generates the environment's host identity alone and mounts this
-                      Secret's data[key] (default "keys") as the container's authorized_keys, so
-                      the Secret must carry the label ai.cubestack.io/ssh-keys-delegated: "true"
+                      Secret's data[key] as the container's authorized_keys, so the Secret must
+                      carry the label ai.cubestack.io/ssh-keys-delegated: "true"
                       — only a Secret that names itself for this use is mounted into a workload.
                       Otherwise the controller generates the host identity and a login keypair,
                       and status.sshKeysSecret names the Secret holding the latter. The plaintext

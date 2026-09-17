@@ -60,9 +60,8 @@ const (
 	// SSH secret data keys. The ssh material is split across two Secrets: the
 	// controller-managed host-key Secret holds the ed25519 host keypair, and the
 	// authorized-keys source holds the content the workload mounts as
-	// authorized_keys — the user's Secret when spec.ssh.keysSecret names one
-	// (data key "keys" by default, per the design's sample CR), else a
-	// controller-generated one.
+	// authorized_keys — the user's Secret when spec.ssh.keysSecret names one, at
+	// the data key its selector names, else a controller-generated one.
 	sshHostKeyKey         = "ssh_host_ed25519_key"
 	sshHostPubKeyKey      = "ssh_host_ed25519_key.pub"
 	sshAuthorizedKeysKey  = "authorized_keys"

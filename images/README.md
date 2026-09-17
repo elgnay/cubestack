@@ -82,8 +82,8 @@ start (see the operator requirements below).
 | `/etc/ssh/ssh_host_ed25519_key` (`subPath`) | `ssh_host_ed25519_key` | `<env>-ssh-host-key` (controller-minted) | sshd host identity; its presence gates ssh |
 | `/run/ssh/authorized_keys` | the entry `status.sshKeysSecret.key` names, renamed by the volume | `spec.ssh.keysSecret`, else `<env>-ssh-authorized-keys` (controller-minted) | keys that may log in |
 
-The mounted entry is `authorized_keys` in the controller-minted case and the user's own key — `keys`
-by default — in the other; `status.sshKeysSecret` names the same Secret and entry, so it is what a
+The mounted entry is `authorized_keys` in the controller-minted case and the entry the user's selector
+names in the other; `status.sshKeysSecret` names the same Secret and entry, so it is what a
 user reads to find where their login keys live. In the controller-minted case that Secret also carries
 `id_ed25519` (the private half of the generated login keypair, which the user retrieves to log in) and
 `id_ed25519.pub`, which *is* the mounted `authorized_keys` content. The volume maps that single entry

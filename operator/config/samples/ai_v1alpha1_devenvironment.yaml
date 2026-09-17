@@ -70,7 +70,7 @@ spec:
     enabled: true                # enable extra SSH for jupyter/vscode types
     keysSecret:
       name: dev-alice-ssh-keys   # must be labeled ai.cubestack.io/ssh-keys-delegated: "true"
-      key: keys                  # Secret.data[keys] holds authorized_keys content (default key: keys)
+      key: keys                  # Secret.data[keys] holds the authorized_keys content
 
   # Network
   network:

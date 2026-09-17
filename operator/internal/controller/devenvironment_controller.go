@@ -729,9 +729,10 @@ func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
 
 // sshAuthorizedKeysSource is the name and data key of the Secret the pod mounts
 // as /run/ssh/authorized_keys: the user's delegated Secret when the spec names
-// one, else the controller-generated <env>-ssh-authorized-keys. The key is the
-// user's own selector key, defaulting to sshUserKeysDefaultKey, or
-// sshAuthorizedKeysKey when the controller generates the content.
+// one, else the controller-generated <env>-ssh-authorized-keys. In the delegated
+// case the key is the user's own selector key; the CRD requires it, so
+// sshUserKeysDefaultKey only stands in for the empty key of an object built
+// without that validation. The generated case uses sshAuthorizedKeysKey.
 //
 // The reconciler and desiredPodSpec both call this, so the entry the pod mounts
 // can never disagree with the entry the reconciler validates.
@@ -1762,8 +1763,8 @@ func generateJupyterToken() (string, error) {
 }
 
 // checkUserAuthorizedKeys verifies the Secret the workload takes its
-// authorized_keys from — spec.ssh.keysSecret, with data key "keys" by default per
-// the design's sample CR — is one the environment may mount.
+// authorized_keys from — spec.ssh.keysSecret, at the data key its selector names
+// — is one the environment may mount.
 //
 // The entry has to be present. The volume maps that one data key to the file the
 // images read, and a key absent from the Secret leaves the file out of the mount
