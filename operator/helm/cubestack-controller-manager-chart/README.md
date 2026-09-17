@@ -93,14 +93,16 @@ omits the flag entirely** (keeping the manager's own default):
 | `gateway.name` | `--gateway-name` | `cubestack-gateway` | Empty = flag omitted; publishing is disabled (`RouteReady=False`, `GatewayNotConfigured`). |
 | `gateway.namespace` | `--gateway-namespace` | `cubestack-system` | Empty = flag omitted (the manager flag default is `cubestack-system` anyway). |
 | `gateway.domain` | `--gateway-domain` | `""` | Empty = flag omitted. **Set this to enable publishing** — the public hostname of a published service is `<modelName>.<domain>`. |
-| `gateway.dataplaneNamespace` | `--gateway-dataplane-namespace` | `envoy-gateway-system` | **Not** a publishing switch. Names the namespace the Gateway's dataplane pods run in, so that environment pods admit ingress from that Gateway. Empty = flag omitted, and environments stay default-deny inbound (reachable in-cluster only). |
+| `gateway.dataplaneNamespace` | `--gateway-dataplane-namespace` | `envoy-gateway-system` | Names the namespace the Gateway's dataplane pods run in. **Not** a publishing switch. Two things read it: environment pods admit ingress from that Gateway, and the controller looks up the dataplane Service there to learn which port each listener is reachable on. Empty = flag omitted: environments stay default-deny inbound, and endpoint addresses fall back to assuming the listener port is the reachable one — true of a LoadBalancer or ClusterIP dataplane, not of a NodePort one. |
 
 `dataplaneNamespace` is the one key here the **DevEnvironment** controller
-reads: it is where its NetworkPolicy allowance points, and it is not the
-Gateway's own namespace — Envoy Gateway runs the proxy pods in a namespace of
-its own, separate from the one holding the `Gateway` object. The other keys
-configure the InferenceService publishing path only; the DevEnvironment
-controller's Gateway name and namespace are platform constants
+reads: it is where its NetworkPolicy allowance points, and where it finds the
+dataplane Service that says which port each listener is reachable on — Envoy
+Gateway renumbers listeners onto nodePorts when it types that Service
+`NodePort`. It is not the Gateway's own namespace — Envoy Gateway runs the proxy
+pods in a namespace of its own, separate from the one holding the `Gateway`
+object. The other keys configure the InferenceService publishing path only; the
+DevEnvironment controller's Gateway name and namespace are platform constants
 (`cubestack-gateway` in `cubestack-system`) rather than values.
 
 The `name`/`namespace` defaults follow the platform convention (the same
@@ -136,10 +138,34 @@ two flags, fed by the `l4PortRange.*` values — these always render:
 
 A port is allocated to the lowest free number in the range and stays with the
 environment across restarts. Each allocated port becomes a listener the
-environment's own `ListenerSet` declares on the platform Gateway, so **the
-range must be one that Gateway's Service carries**: a `LoadBalancer` forwards
-any port, while a `NodePort` Service only carries the ports published as
-nodePorts. Widen the range as the number of environments grows.
+environment's own `ListenerSet` declares on the platform Gateway. **Nothing has
+to pre-publish the range**: Envoy Gateway adds the port of every accepted
+listener to the proxy Service it manages for the Gateway, and where that
+Service is a `NodePort` it also assigns the nodePort. The controller reads the
+dataplane Service back (see `gateway.dataplaneNamespace`) and publishes the port
+it is actually reachable on in `status.endpoints[].address`, keeping the pool
+port in `listenerPort`. Widen the range as the number of environments grows —
+the pool, not the Service, is what runs out.
+
+Three things have to be in place for a listener to take effect, once per
+cluster:
+
+- The Gateway must admit the ListenerSets: `spec.allowedListeners` on
+  `cubestack-gateway` has to permit the namespaces DevEnvironments live in. It
+  defaults to `from: None`, i.e. denying everything, so without this every
+  ListenerSet comes back `Accepted=False` / `NotAllowed` — surfaced on the
+  environment as `RouteReady=False` / `ListenerNotAccepted`, which names the
+  reason rather than hanging. `from: All` is the simple opt-in; who may publish
+  is then settled by RBAC, not by the selector — anyone able to create a
+  ListenerSet in a namespace the selector admits can contribute a listener.
+- The `ListenerSet` CRD (`gateway.networking.k8s.io/v1`) must be installed. The
+  controller probes for each Gateway API kind and only watches the ones the
+  cluster serves, so a cluster without it still runs and still publishes HTTP;
+  its L4 environments report `RouteReady=False` / `GatewayAPINotInstalled`.
+- The installed Envoy Gateway must be one that reconciles ListenerSets
+  (verified on v1.9.1). An older one leaves the object accepted by the API
+  server but unprogrammed, so no listener appears and the environment never
+  reaches `RouteReady=True`.
 
 ```bash
 helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system \

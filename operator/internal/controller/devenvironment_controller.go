@@ -80,11 +80,13 @@ type DevEnvironmentControllerConfig struct {
 	// GatewayNamespace is the namespace of the shared Gateway.
 	GatewayNamespace string
 	// GatewayDataplaneNamespace is the namespace the shared Gateway's dataplane
-	// pods run in, which is where its traffic to an environment originates. It
-	// is not GatewayNamespace: the Gateway object and its Envoy dataplane are
-	// separate deployments and Envoy Gateway places the latter in its own
-	// namespace. Empty disables the ingress allowance in desiredNetworkPolicy,
-	// leaving environments at the default-deny floor.
+	// Service and pods run in, which is where its traffic to an environment
+	// originates. It is not GatewayNamespace: the Gateway object and its Envoy
+	// dataplane are separate deployments and Envoy Gateway places the latter in
+	// its own namespace. Empty disables the ingress allowance in
+	// desiredNetworkPolicy, leaving environments at the default-deny floor, and
+	// stops externalPorts reading the dataplane Service: published addresses then
+	// assume the listener port is the reachable one.
 	GatewayDataplaneNamespace string
 	// GatewayIP is a static fallback address used when the Gateway has no
 	// status address yet.
@@ -145,6 +147,7 @@ const (
 	// without write access to the shared Gateway (design §5).
 	gatewayAPIGroup = "gateway.networking.k8s.io"
 	gatewayKind     = "Gateway"
+	httpRouteKind   = "HTTPRoute"
 	listenerSetKind = "ListenerSet"
 	tcpRouteKind    = "TCPRoute"
 	serviceKind     = "Service"
@@ -650,7 +653,17 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// port range 30000-20000" — a message that reads as exhaustion and sends
 	// the reader looking for environments that are not there. Validated on the
 	// defaulted config so an unset end is compared as its default, not as zero.
-	if cfg := r.defaultedConfig(); cfg.L4PortRangeStart > cfg.L4PortRangeEnd {
+	//
+	// The bounds are checked here too, because this is the last point before a
+	// port reaches a listener: allocatePort would hand out a number the
+	// dataplane cannot listen on, one environment at a time, for a mistake that
+	// is one value on the command line.
+	cfg := r.defaultedConfig()
+	if cfg.L4PortRangeStart < 1 || cfg.L4PortRangeEnd > 65535 {
+		return fmt.Errorf("the L4 port range %d-%d is outside the usable ports 1-65535",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
+	if cfg.L4PortRangeStart > cfg.L4PortRangeEnd {
 		return fmt.Errorf("the L4 port range is empty: start %d is greater than end %d",
 			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 	}
@@ -669,16 +682,22 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvKeysSecret)).
 		Watches(&aiv1alpha1.DevEnvironment{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
+	// Each Gateway API kind is probed for itself before it is watched: they
+	// arrive with separate CRDs — TCPRoute ships in the Gateway API's
+	// experimental channel, ListenerSet is separate again — so an install can
+	// carry the Gateway and the HTTPRoute without either, and a watch on a kind
+	// the server does not serve fails the manager at startup.
 	if gatewayAPICRDInstalled(mgr, gatewayKind) {
-		builder.Owns(&gatewayv1.HTTPRoute{}).
-			Owns(&gatewayv1.TCPRoute{}).
-			Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
-		// The ListenerSet is probed separately: it is a distinct CRD, and an
-		// install carrying the Gateway API without it would otherwise fail to
-		// start the manager on an informer for a kind the server does not serve.
-		if gatewayAPICRDInstalled(mgr, listenerSetKind) {
-			builder.Owns(&gatewayv1.ListenerSet{})
-		}
+		builder.Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
+	}
+	if gatewayAPICRDInstalled(mgr, httpRouteKind) {
+		builder.Owns(&gatewayv1.HTTPRoute{})
+	}
+	if gatewayAPICRDInstalled(mgr, tcpRouteKind) {
+		builder.Owns(&gatewayv1.TCPRoute{})
+	}
+	if gatewayAPICRDInstalled(mgr, listenerSetKind) {
+		builder.Owns(&gatewayv1.ListenerSet{})
 	}
 	// MaxConcurrentReconciles is pinned to 1 rather than left to default to it.
 	// Port allocation reads the pool and then creates a TCPRoute, and nothing
@@ -778,6 +797,27 @@ func sshExposed(env *aiv1alpha1.DevEnvironment) bool {
 	return env.Spec.SSH != nil && env.Spec.SSH.Enabled
 }
 
+// l4Exposed reports whether the environment declares any L4 exposure, i.e.
+// whether it draws a port from the pool. It is the guard for every use of the
+// TCPRoute and ListenerSet kinds: those arrive with their own CRDs (TCPRoute
+// ships in the Gateway API's experimental channel, ListenerSet is separate
+// again), and an environment that exposes nothing on L4 must still publish its
+// HTTPRoute in an install that carries neither.
+//
+// It mirrors the allocation loop in publishRoutes exactly — the two must agree
+// on what counts as L4 exposure, so a change there belongs here too.
+func l4Exposed(env *aiv1alpha1.DevEnvironment) bool {
+	if sshExposed(env) {
+		return true
+	}
+	for _, p := range env.Spec.Ports {
+		if p.Type == aiv1alpha1.PortTypeTCP {
+			return true
+		}
+	}
+	return false
+}
+
 // sshUserKeysRef is the delegated Secret the environment takes its authorized
 // keys from, or nil when the controller generates them instead.
 func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
@@ -790,7 +830,8 @@ func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
 // sshAuthorizedKeysSource is the name and data key of the Secret the pod mounts
 // as /run/ssh/authorized_keys: the user's delegated Secret when the spec names
 // one, at the data key its selector names, else the controller-generated
-// <env>-ssh-authorized-keys at sshAuthorizedKeysKey.
+// <env>-ssh-authorized-keys at sshClientPubKeyKey — the login keypair's public
+// half, which is the key that actually logs in.
 //
 // The delegated key is always non-empty: the CRD requires the field and rejects
 // an empty one, so there is nothing here to fall back to — substituting an entry
@@ -802,7 +843,7 @@ func sshAuthorizedKeysSource(env *aiv1alpha1.DevEnvironment) (name, key string) 
 	if ks := sshUserKeysRef(env); ks != nil {
 		return ks.Name, ks.Key
 	}
-	return sshAuthorizedKeysSecretName(env), sshAuthorizedKeysKey
+	return sshAuthorizedKeysSecretName(env), sshClientPubKeyKey
 }
 
 // sshMountKey renders the ssh mount contract for the pod-template hash: the
@@ -1519,7 +1560,7 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 // the pod when the workload rolls (see sshKeysPodAnnotations); the authorized
 // keys are a directory mount kubelet keeps in sync, so rotating them deliberately
 // does not roll anything.
-func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretKeySelector, string, error) {
+func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretReference, string, error) {
 	if sshUserKeysRef(env) != nil {
 		if err := r.checkUserAuthorizedKeys(ctx, env); err != nil {
 			return nil, "", err
@@ -1534,9 +1575,12 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env 
 			return nil, "", err
 		}
 	}
-	name, key := sshAuthorizedKeysSource(env)
-	selector := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: key}
-	return selector, sshHostKeyDigest(hostKey), nil
+	// Only the Secret is recorded: status names it, and the field's own doc says
+	// which entries either case puts in it. Going through the same source the pod
+	// does is what keeps the two from naming different Secrets.
+	name, _ := sshAuthorizedKeysSource(env)
+	ref := &corev1.SecretReference{Name: name, Namespace: env.Namespace}
+	return ref, sshHostKeyDigest(hostKey), nil
 }
 
 // reconcileSSHHostKeySecret ensures the managed <env>-ssh-host-key Secret exists
@@ -1641,15 +1685,17 @@ func (r *DevEnvironmentReconciler) legacyHostKeySecret(ctx context.Context, env 
 }
 
 // reconcileSSHAuthorizedKeysSecret ensures the generated
-// <env>-ssh-authorized-keys Secret carries a login keypair and the
-// authorized_keys entry the workload mounts. Like the host key the keypair is
-// minted once and kept, so a key its owner has already downloaded keeps working;
-// only one sshd could not read sends it back to generation.
+// <env>-ssh-authorized-keys Secret carries a login keypair: the private half the
+// environment's owner retrieves from status.sshKeysSecret, and the public half
+// the workload mounts as authorized_keys. Like the host key the keypair is minted
+// once and kept, so a key its owner has already downloaded keeps working; only
+// one sshd could not read sends it back to generation.
 //
-// The mounted entry is derived from the stored public key, so a hand-edited
-// authorized_keys is repaired from the keypair rather than the other way round.
-// A change here needs no revision: the pod's volume is an ordinary Secret mount,
-// which kubelet updates in place.
+// The public half is mounted from here rather than from a copy of it under
+// another name, so the entry the user reads and the entry that authorizes them
+// cannot drift apart, and there is no second entry that looks editable and is
+// not. A change here needs no revision: the pod's volume is an ordinary Secret
+// mount, which kubelet updates in place.
 func (r *DevEnvironmentReconciler) reconcileSSHAuthorizedKeysSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
 	name := sshAuthorizedKeysSecretName(env)
 	secret := &corev1.Secret{}
@@ -1663,9 +1709,8 @@ func (r *DevEnvironmentReconciler) reconcileSSHAuthorizedKeysSecret(ctx context.
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 			Type:       corev1.SecretTypeOpaque,
 			Data: map[string][]byte{
-				sshClientKeyKey:      privPEM,
-				sshClientPubKeyKey:   pubOpenSSH,
-				sshAuthorizedKeysKey: pubOpenSSH,
+				sshClientKeyKey:    privPEM,
+				sshClientPubKeyKey: pubOpenSSH,
 			},
 		}
 		if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
@@ -1691,15 +1736,12 @@ func (r *DevEnvironmentReconciler) reconcileSSHAuthorizedKeysSecret(ctx context.
 		}
 		secret.Data[sshClientKeyKey] = privPEM
 		secret.Data[sshClientPubKeyKey] = pubOpenSSH
-		pub = pubOpenSSH
 		changed = true
 	}
-	// The entry is rewritten whenever it drifts from the stored public key, empty
-	// included: the volume omits a data key that is missing rather than failing the
-	// mount, so an absent entry would read as "nobody may log in" with nothing to
-	// say why.
-	if cur, ok := secret.Data[sshAuthorizedKeysKey]; !ok || string(cur) != string(pub) {
-		secret.Data[sshAuthorizedKeysKey] = pub
+	// The copy an older version of this controller kept for the mount is no
+	// longer read by anything, and would sit there looking like the entry to edit.
+	if _, ok := secret.Data[sshAuthorizedKeysKey]; ok {
+		delete(secret.Data, sshAuthorizedKeysKey)
 		changed = true
 	}
 	if changed {
@@ -1951,7 +1993,7 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		return err
 	}
 
-	ports, l4, published, err := r.publishRoutes(ctx, env, gw)
+	ports, l4Set, published, err := r.publishRoutes(ctx, env, gw)
 	if err != nil {
 		// A kind the API server does not serve means the Gateway API install is
 		// incomplete rather than that publishing failed; say that instead of
@@ -1970,7 +2012,7 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		status.Endpoints = nil
 		return nil
 	}
-	if rejection := listenerSetRejection(l4); rejection != "" {
+	if rejection := listenerSetRejection(l4Set); rejection != "" {
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonListenerNotAccepted, rejection)
 		status.Endpoints = nil
 		return nil
@@ -1982,8 +2024,22 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 			return nil
 		}
 	}
+	// Resolve where each listener is reachable before publishing it: a NodePort
+	// dataplane renumbers its listeners, so an address built from the listener
+	// port alone would name a port that is closed on the node.
+	wanted := make([]int32, 0, len(ports)+1)
+	for _, p := range ports {
+		wanted = append(wanted, p)
+	}
+	wanted = append(wanted, cfg.HTTPPort)
+	external, err := r.externalPorts(ctx, gw, wanted)
+	if err != nil {
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotReady, err.Error())
+		status.Endpoints = nil
+		return nil
+	}
 	setDevEnvironmentRouteReadyCondition(&status.Conditions, true, reasonPublished, "Routes are published on the gateway")
-	r.buildEndpoints(env, status, gwIP, ports)
+	r.buildEndpoints(env, status, gwIP, ports, external)
 	return nil
 }
 
@@ -2085,6 +2141,62 @@ func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string
 	return cfg.GatewayIP
 }
 
+// externalPorts maps each given listener port to the port it is reachable on at
+// the Gateway's address.
+//
+// A LoadBalancer or ClusterIP dataplane serves a listener on the listener's own
+// port, so the mapping is the identity. A NodePort dataplane renumbers every
+// listener onto a nodePort instead, and only the dataplane Service knows the
+// assignment: the Gateway's status carries an address but no ports. Reading the
+// Service is what keeps a published endpoint an address that works.
+//
+// It reads through APIReader rather than the cache. An address published from a
+// stale read is wrong in the user's hands, and nothing here watches Services for
+// a cache to be refreshed from. A listener the dataplane does not expose yet is
+// reported rather than passed through as its own port, so an endpoint is either
+// known-reachable or withheld — never silently dead.
+func (r *DevEnvironmentReconciler) externalPorts(ctx context.Context, gw *gatewayv1.Gateway, ports []int32) (map[int32]int32, error) {
+	external := make(map[int32]int32, len(ports))
+	for _, p := range ports {
+		external[p] = p
+	}
+	cfg := r.defaultedConfig()
+	if cfg.GatewayDataplaneNamespace == "" {
+		return external, nil
+	}
+	var svcs corev1.ServiceList
+	if err := r.APIReader.List(ctx, &svcs, client.InNamespace(cfg.GatewayDataplaneNamespace), client.MatchingLabels{
+		gatewayDataplaneNameLabel:      gw.Name,
+		gatewayDataplaneNamespaceLabel: gw.Namespace,
+	}); err != nil {
+		return nil, err
+	}
+	var dataplane *corev1.Service
+	for i := range svcs.Items {
+		if svcs.Items[i].Spec.Type == corev1.ServiceTypeNodePort {
+			dataplane = &svcs.Items[i]
+			break
+		}
+	}
+	if dataplane == nil {
+		return external, nil
+	}
+	for _, p := range ports {
+		nodePort := int32(0)
+		for _, sp := range dataplane.Spec.Ports {
+			if sp.Port == p {
+				nodePort = sp.NodePort
+				break
+			}
+		}
+		if nodePort == 0 {
+			return nil, fmt.Errorf("dataplane Service %s/%s exposes no nodePort for listener port %d", dataplane.Namespace, dataplane.Name, p)
+		}
+		external[p] = nodePort
+	}
+	return external, nil
+}
+
 // publishRoutes allocates the SSH and extra TCP ports, declares them as the
 // environment's own Gateway listeners, then applies the HTTPRoute and one
 // TCPRoute per allocated port. The returned map is keyed by endpoint name and
@@ -2093,27 +2205,36 @@ func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string
 // is read from (nil when the environment has no L4 port).
 func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, *gatewayv1.ListenerSet, []publishedRoute, error) {
 	cfg := r.defaultedConfig()
-	used, err := r.usedPorts(ctx, env.Namespace, env.Name)
-	if err != nil {
-		return nil, nil, nil, err
-	}
 	ports := map[string]int32{}
-	if sshExposed(env) {
-		p := r.allocatePort(env, sshPortName, used)
-		if p == 0 {
-			return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	// The pool is read only for an environment that draws from it, and that read
+	// is the reconcile's only use of the TCPRoute and ListenerSet kinds. Both
+	// arrive with their own CRDs (TCPRoute ships in the Gateway API's
+	// experimental channel, ListenerSet is separate again), so an install can
+	// carry the Gateway and the HTTPRoute without either: an environment with no
+	// L4 exposure publishes its HTTPRoute there without naming them, rather than
+	// failing with the NoMatch that a missing kind would otherwise raise.
+	if l4Exposed(env) {
+		used, err := r.usedPorts(ctx, env.Namespace, env.Name)
+		if err != nil {
+			return nil, nil, nil, err
 		}
-		ports[sshPortName] = p
-	}
-	for _, sp := range env.Spec.Ports {
-		if sp.Type != aiv1alpha1.PortTypeTCP {
-			continue
+		if sshExposed(env) {
+			p := r.allocatePort(env, sshPortName, used)
+			if p == 0 {
+				return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+			}
+			ports[sshPortName] = p
 		}
-		p := r.allocatePort(env, sp.Name, used)
-		if p == 0 {
-			return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+		for _, sp := range env.Spec.Ports {
+			if sp.Type != aiv1alpha1.PortTypeTCP {
+				continue
+			}
+			p := r.allocatePort(env, sp.Name, used)
+			if p == 0 {
+				return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+			}
+			ports[sp.Name] = p
 		}
-		ports[sp.Name] = p
 	}
 
 	// Drop routes for exposures removed since the last reconcile: the loop
@@ -2127,7 +2248,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 	// would be published either way — a route whose listener does not exist yet
 	// simply is not accepted — but creating the listener first means the
 	// environment never reports a state it has to be corrected out of.
-	l4, err := r.applyListenerSet(ctx, env, gw, allocatedPorts(ports))
+	l4Set, err := r.applyListenerSet(ctx, env, gw, allocatedPorts(ports))
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -2139,7 +2260,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 			return nil, nil, nil, err
 		}
 		published = append(published, publishedRoute{
-			kind: "HTTPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents,
+			kind: httpRouteKind, name: route.Name, generation: route.Generation, parents: route.Status.Parents,
 			parentKind: gatewayKind, parentName: gw.Name, parentNamespace: gw.Namespace,
 		})
 	}
@@ -2160,7 +2281,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 			parentKind: listenerSetKind, parentName: listenerSetName(env), parentNamespace: env.Namespace,
 		})
 	}
-	return ports, l4, published, nil
+	return ports, l4Set, published, nil
 }
 
 // allocatedPorts lists the external ports an environment's endpoints resolved
@@ -2305,13 +2426,16 @@ func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, exc
 }
 
 // allocatePort picks a port for the named endpoint, reusing the env's own
-// recorded port when it is still free (stable across restarts) and otherwise
-// the lowest free port in the configured range.
+// recorded listener port when it is still free (stable across restarts) and
+// otherwise the lowest free port in the configured range. The record is
+// status.endpoints[].listenerPort rather than the port in that endpoint's
+// address, which says where the endpoint is reachable, not which pool port the
+// environment holds.
 func (r *DevEnvironmentReconciler) allocatePort(env *aiv1alpha1.DevEnvironment, name string, used map[int32]bool) int32 {
 	cfg := r.defaultedConfig()
 	for _, ep := range env.Status.Endpoints {
 		if ep.Name == name {
-			if p := portFromEndpoint(ep.Address); p != 0 && p >= cfg.L4PortRangeStart && p <= cfg.L4PortRangeEnd && !used[p] {
+			if p := ep.ListenerPort; p >= cfg.L4PortRangeStart && p <= cfg.L4PortRangeEnd && !used[p] {
 				used[p] = true
 				return p
 			}
@@ -2324,21 +2448,6 @@ func (r *DevEnvironmentReconciler) allocatePort(env *aiv1alpha1.DevEnvironment, 
 		}
 	}
 	return 0
-}
-
-// portFromEndpoint extracts the trailing port from an endpoint address such as
-// "1.2.3.4:20001" or "ssh://user@1.2.3.4:20001"; it returns 0 when the
-// address has no parseable port.
-func portFromEndpoint(addr string) int32 {
-	i := strings.LastIndex(addr, ":")
-	if i < 0 {
-		return 0
-	}
-	n, err := strconv.Atoi(strings.TrimRight(addr[i+1:], "/"))
-	if err != nil {
-		return 0
-	}
-	return int32(n)
 }
 
 // desiredHTTPRoute renders the HTTPRoute: the web path prefix for the main
@@ -2580,20 +2689,28 @@ func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1a
 // acceptance can be read. With no ports there is no L4 exposure and the object
 // is removed instead: a listener left behind keeps its port claimed (see
 // usedPorts) and Gateway API would still prefer it as the older declaration.
+//
+// The ListenerSet kind arrives with its own CRD, so this is reached on clusters
+// that do not serve it, by environments that expose nothing on L4. Only the
+// removal path tolerates that (see below); declaring ports needs the kind, and
+// its NoMatch is left to report as the incomplete install it is.
 func (r *DevEnvironmentReconciler) applyListenerSet(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, ports []int32) (*gatewayv1.ListenerSet, error) {
 	existing := &gatewayv1.ListenerSet{}
 	err := r.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, existing)
-	notFound := apierrors.IsNotFound(err)
-	if err != nil && !notFound {
-		return nil, err
-	}
 
 	// No ports means no L4 exposure: remove the object rather than leave a
 	// listener behind, which would keep its port claimed (see usedPorts) and,
 	// being the older declaration, would win any conflict over a new owner's.
+	// "Nothing to remove" covers both a kind the cluster serves without the
+	// object and one it does not serve at all (NoMatch) — the latter is an
+	// install with no L4 in it, where no ListenerSet can exist to remove, and
+	// failing here would withhold the environment's HTTPRoute over it.
 	if len(ports) == 0 {
-		if notFound {
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			return nil, nil
+		}
+		if err != nil {
+			return nil, err
 		}
 		if err := ensureDevEnvOwned(existing, env); err != nil {
 			return nil, err
@@ -2601,6 +2718,10 @@ func (r *DevEnvironmentReconciler) applyListenerSet(ctx context.Context, env *ai
 		return nil, r.Delete(ctx, existing)
 	}
 
+	notFound := apierrors.IsNotFound(err)
+	if err != nil && !notFound {
+		return nil, err
+	}
 	desired := r.desiredListenerSet(env, gw, ports)
 	if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
 		return nil, err
@@ -2620,35 +2741,47 @@ func (r *DevEnvironmentReconciler) applyListenerSet(ctx context.Context, env *ai
 
 // buildEndpoints assembles status.endpoints from the published routes: the
 // web URL, the SSH address, and the extra http/tcp exposures.
-func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus, gwIP string, ports map[string]int32) {
+//
+// ports maps an endpoint name to the listener port its exposure holds in the L4
+// pool; external maps a listener port to the port it is reachable on at gwIP.
+// The two differ under a NodePort dataplane, and both are recorded: external in
+// the address, so that it works, and ports in listenerPort, so that the
+// allocator can hand the same listener back on the next reconcile.
+func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus, gwIP string, ports map[string]int32, external map[int32]int32) {
 	cfg := r.defaultedConfig()
 	// JoinHostPort brackets a literal IPv6 gateway address ([::1]:80); a plain
 	// fmt "%s:%d" would produce an invalid URL.
-	httpHostPort := net.JoinHostPort(gwIP, strconv.Itoa(int(cfg.HTTPPort)))
+	hostPort := func(port int32) string {
+		return net.JoinHostPort(gwIP, strconv.Itoa(int(external[port])))
+	}
 	status.Endpoints = nil
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
-			Name:    string(env.Spec.Type),
-			Address: "http://" + httpHostPort + fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name),
+			Name:         string(env.Spec.Type),
+			Address:      "http://" + hostPort(cfg.HTTPPort) + fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name),
+			ListenerPort: cfg.HTTPPort,
 		})
 	}
 	if sshExposed(env) {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
-			Name:    sshPortName,
-			Address: fmt.Sprintf("ssh://%s@%s", runtimeUser(env), net.JoinHostPort(gwIP, strconv.Itoa(int(ports[sshPortName])))),
+			Name:         sshPortName,
+			Address:      fmt.Sprintf("ssh://%s@%s", runtimeUser(env), hostPort(ports[sshPortName])),
+			ListenerPort: ports[sshPortName],
 		})
 	}
 	for _, p := range env.Spec.Ports {
 		switch p.Type {
 		case aiv1alpha1.PortTypeHTTP:
 			status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
-				Name:    p.Name,
-				Address: "http://" + httpHostPort + fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, p.Name),
+				Name:         p.Name,
+				Address:      "http://" + hostPort(cfg.HTTPPort) + fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, p.Name),
+				ListenerPort: cfg.HTTPPort,
 			})
 		case aiv1alpha1.PortTypeTCP:
 			status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
-				Name:    p.Name,
-				Address: net.JoinHostPort(gwIP, strconv.Itoa(int(ports[p.Name]))),
+				Name:         p.Name,
+				Address:      hostPort(ports[p.Name]),
+				ListenerPort: ports[p.Name],
 			})
 		}
 	}

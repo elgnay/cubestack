@@ -24,6 +24,7 @@ import (
 	"encoding/pem"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -372,10 +373,25 @@ func devEnvTCPRoutePorts(g Gomega, envName string) []int32 {
 func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
 	for _, ep := range endpoints {
 		if ep.Name == sshPortName {
-			return portFromEndpoint(ep.Address)
+			return ep.ListenerPort
 		}
 	}
 	return 0
+}
+
+// addressPort extracts the trailing port from a published address such as
+// "1.2.3.4:20001" or "[2001:db8::1]:20001"; it returns 0 when the address has
+// no parseable port.
+func addressPort(addr string) int32 {
+	i := strings.LastIndex(addr, ":")
+	if i < 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(strings.TrimRight(addr[i+1:], "/"))
+	if err != nil {
+		return 0
+	}
+	return int32(n)
 }
 
 // listEventsForEnv returns the events.k8s.io/v1 Events recorded for the named
@@ -423,13 +439,22 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			return &aiv1alpha1.DevEnvironment{
 				ObjectMeta: metav1.ObjectMeta{Name: "e", Namespace: "ns"},
 				Status: aiv1alpha1.DevEnvironmentStatus{Endpoints: []aiv1alpha1.Endpoint{
-					{Name: sshPortName, Address: fmt.Sprintf("1.2.3.4:%d", port)},
+					{Name: sshPortName, Address: fmt.Sprintf("1.2.3.4:%d", port), ListenerPort: port},
 				}},
 			}
 		}
 
 		It("keeps the environment's own recorded port when it is still free", func() {
 			Expect(r.allocatePort(envWithSSHEndpoint(20001), sshPortName, used(20002))).To(Equal(int32(20001)))
+		})
+
+		It("reuses the recorded listener port even when the address carries another port", func() {
+			// A NodePort dataplane renumbers the endpoint's address away from the
+			// listener port the pool allocated; the allocation is the listener port,
+			// so the environment keeps it rather than being handed a lower free one.
+			env := envWithSSHEndpoint(20001)
+			env.Status.Endpoints[0].Address = "1.2.3.4:31001"
+			Expect(r.allocatePort(env, sshPortName, used(20000))).To(Equal(int32(20001)))
 		})
 
 		It("skips ports used by other environments and picks the lowest free", func() {
@@ -1273,7 +1298,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 						SecretName:  sshAuthorizedKeysSecretName(env),
 						DefaultMode: ptrTo(int32(0o644)),
-						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
 					}},
 				},
 			}))
@@ -1333,7 +1358,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 						SecretName:  sshAuthorizedKeysSecretName(env),
 						DefaultMode: ptrTo(int32(0o644)),
-						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
 					}},
 				},
 			}))
@@ -1586,6 +1611,18 @@ var _ = Describe("DevEnvironmentReconciler construction", func() {
 		}
 		Expect(r.SetupWithManager(testMgr)).To(
 			MatchError(ContainSubstring("L4 port range is empty")))
+	})
+
+	It("rejects an L4 port range outside the port numbers", func() {
+		// A range that is ordered but out of bounds reaches the ListenerSet as
+		// a port the dataplane cannot listen on. The command-line flags reject
+		// it too, but this is the last guard before it is used, and it is the
+		// one a directly constructed controller meets.
+		r := &DevEnvironmentReconciler{
+			Config: DevEnvironmentControllerConfig{L4PortRangeStart: 20000, L4PortRangeEnd: 70000},
+		}
+		Expect(r.SetupWithManager(testMgr)).To(
+			MatchError(ContainSubstring("outside the usable ports")))
 	})
 })
 
@@ -2084,9 +2121,9 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				// status names the authorized-keys Secret: the one carrying the key
 				// its owner logs in with, not the platform's host identity.
-				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: sshAuthorizedKeysSecretName(env)},
-					Key:                  sshAuthorizedKeysKey,
+				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretReference{
+					Name:      sshAuthorizedKeysSecretName(env),
+					Namespace: testNamespace,
 				}))
 
 				host := &corev1.Secret{}
@@ -2102,9 +2139,11 @@ var _ = Describe("DevEnvironment controller", func() {
 				login := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), login)).To(Succeed())
 				g.Expect(sshKeyPairMatches(login.Data[sshClientKeyKey], login.Data[sshClientPubKeyKey])).To(BeTrue())
-				// authorized_keys is exactly the public half of that key, which is
-				// what makes the private half usable for a login.
-				g.Expect(login.Data[sshAuthorizedKeysKey]).To(Equal(login.Data[sshClientPubKeyKey]))
+				// The public half is what the mount takes, so a login works without
+				// the controller keeping a second copy of it under another name — and
+				// the Secret carries the keypair and nothing else.
+				g.Expect(login.Data).To(HaveLen(2))
+				g.Expect(login.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
 				// Two independent keypairs: the login key is not the host key.
 				g.Expect(login.Data[sshClientPubKeyKey]).NotTo(Equal(host.Data[sshHostPubKeyKey]))
 			}, "15s", "200ms").Should(Succeed())
@@ -2139,9 +2178,9 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  testUserKeysKey,
+				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretReference{
+					Name:      keys.Name,
+					Namespace: testNamespace,
 				}))
 
 				host := &corev1.Secret{}
@@ -2386,9 +2425,8 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteEnv(env.Name)
 
 			// The same guard, one Secret over. The recovery has to come back with a
-			// readable login keypair and an authorized_keys entry that still matches
-			// it — otherwise the private key its owner already downloaded would stop
-			// logging in.
+			// readable login keypair — otherwise the private key its owner already
+			// downloaded would stop logging in — and with that keypair alone.
 			emptied := &corev1.Secret{}
 			Eventually(func(g Gomega) {
 				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), emptied)).To(Succeed())
@@ -2400,7 +2438,32 @@ var _ = Describe("DevEnvironment controller", func() {
 				s := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), s)).To(Succeed())
 				g.Expect(sshKeyPairMatches(s.Data[sshClientKeyKey], s.Data[sshClientPubKeyKey])).To(BeTrue())
-				g.Expect(s.Data[sshAuthorizedKeysKey]).To(Equal(s.Data[sshClientPubKeyKey]))
+				g.Expect(s.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// An environment that predates the mount change carries a copy of the login
+		// public key under authorized_keys. Nothing reads it any more, and leaving
+		// it would show a second entry that looks like the one to edit.
+		It("drops the stale authorized_keys copy from a generated keys Secret", func() {
+			env := validDevEnvironment("de-ssh-authkeys-stale")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			keys := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), keys)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			keys.Data[sshAuthorizedKeysKey] = append([]byte(nil), keys.Data[sshClientPubKeyKey]...)
+			Expect(k8sClient.Update(ctx, keys)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), s)).To(Succeed())
+				g.Expect(s.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
+				g.Expect(sshKeyPairMatches(s.Data[sshClientKeyKey], s.Data[sshClientPubKeyKey])).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3132,7 +3195,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				pGRPC = 0
 				for _, ep := range got.Status.Endpoints {
 					if ep.Name == testGRPCPortName {
-						pGRPC = portFromEndpoint(ep.Address)
+						pGRPC = ep.ListenerPort
 					}
 				}
 				g.Expect(pSSH).To(BeNumerically(">", 0))
@@ -3179,10 +3242,10 @@ var _ = Describe("DevEnvironment controller", func() {
 			got := &aiv1alpha1.DevEnvironment{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 			Expect(got.Status.Endpoints).To(ContainElements(
-				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/"},
-				aiv1alpha1.Endpoint{Name: "ssh", Address: fmt.Sprintf("ssh://%s@%s:%d", defaultRuntimeUser, testGatewayIP, pSSH)},
-				aiv1alpha1.Endpoint{Name: "metrics", Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/"},
-				aiv1alpha1.Endpoint{Name: testGRPCPortName, Address: fmt.Sprintf("%s:%d", testGatewayIP, pGRPC)},
+				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/", ListenerPort: 80},
+				aiv1alpha1.Endpoint{Name: "ssh", Address: fmt.Sprintf("ssh://%s@%s:%d", defaultRuntimeUser, testGatewayIP, pSSH), ListenerPort: pSSH},
+				aiv1alpha1.Endpoint{Name: "metrics", Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/", ListenerPort: 80},
+				aiv1alpha1.Endpoint{Name: testGRPCPortName, Address: fmt.Sprintf("%s:%d", testGatewayIP, pGRPC), ListenerPort: pGRPC},
 			))
 		})
 
@@ -3469,7 +3532,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				pSSH = sshEndpointPort(got.Status.Endpoints)
 				for _, ep := range got.Status.Endpoints {
 					if ep.Name == testGRPCPortName {
-						pGRPC = portFromEndpoint(ep.Address)
+						pGRPC = ep.ListenerPort
 					}
 				}
 				g.Expect(pSSH).To(BeNumerically(">", 0))
@@ -3513,7 +3576,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				p2 := int32(0)
 				for _, ep := range got2.Status.Endpoints {
 					if ep.Name == testGRPCPortName {
-						p2 = portFromEndpoint(ep.Address)
+						p2 = ep.ListenerPort
 					}
 				}
 				g.Expect(p2).To(Equal(pGRPC))
@@ -3726,9 +3789,201 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(web).To(Equal("http://[2001:db8::1]:80" + webRootPath + env.Name + "/"))
 				g.Expect(ssh).To(HavePrefix("ssh://" + defaultRuntimeUser + "@[2001:db8::1]:"))
 				g.Expect(tcp).To(HavePrefix("[2001:db8::1]:"))
-				g.Expect(portFromEndpoint(tcp)).To(BeNumerically(">", 0))
-				g.Expect(portFromEndpoint(ssh)).To(BeNumerically(">", 0))
+				g.Expect(addressPort(tcp)).To(BeNumerically(">", 0))
+				g.Expect(addressPort(ssh)).To(BeNumerically(">", 0))
 			}, "15s", "200ms").Should(Succeed())
 		})
+	})
+})
+
+// The dataplane Service is how a published endpoint learns where it is actually
+// reachable: Envoy Gateway creates it, and its type decides whether a listener
+// is served on its own port (LoadBalancer, ClusterIP) or renumbered onto a
+// nodePort (NodePort). These specs create it by hand, since envtest runs no
+// Envoy Gateway. It lives in the dataplane namespace, which is deliberately not
+// the Gateway's own.
+var _ = Describe("published endpoint ports", func() {
+	dataplaneName := "envoy-" + testNamespace + "-" + testDevEnvGatewayName
+
+	// createDataplaneService publishes the Service Envoy Gateway would own for
+	// the test Gateway, labelled the way the controller looks it up.
+	createDataplaneService := func(svcType corev1.ServiceType, ports []corev1.ServicePort) {
+		Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, &corev1.Namespace{
+			ObjectMeta: metav1.ObjectMeta{Name: testGatewayDataplaneNamespace},
+		}))).To(Succeed())
+		Expect(k8sClient.Create(ctx, &corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      dataplaneName,
+				Namespace: testGatewayDataplaneNamespace,
+				Labels: map[string]string{
+					gatewayDataplaneNameLabel:      testDevEnvGatewayName,
+					gatewayDataplaneNamespaceLabel: testNamespace,
+				},
+			},
+			Spec: corev1.ServiceSpec{Type: svcType, Ports: ports},
+		})).To(Succeed())
+	}
+	deleteDataplaneService := func() {
+		_ = k8sClient.Delete(ctx, &corev1.Service{ObjectMeta: metav1.ObjectMeta{
+			Name: dataplaneName, Namespace: testGatewayDataplaneNamespace}})
+	}
+	// nodePortFor is the nodePort this dataplane hands its nth listener, lowest
+	// listener port first, so the specs state the relationship rather than a
+	// pairing that only holds while the pool is empty.
+	nodePortFor := func(i int) int32 { return int32(31000 + i) }
+
+	// listenerPortsOf waits for the environment's listeners to exist and returns
+	// the pool ports they hold, sorted.
+	listenerPortsOf := func(envName string, want int) []int32 {
+		var ports []int32
+		Eventually(func(g Gomega) {
+			stampDevEnvRoutes(g, envName, true, "", "")
+			ports = devEnvTCPRoutePorts(g, envName)
+			g.Expect(ports).To(HaveLen(want))
+		}, "15s", "200ms").Should(Succeed())
+		slices.Sort(ports)
+		return ports
+	}
+
+	// programListenerSet writes the verdict the gateway reaches once a listener is
+	// in its dataplane. That write is what re-enqueues the environment after the
+	// dataplane Service changes underneath it: the controller watches the
+	// environment's own objects, and the shared dataplane Service is not one.
+	programListenerSet := func(envName string) {
+		ls := &gatewayv1.ListenerSet{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: envName + l4ListenerSetSuffix, Namespace: testNamespace}, ls)).To(Succeed())
+		ls.Status.Conditions = append(ls.Status.Conditions, metav1.Condition{
+			Type:               string(gatewayv1.ListenerSetConditionProgrammed),
+			Status:             metav1.ConditionTrue,
+			Reason:             string(gatewayv1.ListenerSetReasonProgrammed),
+			ObservedGeneration: ls.Generation,
+			LastTransitionTime: testRouteConditionTime,
+		})
+		Expect(k8sClient.Status().Update(ctx, ls)).To(Succeed())
+	}
+
+	newSSHEnvironment := func(name string, extra ...aiv1alpha1.PortSpec) *aiv1alpha1.DevEnvironment {
+		env := validDevEnvironment(name)
+		env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+		env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+		env.Spec.Ports = extra
+		Expect(k8sClient.Create(ctx, env)).To(Succeed())
+		return env
+	}
+
+	It("publishes the nodePort the dataplane renumbers the listener onto, keeping the listener port", func() {
+		createGateway(true)
+		defer deleteGateway()
+
+		env := newSSHEnvironment("de-nodeport", aiv1alpha1.PortSpec{
+			Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051,
+		})
+		defer deleteEnv(env.Name)
+
+		// Before any dataplane exists the listener port is all there is, and that
+		// is what an address is built from.
+		listenerPorts := listenerPortsOf(env.Name, 2)
+		Eventually(func(g Gomega) {
+			stampDevEnvRoutes(g, env.Name, true, "", "")
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(got.Status.Endpoints).To(HaveLen(2))
+			for _, ep := range got.Status.Endpoints {
+				g.Expect(ep.ListenerPort).To(Equal(addressPort(ep.Address)))
+			}
+		}, "15s", "200ms").Should(Succeed())
+
+		// The dataplane arrives as a NodePort Service: every listener moves to its
+		// nodePort, and the allocation underneath it does not move at all.
+		ports := make([]corev1.ServicePort, 0, 1+len(listenerPorts))
+		ports = append(ports, corev1.ServicePort{Name: testPortName, Port: 80, NodePort: 31080})
+		for i, p := range listenerPorts {
+			ports = append(ports, corev1.ServicePort{Name: fmt.Sprintf("tcp-%d", p), Port: p, NodePort: nodePortFor(i)})
+		}
+		createDataplaneService(corev1.ServiceTypeNodePort, ports)
+		defer deleteDataplaneService()
+		programListenerSet(env.Name)
+
+		// The routes carry their verdict from above, so this waits on the
+		// renumbering alone rather than re-stamping them each round.
+		Eventually(func(g Gomega) {
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			g.Expect(got.Status.Endpoints).To(HaveLen(2))
+
+			// The listeners still hold the pool ports, which is what makes the next
+			// reconcile hand the environment the same ones — and so the same
+			// addresses — rather than reallocating around it.
+			ls := &gatewayv1.ListenerSet{}
+			g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: testNamespace}, ls)).To(Succeed())
+			g.Expect(ls.Spec.Listeners).To(HaveLen(len(listenerPorts)))
+			for i, l := range ls.Spec.Listeners {
+				g.Expect(l.Port).To(Equal(listenerPorts[i]))
+			}
+
+			published := map[int32]bool{}
+			for _, ep := range got.Status.Endpoints {
+				g.Expect(ep.ListenerPort).To(BeElementOf(listenerPorts))
+				g.Expect(addressPort(ep.Address)).To(Equal(nodePortFor(slices.Index(listenerPorts, ep.ListenerPort))))
+				published[ep.ListenerPort] = true
+			}
+			g.Expect(published).To(HaveLen(len(listenerPorts)))
+		}, "15s", "200ms").Should(Succeed())
+	})
+
+	It("keeps the address on the listener port when the dataplane is not a NodePort", func() {
+		createGateway(true)
+		defer deleteGateway()
+
+		env := newSSHEnvironment("de-lb-dataplane")
+		defer deleteEnv(env.Name)
+
+		listenerPorts := listenerPortsOf(env.Name, 1)
+		createDataplaneService(corev1.ServiceTypeLoadBalancer, []corev1.ServicePort{
+			{Name: testPortName, Port: 80},
+			{Name: fmt.Sprintf("tcp-%d", listenerPorts[0]), Port: listenerPorts[0]},
+		})
+		defer deleteDataplaneService()
+
+		Eventually(func(g Gomega) {
+			stampDevEnvRoutes(g, env.Name, true, "", "")
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			g.Expect(sshEndpointPort(got.Status.Endpoints)).To(Equal(listenerPorts[0]))
+			for _, ep := range got.Status.Endpoints {
+				g.Expect(ep.ListenerPort).To(Equal(listenerPorts[0]))
+				g.Expect(addressPort(ep.Address)).To(Equal(listenerPorts[0]))
+			}
+		}, "15s", "200ms").Should(Succeed())
+	})
+
+	It("withholds endpoints when the dataplane exposes no nodePort for the listener", func() {
+		createGateway(true)
+		defer deleteGateway()
+
+		env := newSSHEnvironment("de-nodeport-gap")
+		defer deleteEnv(env.Name)
+
+		// A NodePort dataplane carrying only the Gateway's HTTP listener: the ssh
+		// listener the environment allocated has no nodePort to be published at,
+		// and a listener port would name a port that is closed on the node.
+		createDataplaneService(corev1.ServiceTypeNodePort, []corev1.ServicePort{
+			{Name: testPortName, Port: 80, NodePort: 31080},
+		})
+		defer deleteDataplaneService()
+
+		Eventually(func(g Gomega) {
+			stampDevEnvRoutes(g, env.Name, true, "", "")
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+			g.Expect(cond).NotTo(BeNil())
+			g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			g.Expect(cond.Reason).To(Equal(reasonGatewayNotReady))
+			g.Expect(cond.Message).To(ContainSubstring("exposes no nodePort"))
+			g.Expect(got.Status.Endpoints).To(BeEmpty())
+		}, "15s", "200ms").Should(Succeed())
 	})
 })

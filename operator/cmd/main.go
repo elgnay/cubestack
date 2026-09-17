@@ -19,6 +19,7 @@ package main
 import (
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
@@ -77,8 +78,10 @@ func main() {
 	flag.StringVar(&gatewayName, "gateway-name", "", "Name of the platform Gateway published HTTPRoutes attach to.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "cubestack-system", "Namespace of the platform Gateway.")
 	flag.StringVar(&gatewayDataplaneNamespace, "gateway-dataplane-namespace", "",
-		"Namespace the platform Gateway's dataplane pods run in; when set, DevEnvironment pods admit "+
-			"ingress from that Gateway. Leaving it empty keeps environments default-deny inbound.")
+		"Namespace the platform Gateway's dataplane Service and pods run in; when set, DevEnvironment "+
+			"pods admit ingress from that Gateway, and published endpoints are addressed at the port "+
+			"its dataplane Service exposes them on. Leaving it empty keeps environments default-deny "+
+			"inbound, and addresses on their listener ports.")
 	flag.IntVar(&l4PortRangeStart, "l4-port-range-start", 20000,
 		"First port of the DevEnvironment L4 port pool. Each allocated port becomes a listener the "+
 			"environment's own ListenerSet declares on the platform Gateway.")
@@ -107,6 +110,24 @@ func main() {
 	flag.Parse()
 
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+
+	// Both port flags are narrowed to int32 for the controller below, so a value
+	// that is not a port has to be rejected while it is still an int: out of
+	// range the conversion wraps, and 0 is the controller's "unset" sentinel —
+	// an oversized start would silently come back as the default pool. Zero is
+	// that sentinel and stays valid, meaning "use the configured default".
+	for _, f := range [...]struct {
+		name  string
+		value int
+	}{
+		{"l4-port-range-start", l4PortRangeStart},
+		{"l4-port-range-end", l4PortRangeEnd},
+	} {
+		if f.value != 0 && (f.value < 1 || f.value > 65535) {
+			setupLog.Error(fmt.Errorf("--%s must be a port between 1 and 65535, got %d", f.name, f.value), "Invalid flag")
+			os.Exit(1)
+		}
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will

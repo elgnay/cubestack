@@ -254,8 +254,8 @@ func (in *DevEnvironmentStatus) DeepCopyInto(out *DevEnvironmentStatus) {
 	}
 	if in.SSHKeysSecret != nil {
 		in, out := &in.SSHKeysSecret, &out.SSHKeysSecret
-		*out = new(v1.SecretKeySelector)
-		(*in).DeepCopyInto(*out)
+		*out = new(v1.SecretReference)
+		**out = **in
 	}
 	if in.LastActivityTime != nil {
 		in, out := &in.LastActivityTime, &out.LastActivityTime

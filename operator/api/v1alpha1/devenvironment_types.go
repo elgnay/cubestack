@@ -376,13 +376,15 @@ type DevEnvironmentStatus struct {
 	// SSHKeysSecret is the Secret the environment's SSH authorized_keys come
 	// from: the user-provided one from spec.ssh.keysSecret, or a
 	// controller-generated one. It is recorded in status so the user can retrieve
-	// generated keys. The key named here is the data entry mounted at
-	// /run/ssh/authorized_keys (the volume renames it); rotating that entry reaches
-	// a running container without a restart. In the generated case the same Secret
-	// also carries the private key to log in with, as id_ed25519. The environment's
-	// host key is not here: it lives in the separate <env>-ssh-host-key Secret.
+	// generated keys. Which data entry holds what depends on the case: with a
+	// keysSecret of its own, the authorized_keys content is the entry that
+	// selector names, and the Secret is mounted as it is. The generated Secret
+	// instead holds a login keypair: id_ed25519, the private half to log in with,
+	// and id_ed25519.pub, which is what the container mounts as authorized_keys.
+	// The environment's host key is not here: it lives in the separate
+	// <env>-ssh-host-key Secret.
 	// +optional
-	SSHKeysSecret *corev1.SecretKeySelector `json:"sshKeysSecret,omitempty"`
+	SSHKeysSecret *corev1.SecretReference `json:"sshKeysSecret,omitempty"`
 
 	// LastActivityTime is the last activity time, used for idle timeout
 	// determination.
@@ -410,14 +412,26 @@ type Endpoint struct {
 	Name string `json:"name"`
 
 	// Address is the access address: a URL for web (e.g.
-	// http://<gw-ip>:80/dev/<ns>/<env>/), or a host:port for SSH and tcp/udp
-	// ports (e.g. ssh://user@<gw-ip>:<port>).
+	// http://<gw-ip>:<port>/dev/<ns>/<env>/), or a host:port for SSH and tcp/udp
+	// ports (e.g. ssh://user@<gw-ip>:<port>). The port is the one the address is
+	// reachable on, which is not ListenerPort when the Gateway's dataplane
+	// Service is a NodePort Service.
 	Address string `json:"address"`
+
+	// ListenerPort is the Gateway listener port the endpoint is published on: the
+	// port the environment's ListenerSet declares, or the Gateway's HTTP listener
+	// port for the web endpoint. The controller reuses it across reconciles, so
+	// the environment keeps the same listener — and therefore the same Address —
+	// for as long as the exposure exists. It is not necessarily the port in
+	// Address: a NodePort dataplane renumbers each listener onto a port from the
+	// cluster's node-port range.
+	// +optional
+	ListenerPort int32 `json:"listenerPort,omitempty"`
 }
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Namespaced
+// +kubebuilder:resource:scope=Namespaced,shortName=devenv
 
 // DevEnvironment is the Schema for the devenvironments API.
 //
