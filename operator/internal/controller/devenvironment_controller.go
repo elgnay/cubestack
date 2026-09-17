@@ -729,18 +729,17 @@ func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
 
 // sshAuthorizedKeysSource is the name and data key of the Secret the pod mounts
 // as /run/ssh/authorized_keys: the user's delegated Secret when the spec names
-// one, else the controller-generated <env>-ssh-authorized-keys. In the delegated
-// case the key is the user's own selector key; the CRD requires it, so
-// sshUserKeysDefaultKey only stands in for the empty key of an object built
-// without that validation. The generated case uses sshAuthorizedKeysKey.
+// one, at the data key its selector names, else the controller-generated
+// <env>-ssh-authorized-keys at sshAuthorizedKeysKey.
+//
+// The delegated key is always non-empty: the CRD requires the field and rejects
+// an empty one, so there is nothing here to fall back to — substituting an entry
+// of our own would mount a file the spec never named.
 //
 // The reconciler and desiredPodSpec both call this, so the entry the pod mounts
 // can never disagree with the entry the reconciler validates.
 func sshAuthorizedKeysSource(env *aiv1alpha1.DevEnvironment) (name, key string) {
 	if ks := sshUserKeysRef(env); ks != nil {
-		if ks.Key == "" {
-			return ks.Name, sshUserKeysDefaultKey
-		}
 		return ks.Name, ks.Key
 	}
 	return sshAuthorizedKeysSecretName(env), sshAuthorizedKeysKey

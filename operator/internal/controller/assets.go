@@ -62,10 +62,9 @@ const (
 	// authorized-keys source holds the content the workload mounts as
 	// authorized_keys — the user's Secret when spec.ssh.keysSecret names one, at
 	// the data key its selector names, else a controller-generated one.
-	sshHostKeyKey         = "ssh_host_ed25519_key"
-	sshHostPubKeyKey      = "ssh_host_ed25519_key.pub"
-	sshAuthorizedKeysKey  = "authorized_keys"
-	sshUserKeysDefaultKey = "keys"
+	sshHostKeyKey        = "ssh_host_ed25519_key"
+	sshHostPubKeyKey     = "ssh_host_ed25519_key.pub"
+	sshAuthorizedKeysKey = "authorized_keys"
 
 	// The generated login keypair, written only into the controller-generated
 	// authorized-keys Secret: the private key its owner can retrieve through

@@ -66,8 +66,12 @@ const (
 	testRuntimeUser       = "jovyan"
 	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 	// testUserKeysSecret is the user-supplied authorized-keys Secret the case-2
-	// specs reference by name.
+	// specs reference by name; testUserKeysKey is the data entry its selector
+	// names. Deliberately not "keys": the delegated key is whatever the selector
+	// says, and a fixture named after the retired default would pass even if the
+	// controller ignored it.
 	testUserKeysSecret = "dev-alice-ssh-keys"
+	testUserKeysKey    = "team-keys"
 	// testSSHUser is the account the self-authored ssh images ship, selected
 	// with spec.runtime.user; testSSHHome is the home it implies.
 	testSSHUser = "ubuntu"
@@ -1098,13 +1102,14 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 
 		// With keysSecret of its own the environment supplies the authorized keys,
-		// so that mount follows the selector — including its defaulted data key —
-		// rather than a name the controller generates.
+		// so that mount follows the selector's data key rather than a name the
+		// controller generates.
 		It("mounts the referenced keys Secret under the selector's data key", func() {
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 				e.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true, KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: testUserKeysSecret},
+					Key:                  testUserKeysKey,
 				}}
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
@@ -1116,7 +1121,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 					SecretName:  testUserKeysSecret,
 					DefaultMode: ptrTo(int32(0o644)),
-					Items:       []corev1.KeyToPath{{Key: sshUserKeysDefaultKey, Path: sshAuthorizedKeysFile}},
+					Items:       []corev1.KeyToPath{{Key: testUserKeysKey, Path: sshAuthorizedKeysFile}},
 				}},
 			}))
 		})
@@ -1720,7 +1725,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -1731,7 +1736,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -1742,7 +1747,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				}))
 
 				host := &corev1.Secret{}
@@ -1757,7 +1762,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				// it, it does not copy out of it.
 				fresh := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(keys.Name), fresh)).To(Succeed())
-				g.Expect(fresh.Data).To(Equal(map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)}))
+				g.Expect(fresh.Data).To(Equal(map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)}))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -1773,7 +1778,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -1784,7 +1789,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -1803,7 +1808,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
 					To(Equal(sshHostKeyDigest(host.Data[sshHostKeyKey])))
 				g.Expect(sts.Spec.Template.Spec.Volumes[1].Secret.Items).
-					To(Equal([]corev1.KeyToPath{{Key: sshUserKeysDefaultKey, Path: sshAuthorizedKeysFile}}))
+					To(Equal([]corev1.KeyToPath{{Key: testUserKeysKey, Path: sshAuthorizedKeysFile}}))
 				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
 			}, "15s", "200ms").Should(Succeed())
 
@@ -1813,7 +1818,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			// template at all.
 			freshKeys := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, envKey(keys.Name), freshKeys)).To(Succeed())
-			freshKeys.Data[sshUserKeysDefaultKey] = []byte(rotated)
+			freshKeys.Data[testUserKeysKey] = []byte(rotated)
 			Expect(k8sClient.Update(ctx, freshKeys)).To(Succeed())
 
 			// Deleting the StatefulSet is what makes that checkable: the reconcile
@@ -1854,7 +1859,7 @@ var _ = Describe("DevEnvironment controller", func() {
 						Namespace: testNamespace,
 						Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 					},
-					Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+					Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 				}
 			}
 			first := newKeysSecret("dev-repoint-first-keys")
@@ -1872,7 +1877,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: first.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -2012,7 +2017,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			// environment creator read any same-namespace Secret from inside it.
 			leaked := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "dev-secret-undelegated", Namespace: testNamespace},
-				Data:       map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data:       map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, leaked)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, leaked) }()
@@ -2023,7 +2028,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: leaked.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -2065,7 +2070,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: wrong.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -2120,7 +2125,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -2149,7 +2154,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Update(ctx, spec)).To(Succeed())
@@ -2703,7 +2708,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -2713,7 +2718,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			env.Spec.Ports = []aiv1alpha1.PortSpec{

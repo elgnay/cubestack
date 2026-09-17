@@ -397,6 +397,9 @@ spec:
                     - key
                     type: object
                     x-kubernetes-map-type: atomic
+                    x-kubernetes-validations:
+                    - message: key must name the Secret data entry the container mounts
+                      rule: self.key != ''
                 type: object
               storage:
                 description: |-

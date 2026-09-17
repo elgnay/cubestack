@@ -215,6 +215,7 @@ type SSHSpec struct {
 	// Otherwise the controller generates the host identity and a login keypair,
 	// and status.sshKeysSecret names the Secret holding the latter. The plaintext
 	// is never stored in spec.
+	// +kubebuilder:validation:XValidation:rule="self.key != ''",message="key must name the Secret data entry the container mounts"
 	// +optional
 	KeysSecret *corev1.SecretKeySelector `json:"keysSecret,omitempty"`
 }
