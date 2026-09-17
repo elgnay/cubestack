@@ -150,9 +150,12 @@ const (
 	// sshPortName names the SSH Service port and the "ssh" endpoint; the ssh
 	// endpoint address carries the environment's login account, which is
 	// spec.runtime.user or defaultRuntimeUser when the spec names none.
-	sshPortName       = "ssh"
-	mainPortName      = "main"
-	sshKeysVolumeName = "ssh-keys"
+	sshPortName  = "ssh"
+	mainPortName = "main"
+	// The ssh material arrives as two Secrets — the host identity and the
+	// authorized keys — so it is two volumes and one mount each.
+	sshHostKeyVolumeName        = "ssh-host-key"
+	sshAuthorizedKeysVolumeName = "ssh-authorized-keys"
 
 	// sshServicePort is the port the platform publishes ssh on — the Service
 	// port, the TCPRoute backendRef and the endpoint address — while
@@ -322,10 +325,10 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpuType matches the image brand")
 	}
 
-	// 2. SSH secret: a managed host keypair + authorized_keys when SSH is
-	// exposed (design §6.3).
+	// 2. SSH secrets: a managed host keypair and the authorized_keys source when
+	// SSH is exposed (design §6.3).
 	if sshExposed(&env) {
-		keysSecret, digest, err := r.reconcileSSHSecret(ctx, &env)
+		keysSecret, digest, err := r.reconcileSSHSecrets(ctx, &env)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -445,7 +448,11 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 	for _, obj := range []client.Object{
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshSecretName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshHostKeySecretName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshAuthorizedKeysSecretName(env), Namespace: env.Namespace}},
+		// The pre-split bundled Secret: nothing creates it any more, but an
+		// environment created before the split still has one.
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshLegacySecretName(env), Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: authSecretName(env), Namespace: env.Namespace}},
 	} {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
@@ -695,6 +702,33 @@ func sshExposed(env *aiv1alpha1.DevEnvironment) bool {
 		return true
 	}
 	return env.Spec.SSH != nil && env.Spec.SSH.Enabled
+}
+
+// sshUserKeysRef is the delegated Secret the environment takes its authorized
+// keys from, or nil when the controller generates them instead.
+func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
+	if env.Spec.SSH == nil {
+		return nil
+	}
+	return env.Spec.SSH.KeysSecret
+}
+
+// sshAuthorizedKeysSource is the name and data key of the Secret the pod mounts
+// at sshAuthorizedKeysPath: the user's delegated Secret when the spec names one,
+// else the controller-generated <env>-ssh-authorized-keys. The key is the user's
+// own selector key, defaulting to sshUserKeysDefaultKey, or
+// sshAuthorizedKeysKey when the controller generates the content.
+//
+// The reconciler and desiredPodSpec both call this, so the entry the pod mounts
+// can never disagree with the entry the revision digest hashes.
+func sshAuthorizedKeysSource(env *aiv1alpha1.DevEnvironment) (name, key string) {
+	if ks := sshUserKeysRef(env); ks != nil {
+		if ks.Key == "" {
+			return ks.Name, sshUserKeysDefaultKey
+		}
+		return ks.Name, ks.Key
+	}
+	return sshAuthorizedKeysSecretName(env), sshAuthorizedKeysKey
 }
 
 // mainContainerPort is the primary container port by type: jupyter 8888,
@@ -1056,21 +1090,25 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 	if sshExposed(env) {
 		// The images read the ssh material in place — no staging, no copy, no
-		// chmod (images/README.md) — so the Secret's keys are mounted as files
-		// with subPath: the host key where sshd looks for its identity, and the
-		// platform keys at the absolute path the images' AuthorizedKeysFile names.
-		// Neither needs a directory to exist in the image: the runtime creates a
-		// file mount target's parent. DefaultMode stays 0644: the files are
-		// root-owned and OpenSSH only enforces its private-key check on files owned
-		// by the uid reading them, so a tighter mode would make a non-root sshd
-		// exit with "no hostkeys available".
+		// chmod (images/README.md) — so each Secret's single relevant key is
+		// mounted as a file with subPath: the host key where sshd looks for its
+		// identity, and the authorized keys at the absolute path the images'
+		// AuthorizedKeysFile names. Only the named entry is materialised, so the
+		// generated login private key — which lives in the same Secret as the
+		// authorized_keys entry it signs for — never enters the container.
+		// Neither mount needs a directory to exist in the image: the runtime
+		// creates a file mount target's parent. DefaultMode stays 0644: the files
+		// are root-owned and OpenSSH only enforces its private-key check on files
+		// owned by the uid reading them, so a tighter mode would make a non-root
+		// sshd exit with "no hostkeys available".
+		_, authorizedKey := sshAuthorizedKeysSource(env)
 		container.VolumeMounts = append(container.VolumeMounts,
 			corev1.VolumeMount{
-				Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true,
+				Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true,
 			},
 			corev1.VolumeMount{
-				Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath,
-				SubPath: sshAuthorizedKeysKey, ReadOnly: true,
+				Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysPath,
+				SubPath: authorizedKey, ReadOnly: true,
 			},
 		)
 	}
@@ -1094,12 +1132,21 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 	if sshExposed(env) {
 		mode := int32(0o644)
-		podSpec.Volumes = append(podSpec.Volumes, corev1.Volume{
-			Name: sshKeysVolumeName,
-			VolumeSource: corev1.VolumeSource{
-				Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: &mode},
+		authorizedName, _ := sshAuthorizedKeysSource(env)
+		podSpec.Volumes = append(podSpec.Volumes,
+			corev1.Volume{
+				Name: sshHostKeyVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: &mode},
+				},
 			},
-		})
+			corev1.Volume{
+				Name: sshAuthorizedKeysVolumeName,
+				VolumeSource: corev1.VolumeSource{
+					Secret: &corev1.SecretVolumeSource{SecretName: authorizedName, DefaultMode: &mode},
+				},
+			},
+		)
 	}
 	return podSpec
 }
@@ -1333,116 +1380,281 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		// SSHKeysRevision is the equivalent digest for the ssh material the pod
 		// mounts as subPath files, which never see a Secret update in place.
 		SSHKeysRevision string
+		// SSHAuthorizedKeysSource is the Secret and data key the template mounts as
+		// authorized_keys. The revision cannot stand in for it: the split puts the
+		// authorized keys in a Secret the environment may not own, so a re-pointed
+		// spec.ssh.keysSecret whose content is byte-identical to the previous
+		// source — the case an environment reconciled by the bundled-Secret
+		// controller is in — digests the same and would leave the workload on the
+		// old mount. The host key's source needs no equivalent: its Secret name is
+		// derived from env.Name, so it cannot vary without a new object.
+		SSHAuthorizedKeysSource string
 	}
+	authorizedName, authorizedKey := sshAuthorizedKeysSource(env)
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
-		Type:                 env.Spec.Type,
-		Image:                env.Spec.Image,
-		Resources:            env.Spec.Resources,
-		Runtime:              env.Spec.Runtime,
-		Storage:              env.Spec.Storage,
-		Volumes:              env.Spec.Volumes,
-		SSHExposed:           sshExposed(env),
-		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
-		SSHKeysRevision:      env.Annotations[sshKeysRevisionAnnotationKey],
+		Type:                    env.Spec.Type,
+		Image:                   env.Spec.Image,
+		Resources:               env.Spec.Resources,
+		Runtime:                 env.Spec.Runtime,
+		Storage:                 env.Spec.Storage,
+		Volumes:                 env.Spec.Volumes,
+		SSHExposed:              sshExposed(env),
+		JupyterTokenRevision:    env.Annotations[jupyterTokenRevisionAnnotationKey],
+		SSHKeysRevision:         env.Annotations[sshKeysRevisionAnnotationKey],
+		SSHAuthorizedKeysSource: authorizedName + "/" + authorizedKey,
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
 
-// reconcileSSHSecret creates or updates the managed SSH secret holding the
-// ed25519 host keypair and the authorized_keys content assembled from
-// spec.ssh.keysSecret. The host keypair is generated once and not rotated
-// (design §6.3), except to replace one sshd cannot read; authorized_keys is
-// refreshed when the user's keys change.
+// reconcileSSHSecrets ensures both halves of the environment's ssh material
+// exist and returns the status ref alongside the digest of what the pod mounts.
 //
-// It returns the non-sensitive digest of the mounted material alongside the
-// key selector, so the caller can record a revision on the pod template: the
-// pod reads the Secret through subPath mounts, which never see an update in
-// place, so refreshed authorized_keys only reach it when the workload rolls
-// (see sshKeysPodAnnotations).
-func (r *DevEnvironmentReconciler) reconcileSSHSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretKeySelector, string, error) {
-	name := sshSecretName(env)
-	authorized, err := r.userAuthorizedKeys(ctx, env)
+// The material is two Secrets because it is two things with different owners:
+// the host identity, which is the platform's and never leaves the cluster, and
+// the authorized keys, which are the user's credential. When the spec names a
+// delegated keys Secret the controller mints the host key only and that Secret
+// is mounted as-is; otherwise it mints a login keypair too, so the environment's
+// owner has a key that actually logs in (design §6.3).
+//
+// The user's Secret is read first, before anything is created: a reference that
+// is missing, undelegated, or lacks the selected data key then leaves no
+// half-provisioned environment behind.
+//
+// The digest is returned alongside the selector so the caller can record a
+// revision on the pod template: the pod reads both Secrets through subPath
+// mounts, which never see an update in place, so rotated keys only reach it when
+// the workload rolls (see sshKeysPodAnnotations).
+func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretKeySelector, string, error) {
+	var authorized []byte
+	if sshUserKeysRef(env) != nil {
+		keys, err := r.userAuthorizedKeys(ctx, env)
+		if err != nil {
+			return nil, "", err
+		}
+		authorized = keys
+	}
+	hostKey, err := r.reconcileSSHHostKeySecret(ctx, env)
 	if err != nil {
 		return nil, "", err
 	}
-	selector := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: sshAuthorizedKeysKey}
-
-	secret := &corev1.Secret{}
-	err = r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
-	if apierrors.IsNotFound(err) {
-		privPEM, pubOpenSSH, err := generateSSHKeyPair()
+	if sshUserKeysRef(env) == nil {
+		authorized, err = r.reconcileSSHAuthorizedKeysSecret(ctx, env)
 		if err != nil {
 			return nil, "", err
+		}
+	}
+	name, key := sshAuthorizedKeysSource(env)
+	selector := &corev1.SecretKeySelector{LocalObjectReference: corev1.LocalObjectReference{Name: name}, Key: key}
+	return selector, sshKeysDigest(hostKey, authorized), nil
+}
+
+// reconcileSSHHostKeySecret ensures the managed <env>-ssh-host-key Secret exists
+// and carries a host keypair sshd can read. The pair is minted once and not
+// rotated (design §6.3), except to replace one sshd cannot read.
+//
+// It returns the host private key so the caller can fold it into the revision
+// digest.
+func (r *DevEnvironmentReconciler) reconcileSSHHostKeySecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) ([]byte, error) {
+	name := sshHostKeySecretName(env)
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
+	if apierrors.IsNotFound(err) {
+		data := map[string][]byte{}
+		// Adopt the host identity of an environment created before the split
+		// rather than minting a new one, which would change the fingerprint its
+		// users have pinned.
+		legacy, err := r.legacyHostKeySecret(ctx, env)
+		if err != nil {
+			return nil, err
+		}
+		if legacy != nil {
+			data[sshHostKeyKey] = legacy.Data[sshHostKeyKey]
+			// The .pub is informational (sshd derives the public half from the
+			// private key), and a hand-written legacy Secret may not carry it, so
+			// it is copied only when there is one to copy.
+			if pub, ok := legacy.Data[sshHostPubKeyKey]; ok {
+				data[sshHostPubKeyKey] = pub
+			}
+		} else {
+			privPEM, pubOpenSSH, err := generateSSHKeyPair()
+			if err != nil {
+				return nil, err
+			}
+			data[sshHostKeyKey] = privPEM
+			data[sshHostPubKeyKey] = pubOpenSSH
 		}
 		desired := &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 			Type:       corev1.SecretTypeOpaque,
-			Data: map[string][]byte{
-				sshHostKeyKey:        privPEM,
-				sshHostPubKeyKey:     pubOpenSSH,
-				sshAuthorizedKeysKey: []byte(authorized),
-			},
+			Data:       data,
 		}
 		if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		if err := r.Create(ctx, desired); err != nil {
-			return nil, "", err
+			return nil, err
 		}
-		return selector, sshKeysDigest(desired), nil
+		return desired.Data[sshHostKeyKey], nil
 	}
 	if err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	if err := ensureDevEnvOwned(secret, env); err != nil {
-		return nil, "", err
+		return nil, err
 	}
 	// A managed Secret can exist without carrying any data — created by hand, or
-	// emptied by hand — and both repairs below write into its map, so an empty map
+	// emptied by hand — and the repair below writes into its map, so an empty map
 	// has to be in place first. reconcileJupyterAuthSecret needs the same guard
 	// for its token.
-	changed := false
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
 	}
 	if hostKeyUnreadable(secret.Data[sshHostKeyKey]) {
 		privPEM, pubOpenSSH, err := generateSSHKeyPair()
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 		secret.Data[sshHostKeyKey] = privPEM
 		secret.Data[sshHostPubKeyKey] = pubOpenSSH
+		if err := r.Update(ctx, secret); err != nil {
+			return nil, err
+		}
+	}
+	return secret.Data[sshHostKeyKey], nil
+}
+
+// legacyHostKeySecret is the host keypair inside the pre-split <env>-ssh-keys
+// Secret, or nil when there is nothing to carry forward: the Secret is absent,
+// is not controlled by this environment, or holds a key sshd cannot read. A
+// foreign same-name Secret must never donate a host identity, and adopting a
+// PKCS#8 key would only move that problem into the new Secret. Nil means "mint a
+// fresh pair".
+//
+// Only a NotFound is folded into nil: a transient read failure aborts the
+// reconcile instead, so a flaky API server can never rotate a host key.
+func (r *DevEnvironmentReconciler) legacyHostKeySecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.Secret, error) {
+	legacy := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: sshLegacySecretName(env)}, legacy); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if ensureDevEnvOwned(legacy, env) != nil {
+		return nil, nil
+	}
+	if hostKeyUnreadable(legacy.Data[sshHostKeyKey]) {
+		return nil, nil
+	}
+	return legacy, nil
+}
+
+// reconcileSSHAuthorizedKeysSecret ensures the generated
+// <env>-ssh-authorized-keys Secret carries a login keypair and the
+// authorized_keys entry the workload mounts. Like the host key the keypair is
+// minted once and kept, so a key its owner has already downloaded keeps working;
+// only one sshd could not read sends it back to generation.
+//
+// The mounted entry is derived from the stored public key, so a hand-edited
+// authorized_keys is repaired from the keypair rather than the other way round.
+// It returns that entry for the revision digest.
+func (r *DevEnvironmentReconciler) reconcileSSHAuthorizedKeysSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) ([]byte, error) {
+	name := sshAuthorizedKeysSecretName(env)
+	secret := &corev1.Secret{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
+	if apierrors.IsNotFound(err) {
+		privPEM, pubOpenSSH, err := generateSSHKeyPair()
+		if err != nil {
+			return nil, err
+		}
+		desired := &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
+			Type:       corev1.SecretTypeOpaque,
+			Data: map[string][]byte{
+				sshClientKeyKey:      privPEM,
+				sshClientPubKeyKey:   pubOpenSSH,
+				sshAuthorizedKeysKey: pubOpenSSH,
+			},
+		}
+		if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
+			return nil, err
+		}
+		if err := r.Create(ctx, desired); err != nil {
+			return nil, err
+		}
+		return desired.Data[sshAuthorizedKeysKey], nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err := ensureDevEnvOwned(secret, env); err != nil {
+		return nil, err
+	}
+	if secret.Data == nil {
+		secret.Data = map[string][]byte{}
+	}
+	changed := false
+	pub := secret.Data[sshClientPubKeyKey]
+	if hostKeyUnreadable(secret.Data[sshClientKeyKey]) || len(pub) == 0 {
+		privPEM, pubOpenSSH, err := generateSSHKeyPair()
+		if err != nil {
+			return nil, err
+		}
+		secret.Data[sshClientKeyKey] = privPEM
+		secret.Data[sshClientPubKeyKey] = pubOpenSSH
+		pub = pubOpenSSH
 		changed = true
 	}
-	// The key has to be written even when authorized is empty: the pod mounts it
-	// by subPath, and a key that is missing from the Secret — rather than present
+	// The key has to be written even when pub is empty: the pod mounts it by
+	// subPath, and a key that is missing from the Secret — rather than present
 	// and empty — leaves the mount with nothing to resolve, so the environment
 	// never starts. This is the shape Create already gives it.
-	if cur, ok := secret.Data[sshAuthorizedKeysKey]; !ok || string(cur) != authorized {
-		secret.Data[sshAuthorizedKeysKey] = []byte(authorized)
+	if cur, ok := secret.Data[sshAuthorizedKeysKey]; !ok || string(cur) != string(pub) {
+		secret.Data[sshAuthorizedKeysKey] = pub
 		changed = true
 	}
 	if changed {
 		if err := r.Update(ctx, secret); err != nil {
-			return nil, "", err
+			return nil, err
 		}
 	}
-	return selector, sshKeysDigest(secret), nil
+	return secret.Data[sshAuthorizedKeysKey], nil
 }
 
-// sshKeysDigest hashes the Secret content the pod mounts — the host key and the
-// platform authorized_keys — into the non-sensitive revision recorded on the
-// pod template. The host key never rotates in place (design §6.3), but a Secret
-// deleted and regenerated mints a new one, and that must roll the pod too.
-func sshKeysDigest(secret *corev1.Secret) string {
+// sshKeysDigest hashes the two entries the pod mounts — the host private key and
+// the authorized_keys content — into the non-sensitive revision recorded on the
+// pod template. They now come from two different Secrets, and in the
+// user-supplied case the second is the user's own: hashing the mounted entry
+// rather than the Secret is what keeps a rotation of the user's Secret rolling
+// the workload, since a subPath mount never sees the update in place. The
+// generated login private key is deliberately not hashed — nothing the pod
+// mounts depends on it.
+func sshKeysDigest(hostKeyPriv, authorizedKeys []byte) string {
 	return assetDataHash(map[string]string{
-		sshHostKeyKey:        string(secret.Data[sshHostKeyKey]),
-		sshAuthorizedKeysKey: string(secret.Data[sshAuthorizedKeysKey]),
+		sshHostKeyKey:        string(hostKeyPriv),
+		sshAuthorizedKeysKey: string(authorizedKeys),
 	})
 }
 
-func sshSecretName(env *aiv1alpha1.DevEnvironment) string {
+// sshHostKeySecretName is the managed Secret <env>-ssh-host-key, which holds the
+// environment's ed25519 host identity and nothing else.
+func sshHostKeySecretName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + "-ssh-host-key"
+}
+
+// sshAuthorizedKeysSecretName is the managed Secret <env>-ssh-authorized-keys,
+// created only when the environment supplies no keys of its own: it carries the
+// generated login keypair and the authorized_keys entry the workload mounts.
+func sshAuthorizedKeysSecretName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + "-ssh-authorized-keys"
+}
+
+// sshLegacySecretName is the pre-split Secret <env>-ssh-keys, which bundled the
+// host keypair and authorized_keys together. Nothing creates or updates it any
+// more: it survives only as the host-key migration source and as a cleanup
+// target for environments created before the split.
+func sshLegacySecretName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-ssh-keys"
 }
 
@@ -1527,30 +1739,33 @@ func generateJupyterToken() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// userAuthorizedKeys reads the multi-line public keys from spec.ssh.keysSecret
-// (data key "keys" by default, per the design's sample CR) into authorized_keys
-// content. It returns "" when no keysSecret is referenced.
-func (r *DevEnvironmentReconciler) userAuthorizedKeys(ctx context.Context, env *aiv1alpha1.DevEnvironment) (string, error) {
-	if env.Spec.SSH == nil || env.Spec.SSH.KeysSecret == nil {
-		return "", nil
-	}
-	ks := env.Spec.SSH.KeysSecret
-	key := ks.Key
-	if key == "" {
-		key = sshUserKeysDefaultKey
-	}
+// userAuthorizedKeys reads the authorized_keys content the workload mounts from
+// spec.ssh.keysSecret (data key "keys" by default, per the design's sample CR).
+//
+// The entry has to be present. The pod mounts it by subPath, and a data key
+// absent from a Secret leaves the mount unresolvable, so the environment would
+// sit in ContainerCreating with nothing to report; refusing it here says why.
+// Present-but-empty is allowed — it is a legitimate "nobody may log in" state,
+// and it mounts as an empty file.
+func (r *DevEnvironmentReconciler) userAuthorizedKeys(ctx context.Context, env *aiv1alpha1.DevEnvironment) ([]byte, error) {
+	ks := sshUserKeysRef(env)
+	_, key := sshAuthorizedKeysSource(env)
 	s := &corev1.Secret{}
 	if err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: ks.Name}, s); err != nil {
-		return "", err
+		return nil, err
 	}
 	// Only a Secret that explicitly delegates itself may back authorized_keys:
-	// copying data from an undelegated Secret would let an environment creator
-	// read any same-namespace Secret through the managed SSH secret that the
-	// workload mounts.
+	// the workload mounts it directly, so an undelegated reference would let an
+	// environment creator read any same-namespace Secret through their own
+	// container — including another environment's generated login key.
 	if s.Labels[devEnvSSHKeysDelegatedLabel] != devEnvSSHKeysDelegatedValue {
-		return "", fmt.Errorf("secret %s/%s is not delegated for SSH keys: missing label %q", env.Namespace, ks.Name, devEnvSSHKeysDelegatedLabel)
+		return nil, fmt.Errorf("secret %s/%s is not delegated for SSH keys: missing label %q", env.Namespace, ks.Name, devEnvSSHKeysDelegatedLabel)
 	}
-	return string(s.Data[key]), nil
+	authorized, ok := s.Data[key]
+	if !ok {
+		return nil, fmt.Errorf("secret %s/%s carries no data key %q, which is the entry the pod mounts as authorized_keys", env.Namespace, ks.Name, key)
+	}
+	return authorized, nil
 }
 
 // generateSSHKeyPair produces an ed25519 host keypair: the private key as an

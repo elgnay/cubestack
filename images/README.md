@@ -66,13 +66,22 @@ always wins.
 
 ## ssh Secret mount contract
 
-The operator mints one Secret per DevEnvironment holding the ssh material and mounts **two of its keys
-as files** with `subPath` — nothing is copied, staged, or re-permissioned in the container:
+The operator mounts **two ssh files** into the container with `subPath` — nothing is copied, staged, or
+re-permissioned in the container. They come from **two Secrets with different owners**: the host
+identity is always the controller's, while the authorized keys are the user's when
+`spec.ssh.keysSecret` names a Secret and the controller's otherwise.
 
-| Secret key | Mounted at | Used by |
-|------------|-----------|---------|
-| `ssh_host_ed25519_key` | `/etc/ssh/ssh_host_ed25519_key` | sshd host identity; its presence gates ssh |
-| `authorized_keys` | `/run/ssh/authorized_keys` | platform keys that may log in |
+| Mounted at | Secret key | Secret | Used by |
+|------------|-----------|--------|---------|
+| `/etc/ssh/ssh_host_ed25519_key` | `ssh_host_ed25519_key` | `<env>-ssh-host-key` (controller-minted) | sshd host identity; its presence gates ssh |
+| `/run/ssh/authorized_keys` | the entry `status.sshKeysSecret.key` names | `spec.ssh.keysSecret`, else `<env>-ssh-authorized-keys` (controller-minted) | keys that may log in |
+
+The mounted entry is `authorized_keys` in the controller-minted case and the user's own key — `keys`
+by default — in the other; `status.sshKeysSecret` names the same Secret and entry, so it is what a
+user reads to find where their login keys live. In the controller-minted case that Secret also carries
+`id_ed25519` (the private half of the generated login keypair, which the user retrieves to log in) and
+`id_ed25519.pub`, which *is* the mounted `authorized_keys` content. Only the single named entry is
+mounted, so **the generated login private key never enters the container**.
 
 The private key has to be in **OpenSSH's own format** (`-----BEGIN OPENSSH PRIVATE KEY-----`): sshd
 does not read a PKCS#8 Ed25519 key at all, and exits with *invalid format* if handed one. The
@@ -103,8 +112,9 @@ would not close it either, since it accepts a key file owned by the account doin
 to operator-issued keys only would mean dropping this path (and `ssh-copy-id` with it) — a product
 decision, not a tightening the drop-in can make on its own.
 
-The operator must ensure the Secret always exists and carries `ssh_host_ed25519_key`; images have no
-fallback identity and fail fast without it (`ssh` mode exits; `jupyter` simply starts without sshd).
+The operator must ensure the host-key Secret always exists and carries `ssh_host_ed25519_key`; images
+have no fallback identity and fail fast without it (`ssh` mode exits; `jupyter` simply starts without
+sshd).
 A host key that is mounted but unusable is **not** that case: `jupyter` mode runs `sshd -t` before
 backgrounding sshd and exits if it fails, rather than serving a ready notebook with a dead ssh endpoint.
 
@@ -116,12 +126,15 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   OpenSSH-format PEM block — sshd rejects a PKCS#8 Ed25519 key, so a Secret carrying one leaves the
   environment with no ssh at all. The controller regenerates such a key in place when it finds one,
   which the revision annotation below then rolls the pod onto.
-- **Restart the workload when the Secret changes.** Kubernetes does not propagate Secret updates to
+- **Restart the workload when either Secret changes.** Kubernetes does not propagate Secret updates to
   `subPath` mounts — the container keeps the bytes it started with
   ([Secret docs](https://kubernetes.io/docs/concepts/configuration/secret/)). Rotated keys are
-  therefore inert until the pod is recreated. The controller stamps a digest of the mounted material on
-  the pod template (`ai.cubestack.io/ssh-keys-revision`, from `::sshKeysDigest`), which changes the
-  StatefulSet's spec hash and rolls the pod — the same mechanism the Jupyter token uses.
+  therefore inert until the pod is recreated. The controller stamps a digest of both mounted files — the
+  host key and the authorized-keys entry — on the pod template
+  (`ai.cubestack.io/ssh-keys-revision`, from `::sshKeysDigest`), which changes the StatefulSet's spec
+  hash and rolls the pod — the same mechanism the Jupyter token uses. It also watches Secrets, mapping
+  one back to every environment whose `spec.ssh.keysSecret` names it, so a user who rotates their own
+  keys rolls the pod without touching the environment.
 - **Keep the files readable by the container uid.** The default Secret `defaultMode` `0644` is
   correct: the files are root-owned, and OpenSSH only enforces its private-key permission check on
   files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
