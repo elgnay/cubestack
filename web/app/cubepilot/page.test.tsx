@@ -9,8 +9,9 @@ import CubepilotPage from "./page";
 // The test file avoids JSX because tsconfig sets jsx: "preserve" (for Next),
 // which vitest's import-analysis can't transform.
 
-/** Stub every endpoint the three panes fetch on mount + the agent flow. */
-function stubApi() {
+/** Stub every endpoint the three panes fetch on mount + the agent flow.
+ *  `config` replaces the agent config body when a test needs its own catalog. */
+function stubApi(config?: Record<string, unknown>) {
   vi.stubGlobal(
     "fetch",
     vi.fn(async (input: RequestInfo | URL) => {
@@ -21,7 +22,7 @@ function stubApi() {
       if (url.includes("/api/cubepilot/tasks")) return json({ tasks: [], reports: [] });
       if (url.includes("/api/cubepilot/agent/config"))
         return json({
-          config: {
+          config: config ?? {
             exists: true,
             selectedModel: "glm-5.2-chat",
             userInstructions: "演示提示词",
@@ -203,7 +204,7 @@ describe("cubepilot page", () => {
     act(() => root.unmount());
   });
 
-  it("selects the first model and streams a reply with the params rail", async () => {
+  it("selects the first model and streams a reply with the sampling params collapsed in the composer", async () => {
     const { container, root } = renderPage();
     await act(async () => {});
 
@@ -211,10 +212,17 @@ describe("cubepilot page", () => {
     expect(
       (container.querySelector('[data-od-id="obj-glm-5.2-chat"]') as HTMLElement).getAttribute("aria-pressed"),
     ).toBe("true");
-    expect(container.querySelector('[data-od-id="params-card"]')).not.toBeNull();
-    // No fake metrics card: the rail is params + the real cURL card.
+    // Sampling params collapse into a chip in the composer by default.
+    expect(container.querySelector('[data-od-id="params-chip"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-od-id="params-card"]')).toBeNull();
+    // The chip opens the params panel in a popover (a body portal).
+    act(() => {
+      (container.querySelector('[data-od-id="params-chip"]') as HTMLElement).click();
+    });
+    expect(document.body.querySelector('[data-od-id="params-card"]')).not.toBeNull();
+    // No fake metrics card.
     expect(container.querySelector('[data-od-id="metrics-card"]')).toBeNull();
-    expect(container.querySelector('[data-od-id="api-card"]')).not.toBeNull();
+    expect(container.querySelector('[data-od-id="api-card"]')).toBeNull();
     expect(container.querySelector('[data-od-id="pg-endpoint"]')?.textContent).toContain("/v1/chat/completions");
     // The object meta line shows the gateway owner.
     expect(container.textContent).toContain("cubestack");
@@ -249,7 +257,7 @@ describe("cubepilot page", () => {
     act(() => root.unmount());
   }, 10000);
 
-  it("switches to the agent: real rail, data greeting, SSE turn with an approval card", async () => {
+  it("switches to the agent: data greeting, SSE turn with an approval card", async () => {
     const { container, root } = renderPage();
     await act(async () => {});
 
@@ -259,15 +267,14 @@ describe("cubepilot page", () => {
       agentObj.click();
     });
 
-    // The context rail swaps to the agent cards (status + whitelist +
-    // approval; no canned recent-calls card).
-    expect(container.querySelector('[data-od-id="agent-status-card"]')).not.toBeNull();
-    // The rail splits the confirmation allowlist from the agent's skills.
-    expect(container.querySelector('[data-od-id="allowlist-card"]')).not.toBeNull();
-    expect(container.querySelector('[data-od-id="tool-whitelist-card"]')).not.toBeNull();
-    expect(container.querySelector('[data-od-id="approval-card"]')).not.toBeNull();
-    expect(container.querySelector('[data-od-id="recent-calls-card"]')).toBeNull();
-    expect(container.querySelector('[data-od-id="params-card"]')).toBeNull();
+    // No context rail in agent mode: the chat card owns the full width and
+    // the instance state lives in the card header.
+    expect(container.querySelector('[data-od-id="agent-status-card"]')).toBeNull();
+    expect(container.querySelector('[data-od-id="allowlist-card"]')).toBeNull();
+    expect(container.querySelector('[data-od-id="tool-whitelist-card"]')).toBeNull();
+    expect(container.querySelector('[data-od-id="approval-card"]')).toBeNull();
+    // Agent mode has no sampling-params chip (model-side control).
+    expect(container.querySelector('[data-od-id="params-chip"]')).toBeNull();
 
     // The greeting is data-driven (skills from the CRs, model from the CR)
     // because the stub user has no sessions yet.
@@ -282,18 +289,16 @@ describe("cubepilot page", () => {
         (container.textContent ?? "").includes("会话审计已开启");
     }
     expect(greeted).toBe(true);
-    // The whitelist card lists the platform skills with their enabled state.
-    expect(container.textContent).toContain("集群巡检");
-    expect(container.textContent).toContain("GPU 体检");
-    expect(container.textContent).toContain("已启用");
 
-    // Quick chip → a real turn streams through the pilot proxy.
-    const chip = Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find(
-      (b) => b.textContent === "分析 Ceph OSD 使用率告警",
-    );
-    expect(chip).toBeDefined();
+    // Composer → a real turn streams through the pilot proxy.
+    const input = container.querySelector('[data-od-id="chat-input"]') as HTMLTextAreaElement;
+    const setValue = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value")!.set!;
     act(() => {
-      chip!.click();
+      setValue.call(input, "分析 Ceph OSD 使用率告警");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    act(() => {
+      (container.querySelector('[data-od-id="send-btn"]') as HTMLElement).click();
     });
 
     // The SSE events land: accumulated text, the paired tool result, and
@@ -330,17 +335,81 @@ describe("cubepilot page", () => {
     expect(approved).toBe(true);
     expect(container.querySelector('[data-od-id="approval-approve"]')).toBeNull();
 
-    // Back to the model: the model rail is restored and the thread resets.
+    // Back to the model: the sampling-params chip is back in the composer
+    // and the thread resets.
     const modelObj = container.querySelector('[data-od-id="obj-glm-5.2-chat"]') as HTMLElement;
     act(() => {
       modelObj.click();
     });
     await act(async () => {});
-    expect(container.querySelector('[data-od-id="params-card"]')).not.toBeNull();
+    expect(container.querySelector('[data-od-id="params-chip"]')).not.toBeNull();
     expect(container.querySelector('[data-od-id="tool-whitelist-card"]')).toBeNull();
     expect(container.textContent).toContain("已切换到 glm-5.2-chat");
     act(() => root.unmount());
   }, 15000);
+
+  it("resizes the object list column by dragging the pane resizer", async () => {
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    const resizer = container.querySelector('[data-od-id="pane-resizer"]') as HTMLElement;
+    expect(resizer).not.toBeNull();
+    expect(resizer.getAttribute("role")).toBe("separator");
+    expect(resizer.getAttribute("aria-valuenow")).toBe("157");
+
+    const drag = (fromX: number, toX: number): void => {
+      act(() => {
+        resizer.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, clientX: fromX }));
+      });
+      act(() => {
+        window.dispatchEvent(new PointerEvent("pointermove", { clientX: toX }));
+        window.dispatchEvent(new PointerEvent("pointerup"));
+      });
+    };
+
+    // Dragging 100px right widens the column by 100px.
+    drag(200, 300);
+    expect(resizer.getAttribute("aria-valuenow")).toBe("257");
+
+    // Drags beyond the bounds clamp to the min/max.
+    drag(200, 5000);
+    expect(resizer.getAttribute("aria-valuenow")).toBe("460");
+    drag(200, -5000);
+    expect(resizer.getAttribute("aria-valuenow")).toBe("120");
+    act(() => root.unmount());
+  });
+
+  it("shows the platform model without its internal alias, external providers with their name", async () => {
+    stubApi({
+      exists: true,
+      selectedModel: "cubestack/qwen38-27b",
+      userInstructions: "",
+      providers: [
+        { name: "cubestack", endpoint: "http://gw.test:8080/v1", models: ["qwen38-27b"], origin: "system" },
+        { name: "deepseek", endpoint: "https://api.deepseek.com/v1", models: ["deepseek-chat"], keyed: true, origin: "external" },
+      ],
+      gatewayModels: ["qwen38-27b", "deepseek-v4-flash"],
+    });
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    // "cubestack/" is internal plumbing the user never chose.
+    const model = container.querySelector('[data-od-id="cp-config-model-select"]') as HTMLSelectElement;
+    expect(model.disabled).toBe(false);
+    expect(model.textContent).toContain("qwen38-27b");
+    expect(model.textContent).not.toContain("cubestack/");
+    // One option per served gateway model, valued as the platform ref.
+    expect(model.options.length).toBe(2);
+    expect(Array.from(model.options).map((o) => o.value)).toEqual(["cubestack/qwen38-27b", "cubestack/deepseek-v4-flash"]);
+
+    const external = container.querySelector('[data-od-id="cp-config-llm-src-external"]') as HTMLElement;
+    act(() => external.click());
+    const row = container.querySelector('[data-od-id="cp-config-llm-row"]') as HTMLElement;
+    // The provider key is the ref prefix, so the row reads provider/modelId.
+    expect(row.textContent).toContain("deepseek");
+    expect(row.textContent).toContain("deepseek/deepseek-chat");
+    act(() => root.unmount());
+  });
 
   it("restores the persisted tab on mount", async () => {
     localStorage.setItem("cubestack.cubepilot.tab", "config");

@@ -20,13 +20,21 @@ const ENC_KEY = encodeURIComponent(SESSION_KEY);
 /** The instance's real state, as the CR-projected endpoints report it. */
 const CONFIG_READY = {
   exists: true,
-  selectedModel: "glm-5.2-chat",
+  // The agent always runs the platform provider: the save writes the
+  // "<provider>/<model id>" ref the operator resolves.
+  selectedModel: "cubestack/qwen38-27b",
   userInstructions: "巡检优先,写操作全部走审批",
-  // The AgentTemplate's inlined models: the page lists these (no gateway call).
-  models: [
-    { name: "glm-5.2-chat", endpoint: "http://ai-gateway.test:8080", origin: "external", keyed: true },
-    { name: "system-only", origin: "system" },
+  providers: [
+    { name: "cubestack", endpoint: "http://ai-gateway.test:8080/v1", models: ["qwen38-27b"], origin: "system" },
+    {
+      name: "glm-5.2-chat",
+      endpoint: "http://ai-gateway.test:8080",
+      models: ["glm-5.2-chat"],
+      origin: "external",
+      keyed: true,
+    },
   ],
+  gatewayModels: ["qwen38-27b", "system-only"],
 };
 
 const STATUS_READY = {
@@ -46,7 +54,10 @@ const CONFIG_NONE = {
   exists: false,
   selectedModel: "",
   userInstructions: "",
-  models: [{ name: "glm-5.2-chat", endpoint: "http://ai-gateway.test:8080", origin: "external", keyed: false }],
+  providers: [
+    { name: "glm-5.2-chat", endpoint: "http://ai-gateway.test:8080", models: ["glm-5.2-chat"], origin: "external", keyed: false },
+  ],
+  gatewayModels: [],
 };
 
 /** One enabled + one disabled skill: the materialized whitelist of an
@@ -217,14 +228,16 @@ async function stubAgent(page: Page, stubs: Stubs = {}): Promise<Captured> {
       return json(confirm);
     }
     if (path.endsWith("/api/cubepilot/agent/llms") && method === "POST") {
-      const body = post() as { name: string; endpoint: string; public?: boolean };
+      const body = post() as { name: string; endpoint: string; models?: string[]; public?: boolean };
       captured.llmPosts.push({ method: "POST", path, body });
-      return json({ model: { name: body.name, endpoint: body.endpoint } });
+      return json({ provider: { name: body.name, endpoint: body.endpoint, models: body.models ?? [] } });
     }
     if (path.includes("/api/cubepilot/agent/llms/") && (method === "PUT" || method === "DELETE")) {
-      const body = post() as { endpoint?: string; public?: boolean; apiKey?: string };
+      const body = post() as { endpoint?: string; models?: string[]; public?: boolean; apiKey?: string };
       captured.llmPosts.push({ method, path, body });
-      return method === "DELETE" ? json({ deleted: decodeURIComponent(path.split("/").pop() ?? "") }) : json({ model: { name: "x" } });
+      return method === "DELETE"
+        ? json({ deleted: decodeURIComponent(path.split("/").pop() ?? "") })
+        : json({ provider: { name: "x", endpoint: body.endpoint, models: body.models ?? [] } });
     }
     if (path.endsWith("/api/cubepilot/skills")) return json(stubs.skills ?? SKILLS);
     // The chat tab still reads the gateway catalog; the config page does not.
@@ -280,7 +293,7 @@ test.beforeEach(async ({ context, page }) => {
 });
 
 test.describe("cubepilot agent chat (CR-backed data)", () => {
-  test("greets with the instance's model, the allowlist and the skills", async ({ page }) => {
+  test("greets with the instance's model and shows its state in the card header", async ({ page }) => {
     await stubAgent(page);
     await page.goto("/cubepilot");
 
@@ -290,53 +303,18 @@ test.describe("cubepilot agent chat (CR-backed data)", () => {
     await obj.click();
 
     const thread = page.locator('[data-od-id="chat-thread"]');
-    await expect(thread).toContainText("技能 2 项,当前模型 glm-5.2-chat");
+    // The greeting is data-driven: the instance's skills and model from the CRs.
+    await expect(thread).toContainText("技能 2 项,当前模型 qwen38-27b");
     await expect(thread).toContainText("会话审计已开启");
 
-    // The rail lists the confirmation allowlist as tags: the hardcoded platform
-    // defaults plus the caller's own rule.
-    const allow = page.locator('[data-od-id="allowlist-card"]');
-    await expect(allow).toContainText("白名单");
-    await expect(allow).toContainText("4 条自动放行");
-    await expect(allow).toContainText("kubectl");
-    await expect(allow).toContainText("ls");
-    await expect(allow).toContainText("helm ls");
-    await expect(allow.locator('[data-od-id="rail-allowlist-tag"][data-owned="true"]')).toHaveCount(1);
-    await expect(allow).toContainText("命中的命令直接放行");
-
-    // Skills live in their own card (tools, not the allowlist).
-    const skills = page.locator('[data-od-id="tool-whitelist-card"]');
-    await expect(skills).toContainText("技能(工具)");
-    await expect(skills).toContainText("2 项");
-    await expect(skills).toContainText("集群巡检");
-    await expect(skills).toContainText("GPU 体检");
-    await expect(skills).toContainText("已启用");
-    await expect(skills).toContainText("未启用");
-
-    // The status card is the instance's own state, not a demo fixture.
-    const rail = page.locator('[data-od-id="agent-status-card"]');
-    await expect(rail).toContainText("最近活动");
-    await expect(rail).toContainText("当前模型");
-    await expect(rail).toContainText("glm-5.2-chat");
-    await expect(rail).toContainText("阶段");
-    await expect(rail).toContainText("Ready");
-
-    // Write ops still route through the approval queue; the model-mode rail
-    // (params/api cards) is not rendered for the agent.
-    await expect(page.locator('[data-od-id="approval-card"]')).toContainText("写操作");
-    await expect(page.locator('[data-od-id="params-card"]')).toHaveCount(0);
-  });
-
-  test("hides the rail allowlist under the None policy", async ({ page }) => {
-    await stubAgent(page, { confirm: { ...CONFIRM, confirmPolicy: "None", override: "None" } });
-    await page.goto("/cubepilot");
-    await page.locator('[data-od-id="obj-cubepilot"]').click();
-
-    // None passes everything through, so there is no allowlist to show — but the
-    // skills card stays.
-    await expect(page.locator('[data-od-id="agent-status-card"]')).toContainText("Ready");
+    // The chat tab has no context rail: the instance state lives in the card
+    // header (phase pill + activity line), not in a right-hand card column.
+    await expect(page.locator('[data-od-id="chat-card"]')).toContainText("Ready");
     await expect(page.locator('[data-od-id="allowlist-card"]')).toHaveCount(0);
-    await expect(page.locator('[data-od-id="tool-whitelist-card"]')).toContainText("集群巡检");
+    await expect(page.locator('[data-od-id="tool-whitelist-card"]')).toHaveCount(0);
+    await expect(page.locator('[data-od-id="agent-status-card"]')).toHaveCount(0);
+    await expect(page.locator('[data-od-id="approval-card"]')).toHaveCount(0);
+    await expect(page.locator('[data-od-id="params-card"]')).toHaveCount(0);
   });
 
   test("asks to provision the instance when the caller has none", async ({ page }) => {
@@ -351,12 +329,11 @@ test.describe("cubepilot agent chat (CR-backed data)", () => {
     await expect(thread).toContainText("Agent 实例尚未创建");
     await expect(thread).toContainText("「配置」页保存一次模型配置");
 
-    // No instance → no phase, the runtime default model, and the platform
-    // baseline still lists the registered skills.
-    const rail = page.locator('[data-od-id="agent-status-card"]');
-    await expect(rail).toContainText("状态 · —");
-    await expect(rail).toContainText("运行时默认");
-    await expect(page.locator('[data-od-id="tool-whitelist-card"]')).toContainText("集群巡检");
+    // No instance → the card header carries the not-provisioned line and no
+    // context rail is rendered.
+    await expect(page.locator('[data-od-id="chat-card"]')).toContainText("实例未创建");
+    await expect(page.locator('[data-od-id="agent-status-card"]')).toHaveCount(0);
+    await expect(page.locator('[data-od-id="tool-whitelist-card"]')).toHaveCount(0);
   });
 
   test("streams a turn and approves the write operation it blocks on", async ({ page }) => {
@@ -366,7 +343,8 @@ test.describe("cubepilot agent chat (CR-backed data)", () => {
 
     const thread = page.locator('[data-od-id="chat-thread"]');
     await expect(thread).toContainText("技能 2 项");
-    await page.locator('[data-od-id="quick-chip"]').filter({ hasText: "分析 Ceph OSD 使用率告警" }).click();
+    await page.locator('[data-od-id="chat-input"]').fill("分析 Ceph OSD 使用率告警");
+    await page.locator('[data-od-id="send-btn"]').click();
 
     // The prompt bubble, the accumulated deltas and the paired tool result.
     await expect(thread).toContainText("分析 Ceph OSD 使用率告警");
@@ -401,7 +379,8 @@ test.describe("cubepilot agent chat (CR-backed data)", () => {
     await page.locator('[data-od-id="obj-cubepilot"]').click();
 
     await expect(page.locator('[data-od-id="chat-thread"]')).toContainText("技能 2 项");
-    await page.locator('[data-od-id="quick-chip"]').filter({ hasText: "生成升级前预检结论" }).click();
+    await page.locator('[data-od-id="chat-input"]').fill("生成升级前预检结论");
+    await page.locator('[data-od-id="send-btn"]').click();
 
     const card = page.locator('[data-od-id="question-item"]');
     await expect(card).toContainText("Agent 需要你确认");
@@ -452,6 +431,35 @@ test.describe("cubepilot agent chat (CR-backed data)", () => {
   });
 });
 
+test.describe("cubepilot chat pane (layout)", () => {
+  test("drags the resizer to resize the object list column", async ({ page }) => {
+    await stubAgent(page);
+    await page.goto("/cubepilot");
+
+    const resizer = page.locator('[data-od-id="pane-resizer"]');
+    await expect(resizer).toBeVisible();
+    const list = page.locator('[data-od-id="object-list"]');
+
+    const colWidth = async (): Promise<number> =>
+      list.evaluate((el) => el.getBoundingClientRect().width);
+    const before = await colWidth();
+
+    // Drag the resizer ~80px to the right with a real mouse.
+    const box = await resizer.boundingBox();
+    if (!box) throw new Error("resizer has no bounding box");
+    const x = box.x + box.width / 2;
+    const y = box.y + box.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x + 80, y, { steps: 8 });
+    await page.mouse.up();
+
+    // The column (and thus the resizer's reported width) grows by ~80px.
+    const after = await colWidth();
+    expect(after).toBeGreaterThan(before + 50);
+  });
+});
+
 test.describe("cubepilot config (AgentInstance CR + AgentTemplate catalog)", () => {
   test("shows the instance state, the inherited policy and persists edits", async ({ page }) => {
     const captured = await stubAgent(page);
@@ -461,13 +469,16 @@ test.describe("cubepilot config (AgentInstance CR + AgentTemplate catalog)", () 
     const pane = page.locator('[data-od-id="cp-config-pane"]');
     await expect(pane).toBeVisible();
 
-    // Model from the CR; the dropdown lists the template's own models plus the
-    // system catalog (+ the runtime default).
+    // Model from the CR; the options are the models the gateway serves.
+    // The agent runs them through the platform provider, and the platform
+    // prefix stays out of the labels.
     const modelSelect = page.locator('[data-od-id="cp-config-model-select"]');
-    await expect(modelSelect).toHaveValue("glm-5.2-chat");
-    await expect(modelSelect.locator("option")).toHaveCount(3);
-    await expect(modelSelect).toContainText("运行时默认");
+    await expect(modelSelect).toBeEnabled();
+    await expect(modelSelect).toHaveValue("cubestack/qwen38-27b");
+    await expect(modelSelect.locator("option")).toHaveCount(2);
+    await expect(modelSelect).toContainText("qwen38-27b");
     await expect(modelSelect).toContainText("system-only");
+    await expect(page.locator('[data-od-id="cp-config-model-note"]')).toContainText("http://ai-gateway.test:8080/v1");
 
     await expect(page.locator('[data-od-id="cp-config-prompt-input"]')).toHaveValue("巡检优先,写操作全部走审批");
 
@@ -502,38 +513,50 @@ test.describe("cubepilot config (AgentInstance CR + AgentTemplate catalog)", () 
     await expect(owned).toContainText("helm ls");
     await expect(owned.locator('[data-od-id="cp-allowlist-remove"]')).toHaveCount(1);
 
-    // LLM 配置: two sources — the system catalog (read-only) and your own
-    // models (written to the AgentTemplate, keyed ones through a Secret).
+    // LLM 配置: two sources — the gateway catalog (read-only) and your own
+    // providers (written to the AgentTemplate, keyed ones through a Secret).
     await expect(page.locator('[data-od-id="cp-config-llm"]')).toBeVisible();
     await expect(page.locator('[data-od-id="cp-config-llm-src-system"]')).toHaveAttribute("aria-pressed", "true");
     await expect(page.locator('[data-od-id="cp-config-llm-system"]')).toContainText("system-only");
     await page.locator('[data-od-id="cp-config-llm-src-external"]').click();
     await expect(page.locator('[data-od-id="cp-config-llm-external"]')).toContainText("glm-5.2-chat");
     await expect(page.locator('[data-od-id="cp-config-llm-external"]')).toContainText("密钥");
+    // The row reads provider/modelId — the ref an instance selects.
+    await expect(page.locator('[data-od-id="cp-config-llm-row"]')).toContainText("glm-5.2-chat/glm-5.2-chat");
 
     await page.locator('[data-od-id="cp-config-llm-name"]').fill("Local Qwen");
     await page.locator('[data-od-id="cp-config-llm-endpoint"]').fill("http://llm.local:8080/v1/chat/completions");
+    await page.locator('[data-od-id="cp-config-llm-models"]').fill("local-qwen-32b, local-qwen-72b");
     await page.locator('[data-od-id="cp-config-llm-public"]').check();
     await page.locator('[data-od-id="cp-config-llm-save"]').click();
-    await expect(page.getByText('已添加模型「Local Qwen」')).toBeVisible();
+    await expect(page.getByText("已添加 provider「Local Qwen」")).toBeVisible();
     expect(captured.llmPosts.at(-1)).toEqual({
       method: "POST",
       path: "/api/cubepilot/agent/llms",
-      body: { name: "Local Qwen", endpoint: "http://llm.local:8080/v1/chat/completions", public: true },
+      body: {
+        name: "Local Qwen",
+        endpoint: "http://llm.local:8080/v1/chat/completions",
+        models: ["local-qwen-32b", "local-qwen-72b"],
+        public: true,
+      },
     });
 
     // Editing prefills the form; the name is immutable.
     await page.locator('[data-od-id="cp-config-llm-edit"]').first().click();
     await expect(page.locator('[data-od-id="cp-config-llm-name"]')).toBeDisabled();
+    await expect(page.locator('[data-od-id="cp-config-llm-models"]')).toHaveValue("glm-5.2-chat");
     await page.locator('[data-od-id="cp-config-llm-endpoint"]').fill("http://gw.test:9090/v1");
     await page.locator('[data-od-id="cp-config-llm-save"]').click();
-    await expect(page.getByText("已更新模型「glm-5.2-chat」")).toBeVisible();
-    expect(captured.llmPosts.at(-1)).toMatchObject({ method: "PUT", body: { endpoint: "http://gw.test:9090/v1" } });
+    await expect(page.getByText("已更新 provider「glm-5.2-chat」")).toBeVisible();
+    expect(captured.llmPosts.at(-1)).toMatchObject({
+      method: "PUT",
+      body: { endpoint: "http://gw.test:9090/v1", models: ["glm-5.2-chat"] },
+    });
 
     // Removing asks for confirmation and deletes by name.
     page.on("dialog", (d) => void d.accept());
     await page.locator('[data-od-id="cp-config-llm-remove"]').first().click();
-    await expect(page.getByText("已删除模型「glm-5.2-chat」")).toBeVisible();
+    await expect(page.getByText("已删除 provider「glm-5.2-chat」")).toBeVisible();
     expect(captured.llmPosts.at(-1)).toMatchObject({ method: "DELETE" });
 
     // The argPattern input advertises a short regex example as its placeholder.
@@ -559,9 +582,14 @@ test.describe("cubepilot config (AgentInstance CR + AgentTemplate catalog)", () 
     await expect(owned).toHaveCount(1);
 
     // Saving the model/prompt hits the config route and confirms with a toast.
+    // Picking another served model first: the save carries the new ref.
+    await modelSelect.selectOption("cubestack/system-only");
     await page.locator('[data-od-id="cp-config-save"]').click();
     await expect(page.getByText("配置已保存,模型与系统提示词下轮生效")).toBeVisible();
-    expect(captured.configPuts.at(-1)).toEqual({ selectedModel: "glm-5.2-chat", userInstructions: "巡检优先,写操作全部走审批" });
+    expect(captured.configPuts.at(-1)).toEqual({
+      selectedModel: "cubestack/system-only",
+      userInstructions: "巡检优先,写操作全部走审批",
+    });
   });
 
   test("switching the policy to None persists the override and hides the allowlist", async ({ page }) => {
@@ -579,18 +607,20 @@ test.describe("cubepilot config (AgentInstance CR + AgentTemplate catalog)", () 
     expect(captured.confirmPuts.at(-1)).toEqual({ confirmPolicy: "None" });
   });
 
-  test("keeps the page usable when the template declares no models", async ({ page }) => {
-    await stubAgent(page, { config: { ...CONFIG_READY, selectedModel: "", models: [] } });
+  test("keeps the page usable when the template declares no provider", async ({ page }) => {
+    await stubAgent(page, { config: { ...CONFIG_READY, selectedModel: "", providers: [], gatewayModels: [] } });
     await page.goto("/cubepilot");
     await page.locator('[data-od-id="cp-tab-config"]').click();
 
-    // No template models: only the runtime default is selectable, and the page
-    // says so instead of failing on a missing gateway.
+    // No template provider: the page says so instead of failing on a missing
+    // gateway, and the model field is an empty, disabled select.
     const pane = page.locator('[data-od-id="cp-config-pane"]');
-    await expect(pane).toContainText("模板未声明模型");
+    await expect(pane).toContainText("模板未声明 provider");
     await page.locator('[data-od-id="cp-config-llm-src-external"]').click();
-    await expect(page.locator('[data-od-id="cp-config-llm"]')).toContainText("模板暂未声明模型");
-    await expect(page.locator('[data-od-id="cp-config-model-select"]').locator("option")).toHaveCount(1);
+    await expect(page.locator('[data-od-id="cp-config-llm"]')).toContainText("模板暂未声明外部 provider");
+    const modelSelect = page.locator('[data-od-id="cp-config-model-select"]');
+    await expect(modelSelect).toBeDisabled();
+    await expect(modelSelect.locator("option")).toHaveCount(0);
     await expect(page.locator('[data-od-id="cp-config-prompt-input"]')).toHaveValue("巡检优先,写操作全部走审批");
     await expect(page.locator('[data-od-id="cp-config-status"]')).toContainText("admin-cubepilot");
   });

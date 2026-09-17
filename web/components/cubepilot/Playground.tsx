@@ -1,14 +1,12 @@
 "use client";
 
-// Context cards for the model side of the unified chat rail, adapted from
-// public/chat.html (sampling params / cURL). Rendered by ChatPane while a
-// gateway model is selected.
+// Context cards for the model side of the unified chat surface, adapted from
+// public/chat.html (sampling params). The sampling panel opens in a popover
+// from the composer's params chip (see ChatPane).
 
 import { Box } from "@mui/material";
 
-import { useI18n } from "@/lib/i18n";
-
-import { Card, CardHead, monoSx } from "./ui";
+import { monoSx } from "./ui";
 
 /** Sampling params shown in the rail and used in the cURL snippet. */
 export interface SampleParams {
@@ -17,20 +15,7 @@ export interface SampleParams {
   maxTokens: number;
 }
 
-/** cURL snippet for the real gateway endpoint + selected model + params. */
-export function gatewayCurl(endpoint: string, model: string, p: SampleParams): string {
-  return (
-    `curl -X POST \\\n  ${endpoint}/v1/chat/completions \\\n` +
-    `  -H "Content-Type: application/json" \\\n` +
-    `  -d '{\n    "model": "${model}",\n` +
-    `    "messages": [{"role": "user", "content": "你好"}],\n` +
-    `    "temperature": ${p.temperature},\n` +
-    `    "max_tokens": ${p.maxTokens},\n` +
-    `    "stream": true\n  }'`
-  );
-}
-
-/** One sampling-parameter slider row in the params card. */
+/** One sampling-parameter slider row in the params panel. */
 function SliderRow({
   id,
   label,
@@ -51,7 +36,14 @@ function SliderRow({
   onChange: (v: number) => void;
 }) {
   return (
-    <Box sx={{ p: "14px 18px", borderBottom: 1, borderColor: "divider", "&:last-child": { borderBottom: 0 } }}>
+    <Box
+      sx={{
+        p: "10px 4px",
+        borderBottom: 1,
+        borderColor: "divider",
+        "&:last-child": { borderBottom: 0 },
+      }}
+    >
       <Box sx={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", mb: "8px" }}>
         <Box component="label" htmlFor={id} sx={{ fontSize: 12.5, fontWeight: 550 }}>
           {label}
@@ -76,7 +68,7 @@ function SliderRow({
   );
 }
 
-/** Small text button used inside the endpoint chip and the cURL card head. */
+/** Small text button used inside the endpoint chip. */
 export function CopyBtn({ text, onClick }: { text: string; onClick: () => void }) {
   return (
     <Box
@@ -101,18 +93,17 @@ export function CopyBtn({ text, onClick }: { text: string; onClick: () => void }
   );
 }
 
-/** 采样参数 card: temperature / top_p / max_tokens sliders. */
-export function ParamsCard({
+/** 采样参数 panel: temperature / top_p / max_tokens sliders, shown in the
+ *    popover opened by the composer's params chip. */
+export function ParamsPanel({
   params,
   onChange,
 }: {
   params: SampleParams;
   onChange: (patch: Partial<SampleParams>) => void;
 }) {
-  const { t } = useI18n();
   return (
-    <Card data-od-id="params-card">
-      <CardHead title={t("cubepilot.playground.paramsTitle")} hint={t("cubepilot.playground.paramsSession")} />
+    <Box data-od-id="params-card">
       <SliderRow
         id="pg-temperature"
         label="temperature"
@@ -140,59 +131,6 @@ export function ParamsCard({
         value={params.maxTokens}
         onChange={(v) => onChange({ maxTokens: v })}
       />
-    </Card>
-  );
-}
-
-/** API 调用 card: live cURL snippet with a copy button. */
-export function ApiCard({
-  endpoint,
-  model,
-  params,
-  copied,
-  onCopy,
-}: {
-  endpoint: string;
-  model: string;
-  params: SampleParams;
-  copied: boolean;
-  onCopy: () => void;
-}) {
-  const { t } = useI18n();
-  const curl = gatewayCurl(endpoint, model, params);
-  return (
-    <Card data-od-id="api-card">
-      <Box
-        sx={{
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "space-between",
-          px: "18px",
-          py: "10px",
-          borderBottom: 1,
-          borderColor: "divider",
-        }}
-      >
-        <Box sx={{ fontSize: 12.5, fontWeight: 600 }}>{t("cubepilot.playground.apiTitle")}</Box>
-        <CopyBtn text={copied ? t("cubepilot.playground.copied") : t("cubepilot.playground.apiCopy")} onClick={onCopy} />
-      </Box>
-      <Box
-        data-od-id="pg-curl"
-        sx={{
-          m: 0,
-          bg: "text.primary",
-          color: "background.default",
-          px: "18px",
-          py: "14px",
-          ...monoSx,
-          fontSize: 11.5,
-          lineHeight: 1.7,
-          overflowX: "auto",
-          whiteSpace: "pre",
-        }}
-      >
-        {curl}
-      </Box>
-    </Card>
+    </Box>
   );
 }

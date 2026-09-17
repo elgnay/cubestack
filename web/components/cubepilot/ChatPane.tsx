@@ -2,9 +2,12 @@
 
 // 聊天 tab — the unified conversation surface for inference models and the
 // CubePilot agent, mirroring public/chat.html: object list (gateway models
-// + AI assistant) | chat card | context rail that follows the selected
-// object (model: sampling params / cURL; agent: status / tool whitelist /
-// approval).
+// + AI assistant) | chat card. The chat card fills the viewport height, the
+// thread scrolls inside its own scrollbar, and the composer is a floating bar
+// docked at the very bottom; sampling params (model mode) collapse into a
+// chip in the composer's bottom row and open in a popover.
+// There is no context rail: the instance phase/model line lives in the card
+// header, and the config tab owns the policy/allowlist detail.
 //
 // Model side: the object list is the real model catalog from the AI Gateway
 // (/api/cubepilot/playground/services → gateway /v1/models), and replies are
@@ -20,33 +23,25 @@
 // client restores the user's latest session (history + pending HITL cards),
 // and polls history while a turn is still in flight after a reload.
 
-import { Box, SxProps, Theme } from "@mui/material";
+import { Box, Popover, SxProps, Theme } from "@mui/material";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { PointerEvent as ReactPointerEvent } from "react";
 
+import { PLATFORM_MODEL_NAME, displayModelName } from "@/lib/cubepilot/types";
 import type {
   AgentConfig,
   AgentQuestionItem,
   AgentSseEvent,
   AgentStatus,
-  ConfirmView,
   GatewayModel,
   HistoryMessage,
-  QuickChip,
   SkillInfo,
 } from "@/lib/cubepilot/types";
-import { ruleKey } from "@/lib/cubepilot/allowlist";
 import { useI18n } from "@/lib/i18n";
 
 import { fmtTime } from "./format";
-import {
-  ApiCard,
-  CopyBtn,
-  gatewayCurl,
-  ParamsCard,
-  SampleParams,
-} from "./Playground";
-import { setStoredTab } from "./tabStore";
-import { Btn, Card, CardHead, CpInput, CpTextArea, Icons, Pill, monoSx, STATUS_WARN, useToast } from "./ui";
+import { CopyBtn, ParamsPanel, SampleParams } from "./Playground";
+import { Btn, Card, CpInput, CpTextArea, Icons, Pill, monoSx, STATUS_WARN, useToast } from "./ui";
 
 // The portal tokens have no violet; one hue + color-mix against var(--fg)
 // adapts to the theme (dark violet on light, light violet on dark).
@@ -57,13 +52,30 @@ const VIOLET_SOFT = `color-mix(in oklch, ${VIOLET} 9%, transparent)`;
 const ACCENT_FILL = "color-mix(in oklch, var(--accent) 82%, var(--fg))";
 const ERROR_COLOR = "#e15c5c";
 
-const CHAT_GRID: SxProps<Theme> = {
+// The object list is a draggable pane: the column width is component state,
+// and the resizer handle rides the 16px gutter between the two panes.
+const LIST_COL_DEFAULT = 157;
+const LIST_COL_MIN = 120;
+const LIST_COL_MAX = 460;
+
+const chatGridSx = (listW: number): SxProps<Theme> => ({
   display: "grid",
-  gridTemplateColumns: "236px minmax(0,1fr) 300px",
-  gap: "14px",
+  gridTemplateColumns: `${listW}px 16px minmax(0,1fr)`,
   alignItems: "start",
   "@media (max-width: 1180px)": { gridTemplateColumns: "1fr" },
-};
+});
+
+// 14px glyphs for the composer's sampling-params chip (DSH access-mode look).
+const SLIDERS_ICON = (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" aria-hidden>
+    <path d="M3 17v2h6v-2H3zM3 5v2h10V5H3zm10 16v-2h8v-2h-8v-2h-2v6h2zM7 9v2H3v2h4v2h2V9H7zm14 4v-2H11v2h10zm-6-4h2V7h4V5h-4V3h-2v6z" />
+  </svg>
+);
+const CHEVRON_DOWN_ICON = (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
 
 const userMsgSx: SxProps<Theme> = {
   alignSelf: "flex-end",
@@ -152,7 +164,6 @@ interface AgentMeta {
   status: AgentStatus | null;
   config: AgentConfig | null;
   skills: SkillInfo[];
-  confirm: ConfirmView | null;
 }
 
 /** Format tool_call arguments for display (objects compact, strings as-is). */
@@ -246,21 +257,53 @@ export function ChatPane() {
   const [thinkingText, setThinkingText] = useState<string | null>(null);
   /** Partial reply text while the model SSE stream is in flight; null = idle. */
   const [streaming, setStreaming] = useState<string | null>(null);
-  const [copied, setCopied] = useState<"endpoint" | "curl" | null>(null);
+  const [copied, setCopied] = useState<"endpoint" | null>(null);
   const [params, setParams] = useState<SampleParams>({ temperature: 0.7, topP: 0.9, maxTokens: 1024 });
+  /** Anchor of the sampling-params popover; null = the chip is collapsed. */
+  const [paramsAnchor, setParamsAnchor] = useState<HTMLElement | null>(null);
+  /** Object-list column width in px; dragged with the pane resizer. */
+  const [listW, setListW] = useState(LIST_COL_DEFAULT);
+  const [resizing, setResizing] = useState(false);
+  const resizeStart = useRef({ x: 0, w: 0 });
+
+  const startResize = (e: ReactPointerEvent<HTMLDivElement>): void => {
+    e.preventDefault();
+    resizeStart.current = { x: e.clientX, w: listW };
+    setResizing(true);
+  };
+
+  // While resizing: track the pointer on window, clamp the column width, and
+  // keep the drag from selecting text or scrolling the page (touch).
+  useEffect(() => {
+    if (!resizing) return;
+    const onMove = (e: PointerEvent): void => {
+      const next = resizeStart.current.w + (e.clientX - resizeStart.current.x);
+      setListW(Math.min(LIST_COL_MAX, Math.max(LIST_COL_MIN, next)));
+    };
+    const onUp = (): void => setResizing(false);
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    document.body.style.userSelect = "none";
+    document.body.style.cursor = "col-resize";
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
+    };
+  }, [resizing]);
 
   // Agent (CubePilot) state — real data from the agent CRs + agent API.
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
   const [agentConfig, setAgentConfig] = useState<AgentConfig | null>(null);
   const [agentSkills, setAgentSkills] = useState<SkillInfo[]>([]);
-  /** The confirmation view: the effective policy + the allowlist the rail shows. */
-  const [agentConfirm, setAgentConfirm] = useState<ConfirmView | null>(null);
-  const [agentMetaError, setAgentMetaError] = useState("");
   const [agentSessionKey, setAgentSessionKey] = useState<string | null>(null);
   const [agentNotice, setAgentNotice] = useState("");
 
   const inputEl = useRef<HTMLTextAreaElement | null>(null);
   const threadEl = useRef<HTMLDivElement | null>(null);
+  /** The composer's sampling-params chip; anchors the params popover. */
+  const paramsChipRef = useRef<HTMLButtonElement | null>(null);
   // Guards against in-flight fetch/stream from a previous object.
   const genRef = useRef(0);
   const idRef = useRef(0);
@@ -316,42 +359,36 @@ export function ChatPane() {
   }
 
   /**
-   * The agent's real meta (instance status, config, skill whitelist) from the
-   * agent CRs. Returns the fresh values (the state they set is one render
-   * stale inside the calling async flow).
+   * The agent's real meta (instance status, config, skills) from the agent
+   * CRs. Returns the fresh values (the state they set is one render stale
+   * inside the calling async flow).
    */
   async function loadAgentMeta(): Promise<AgentMeta> {
     try {
-      const [stRes, cfgRes, skRes, cfRes] = await Promise.all([
+      const [stRes, cfgRes, skRes] = await Promise.all([
         fetch("/api/cubepilot/agent/status"),
         fetch("/api/cubepilot/agent/config"),
         fetch("/api/cubepilot/skills"),
-        fetch("/api/cubepilot/agent/confirm"),
       ]);
-      const [stBody, cfgBody, skBody, cfBody] = await Promise.all([
+      const [stBody, cfgBody, skBody] = await Promise.all([
         stRes.json().catch(() => null),
         cfgRes.json().catch(() => null),
         skRes.json().catch(() => null),
-        cfRes.json().catch(() => null),
       ]);
       if (!stRes.ok) throw new Error((stBody as { error?: string } | null)?.error ?? `HTTP ${stRes.status}`);
-      // The agent meta is global (the object list entry + the context rail),
+      // The agent meta is global (the object list entry + the card header),
       // not part of the conversation generation: apply it even when a model
       // auto-selection bumped that generation while these requests were in
       // flight (otherwise the object entry stays "loading" forever).
       const status = stBody as AgentStatus;
       const config = cfgRes.ok ? ((cfgBody as { config?: AgentConfig } | null)?.config ?? null) : null;
       const skills = skRes.ok ? ((skBody as { skills?: SkillInfo[] } | null)?.skills ?? []) : [];
-      const confirm = cfRes.ok ? (cfBody as ConfirmView | null) : null;
       setAgentStatus(status);
       setAgentConfig(config);
       setAgentSkills(skills);
-      setAgentConfirm(confirm);
-      setAgentMetaError("");
-      return { status, config, skills, confirm };
-    } catch (e) {
-      setAgentMetaError(String(e));
-      return { status: null, config: null, skills: [], confirm: null };
+      return { status, config, skills };
+    } catch {
+      return { status: null, config: null, skills: [] };
     }
   }
 
@@ -364,7 +401,7 @@ export function ChatPane() {
       newAgentMsg(nextId(), {
         text: t("cubepilot.chat.greeting", {
           tools: String(skills.length),
-          model: config?.selectedModel || t("cubepilot.chat.modelDefault"),
+          model: displayModelName(config?.selectedModel || PLATFORM_MODEL_NAME),
         }),
         meta: t("cubepilot.chat.greetingMeta"),
       }),
@@ -573,7 +610,7 @@ export function ChatPane() {
     }
   }
 
-  function copyText(text: string, which: "endpoint" | "curl"): void {
+  function copyText(text: string, which: "endpoint"): void {
     const done = () => {
       setCopied(which);
       setTimeout(() => setCopied((c) => (c === which ? null : c)), 1400);
@@ -944,12 +981,6 @@ export function ChatPane() {
   // matter for the captured session key and message list.
   /* eslint-enable react-hooks/exhaustive-deps */
 
-  const chips: QuickChip[] = (
-    isModel
-      ? [t("cubepilot.chat.chipModel1"), t("cubepilot.chat.chipModel2"), t("cubepilot.chat.chipModel3")]
-      : [t("cubepilot.chat.chipAgent1"), t("cubepilot.chat.chipAgent2"), t("cubepilot.chat.chipAgent3")]
-  ).map((label) => ({ label }));
-
   const agentRoleLine = !agentStatus
     ? t("cubepilot.chat.agentMetaLoading")
     : !agentStatus.exists
@@ -971,9 +1002,9 @@ export function ChatPane() {
       </Box>
       {toastView}
 
-      <Box sx={CHAT_GRID}>
+      <Box sx={chatGridSx(listW)}>
         {/* ── objects ── */}
-        <Box data-od-id="object-list">
+        <Box data-od-id="object-list" sx={{ "@media (max-width: 1180px)": { mb: "14px" } }}>
           <Box sx={groupLabelSx}>{t("cubepilot.chat.objectsModels")}</Box>
           {models.map((m) => {
             const active = isModel && m.id === svcId;
@@ -984,6 +1015,7 @@ export function ChatPane() {
                 type="button"
                 onClick={() => selectModel(m.id)}
                 aria-pressed={active}
+                title={m.id}
                 data-od-id={`obj-${m.id}`}
                 sx={{
                   width: "100%",
@@ -1073,14 +1105,60 @@ export function ChatPane() {
               {agentRoleLine}
             </Box>
           </Box>
-
-          <Card sx={{ p: "12px 14px", mt: "8px" }}>
-            <Box sx={{ fontSize: 12, color: "text.secondary", lineHeight: 1.7 }}>{t("cubepilot.chat.objectsNote")}</Box>
-          </Card>
         </Box>
 
+        {/* ── resizer: drag to resize the object list column ── */}
+        <Box
+          data-od-id="pane-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-valuemin={LIST_COL_MIN}
+          aria-valuemax={LIST_COL_MAX}
+          aria-valuenow={listW}
+          aria-label={t("cubepilot.chat.resizeAria")}
+          onPointerDown={startResize}
+          sx={{
+            alignSelf: "stretch",
+            position: "relative",
+            cursor: "col-resize",
+            touchAction: "none",
+            zIndex: 5,
+            "@media (max-width: 1180px)": { display: "none" },
+            "&::before": {
+              content: '""',
+              position: "absolute",
+              top: 0,
+              bottom: 0,
+              left: "50%",
+              transform: "translateX(-50%)",
+              width: resizing ? 3 : 2,
+              borderRadius: 2,
+              bgcolor: resizing ? "var(--accent)" : "divider",
+              transition: "background-color 120ms ease, width 120ms ease",
+            },
+            "&:hover::before": { bgcolor: "var(--accent)" },
+          }}
+        />
+
         {/* ── chat card ── */}
-        <Card data-od-id="chat-card" sx={{ display: "flex", flexDirection: "column", minHeight: 600 }}>
+        {/* The card fills the viewport below the app chrome (237px above:
+            sticky topbar + page head + tabs + pane sub; the chat tab has no
+            page bottom padding), so the thread is the flex filler that
+            scrolls inside its own scrollbar and the floating composer sits
+            at the window's bottom edge. */}
+        <Card
+          data-od-id="chat-card"
+          sx={{
+            display: "flex",
+            flexDirection: "column",
+            height: "calc(100dvh - 237px)",
+            minHeight: 480,
+            // Visible so the floating composer's shadow is not clipped at the
+            // card's bottom edge.
+            overflow: "visible",
+            "@media (max-width: 1180px)": { height: "auto" },
+          }}
+        >
           <Box
             sx={{
               display: "flex",
@@ -1159,52 +1237,22 @@ export function ChatPane() {
             </Btn>
           </Box>
 
-          {objKind ? (
-            <Box
-              data-od-id="quick-chips"
-              sx={{ display: "flex", gap: "8px", flexWrap: "wrap", px: "18px", py: "12px", borderBottom: 1, borderColor: "divider" }}
-            >
-              {chips.map((c) => (
-                <Box
-                  key={c.label}
-                  component="button"
-                  type="button"
-                  disabled={sending}
-                  onClick={() => sendMessage(c.label)}
-                  data-od-id="quick-chip"
-                  sx={{
-                    fontSize: 12.5,
-                    border: 1,
-                    borderColor: "divider",
-                    borderRadius: 999,
-                    bgcolor: "background.default",
-                    color: "text.primary",
-                    p: "5px 13px",
-                    cursor: sending ? "default" : "pointer",
-                    opacity: sending ? 0.5 : 1,
-                    "&:hover": { borderColor: "text.primary" },
-                  }}
-                >
-                  {c.label}
-                </Box>
-              ))}
-            </Box>
-          ) : null}
-
           <Box
             ref={threadEl}
             data-od-id="chat-thread"
             aria-live="polite"
             sx={{
-              flex: 1,
+              // 480px basis keeps the thread sized when the card has no
+              // definite height (narrow layout); otherwise it flex-fills and
+              // scrolls inside its own scrollbar.
+              flex: "1 1 480px",
+              minHeight: 160,
               overflowY: "auto",
               p: "18px",
               display: "flex",
               flexDirection: "column",
               gap: "14px",
-              height: 480,
               bgcolor: "var(--surface)",
-              "@media (max-width: 1180px)": { height: 420 },
             }}
           >
             {agentNotice ? (
@@ -1346,218 +1394,139 @@ export function ChatPane() {
             ) : null}
           </Box>
 
-          <Box sx={{ borderTop: 1, borderColor: "divider", p: "12px 14px", display: "flex", gap: "10px", alignItems: "flex-end" }}>
-            <CpTextArea
-              ref={inputEl}
-              rows={1}
-              value={input}
-              onChange={(e) => {
-                setInput(e.target.value);
-                autoGrow();
-              }}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
-                  e.preventDefault();
-                  sendMessage();
-                }
-              }}
-              placeholder={t("cubepilot.chat.placeholder")}
-              aria-label={t("cubepilot.chat.placeholder")}
-              data-od-id="chat-input"
+          {/* Composer: a floating bar pinned to the window's bottom edge (the
+              DSH look) — a rounded card with a soft shadow instead of a flat
+              top-border row; the thread scrolls above it. In model mode the
+              sampling params collapse into a chip in the bar's bottom row
+              (DSH's access-mode look) and open in a popover. */}
+          <Box sx={{ p: "10px 14px 12px", flex: "none" }}>
+            <Box
               sx={{
-                flex: 1,
-                resize: "none",
-                padding: "10px 12px",
-                minHeight: 44,
-                maxHeight: 120,
-                fontSize: 13.5,
+                display: "flex",
+                flexDirection: "column",
+                gap: "6px",
+                border: 1,
+                borderColor: "divider",
+                borderRadius: "16px",
+                bgcolor: "background.default",
+                boxShadow: (theme) =>
+                  `0 1px 2px ${theme.palette.mode === "dark" ? "rgba(0,0,0,0.45)" : "rgba(0,0,0,0.05)"}, 0 8px 20px ${
+                    theme.palette.mode === "dark" ? "rgba(0,0,0,0.5)" : "rgba(0,0,0,0.09)"
+                  }`,
+                p: "6px 8px",
+                "&:focus-within": { borderColor: "var(--accent)" },
               }}
-            />
-            {isAgent && sending ? (
-              <Btn variant="secondary" onClick={() => void stopAgent()} data-od-id="stop-btn">
-                {t("cubepilot.chat.stop")}
-              </Btn>
-            ) : (
-              <Btn variant="primary" disabled={sending || !objKind} onClick={() => sendMessage()} data-od-id="send-btn">
-                {t("cubepilot.chat.send")}
-              </Btn>
-            )}
-          </Box>
-        </Card>
-
-        {/* ── context rail ── */}
-        {isAgent ? (
-          <Box sx={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-            <Card data-od-id="agent-status-card">
-              <Box sx={{ display: "flex", alignItems: "center", gap: "12px", p: "16px 18px 14px" }}>
-                <Box
-                  aria-hidden
-                  sx={{
-                    width: 30,
-                    height: 30,
-                    borderRadius: 8,
-                    display: "grid",
-                    placeItems: "center",
-                    color: "#fff",
-                    flex: "none",
-                    bgcolor: VIOLET,
-                  }}
-                >
-                  {Icons.spark({ size: 15 })}
-                </Box>
-                <Box sx={{ minWidth: 0 }}>
-                  <Box sx={{ fontSize: 14, fontWeight: 650 }}>CubePilot</Box>
-                  <Box sx={{ fontSize: 11.5, color: "text.secondary" }}>{t("cubepilot.chat.agentRole")}</Box>
-                </Box>
-                <Box sx={{ ml: "auto", textAlign: "right", ...monoSx, fontSize: 10.5, color: "text.secondary", lineHeight: 1.6 }}>
-                  {agentStatus?.lastActivity ? (
-                    <>
-                      {t("cubepilot.chat.lastActivity")}
-                      <br />
-                      {fmtTime(agentStatus.lastActivity)}
-                    </>
-                  ) : (
-                    t("cubepilot.chat.statusLabel", { status: agentStatus?.phase || "—" })
-                  )}
-                </Box>
-              </Box>
-              <Box sx={{ display: "grid", gridTemplateColumns: "1fr 1fr" }}>
-                <Box sx={{ p: "12px 18px", borderTop: 1, borderColor: "divider", borderRight: 1, minWidth: 0 }}>
-                  <Box sx={{ fontSize: 11, color: "text.secondary" }}>{t("cubepilot.chat.railModel")}</Box>
-                  <Box sx={{ ...monoSx, fontSize: 12, fontWeight: 650, mt: "3px", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {agentConfig?.selectedModel || t("cubepilot.chat.modelDefault")}
-                  </Box>
-                </Box>
-                <Box sx={{ p: "12px 18px", borderTop: 1, borderColor: "divider" }}>
-                  <Box sx={{ fontSize: 11, color: "text.secondary" }}>{t("cubepilot.chat.railPhase")}</Box>
-                  <Box sx={{ ...monoSx, fontSize: 12, fontWeight: 650, mt: "3px" }}>{agentStatus?.phase || "—"}</Box>
-                </Box>
-              </Box>
-            </Card>
-
-            {agentMetaError ? (
-              <Card data-od-id="agent-meta-error-card">
-                <Box sx={{ p: "10px 18px", fontSize: 12, color: ERROR_COLOR, wordBreak: "break-word" }}>
-                  {t("cubepilot.chat.metaError", { error: agentMetaError })}
-                </Box>
-              </Card>
-            ) : null}
-
-            {/* The allowlist only exists under the Allowlist policy: with None
-                everything passes (audited), so the card is hidden entirely. */}
-            {agentConfirm?.confirmPolicy === "Allowlist" ? (
-              <Card data-od-id="allowlist-card">
-                <CardHead
-                  title={t("cubepilot.chat.railAllowlist")}
-                  hint={t("cubepilot.chat.railAllowlistMeta", { count: String(agentConfirm.allowlist.length) })}
-                />
-                <Box sx={{ display: "flex", flexWrap: "wrap", gap: "6px", p: "12px 18px", borderTop: 1, borderColor: "divider" }}>
-                  {agentConfirm.allowlist.map((r) => (
+            >
+              <CpTextArea
+                ref={inputEl}
+                rows={1}
+                value={input}
+                onChange={(e) => {
+                  setInput(e.target.value);
+                  autoGrow();
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                    e.preventDefault();
+                    sendMessage();
+                  }
+                }}
+                placeholder={t("cubepilot.chat.placeholder")}
+                aria-label={t("cubepilot.chat.placeholder")}
+                data-od-id="chat-input"
+                sx={{
+                  width: "100%",
+                  resize: "none",
+                  border: 0,
+                  boxShadow: "none",
+                  bgcolor: "transparent",
+                  padding: "6px 4px",
+                  minHeight: 34,
+                  maxHeight: 120,
+                  fontSize: 13.5,
+                  "&:focus": { borderColor: "divider", boxShadow: "none" },
+                }}
+              />
+              <Box sx={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                {isModel ? (
+                  <Box
+                    ref={paramsChipRef}
+                    component="button"
+                    type="button"
+                    data-od-id="params-chip"
+                    aria-haspopup="dialog"
+                    aria-expanded={paramsAnchor !== null}
+                    onClick={() => setParamsAnchor(paramsAnchor ? null : paramsChipRef.current)}
+                    sx={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "4px",
+                      height: 28,
+                      px: "8px",
+                      border: "none",
+                      borderRadius: "24px",
+                      bgcolor: "transparent",
+                      color: "text.secondary",
+                      fontSize: 13,
+                      lineHeight: "20px",
+                      fontWeight: 500,
+                      cursor: "pointer",
+                      flex: "none",
+                      "&:hover": { bgcolor: "action.hover" },
+                      "&:focus-visible": { boxShadow: "0 0 0 2px var(--border)" },
+                    }}
+                  >
+                    {SLIDERS_ICON}
+                    <Box component="span">{t("cubepilot.playground.paramsTitle")}</Box>
                     <Box
-                      key={ruleKey(r)}
-                      data-od-id="rail-allowlist-tag"
-                      data-owned={r.owned ? "true" : "false"}
-                      title={[r.label || r.pattern, r.argPattern ? `argPattern: ${r.argPattern}` : ""].filter(Boolean).join("\n")}
+                      component="span"
                       sx={{
                         display: "inline-flex",
-                        alignItems: "center",
-                        border: 1,
-                        borderColor: r.owned ? "color-mix(in oklch, var(--accent) 40%, var(--border))" : "divider",
-                        bgcolor: r.owned ? "var(--accent-soft)" : "var(--surface)",
-                        borderRadius: 999,
-                        p: "3px 9px",
-                        ...monoSx,
-                        fontSize: 11.5,
+                        color: "text.disabled",
+                        transform: paramsAnchor !== null ? "rotate(180deg)" : "none",
+                        transition: "transform 120ms ease",
                       }}
                     >
-                      {r.pattern}
+                      {CHEVRON_DOWN_ICON}
                     </Box>
-                  ))}
-                </Box>
-                <Box sx={{ px: "18px", pb: "12px", fontSize: 11.5, color: "text.secondary", lineHeight: 1.6 }}>
-                  {t("cubepilot.chat.railAllowlistNote")}
-                </Box>
-              </Card>
-            ) : null}
-
-            {/* The agent's tools (skills) — separate from the confirmation
-                allowlist above. */}
-            <Card data-od-id="tool-whitelist-card">
-              <CardHead title={t("cubepilot.chat.railSkills")} hint={t("cubepilot.chat.railTotal", { count: String(agentSkills.length) })} />
-              {agentSkills.length === 0 && !agentMetaError ? (
-                <Box sx={{ p: "10px 18px", borderTop: 1, borderColor: "divider", fontSize: 12.5, color: "text.secondary" }}>
-                  {t("cubepilot.chat.noSkills")}
-                </Box>
-              ) : null}
-              {agentSkills.map((s) => (
-                <Box
-                  key={s.name}
-                  title={s.description}
-                  sx={{ display: "flex", alignItems: "center", gap: "10px", p: "9px 18px", borderTop: 1, borderColor: "divider", fontSize: 12.5 }}
-                >
-                  <Box sx={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {s.displayName || s.name}
                   </Box>
-                  <Pill variant={s.enabled ? "ok" : "neutral"}>{s.enabled ? t("cubepilot.chat.skillEnabled") : t("cubepilot.chat.skillDisabled")}</Pill>
-                </Box>
-              ))}
-            </Card>
-
-            <Card data-od-id="approval-card">
-              <CardHead title={t("cubepilot.chat.railApproval")} hint={t("cubepilot.chat.railApprovalMeta")} />
-              <Box
-                sx={{
-                  p: "13px 18px",
-                  borderTop: 1,
-                  borderColor: "divider",
-                  bgcolor: "var(--surface)",
-                  display: "flex",
-                  flexDirection: "column",
-                  gap: "9px",
-                }}
-              >
-                <Box sx={{ fontSize: 11.5, color: "text.secondary", lineHeight: 1.6 }}>{t("cubepilot.chat.railApprovalNote")}</Box>
-                <Box
-                  component="button"
-                  type="button"
-                  onClick={() => setStoredTab("config")}
-                  sx={{
-                    alignSelf: "flex-start",
-                    border: 0,
-                    bg: "transparent",
-                    p: 0,
-                    cursor: "pointer",
-                    fontSize: 12,
-                    fontWeight: 550,
-                    color: "var(--accent-strong)",
-                    display: "inline-flex",
-                    alignItems: "center",
-                    gap: "4px",
-                    "&:hover": { textDecoration: "underline", textUnderlineOffset: 3 },
-                  }}
-                >
-                  {t("cubepilot.chat.railApprovalLink")}
-                </Box>
+                ) : null}
+                <Box sx={{ flex: 1 }} />
+                {isAgent && sending ? (
+                  <Btn variant="secondary" small onClick={() => void stopAgent()} data-od-id="stop-btn">
+                    {t("cubepilot.chat.stop")}
+                  </Btn>
+                ) : (
+                  <Btn variant="primary" small disabled={sending || !objKind} onClick={() => sendMessage()} data-od-id="send-btn">
+                    {t("cubepilot.chat.send")}
+                  </Btn>
+                )}
               </Box>
-            </Card>
+            </Box>
+            <Popover
+              open={paramsAnchor !== null}
+              anchorEl={paramsAnchor}
+              onClose={() => setParamsAnchor(null)}
+              anchorOrigin={{ vertical: "top", horizontal: "left" }}
+              transformOrigin={{ vertical: "bottom", horizontal: "left" }}
+              slotProps={{
+                paper: {
+                  sx: {
+                    p: "10px 12px",
+                    border: 1,
+                    borderColor: "divider",
+                    borderRadius: "var(--radius)",
+                    bgcolor: "background.default",
+                  },
+                },
+              }}
+            >
+              <Box sx={{ width: 320 }}>
+                <ParamsPanel params={params} onChange={(patch) => setParams((p) => ({ ...p, ...patch }))} />
+              </Box>
+            </Popover>
           </Box>
-        ) : (
-          <Box sx={{ display: "flex", flexDirection: "column", gap: "14px" }}>
-            <ParamsCard
-              params={params}
-              onChange={(patch) => setParams((p) => ({ ...p, ...patch }))}
-            />
-            {endpoint && svc ? (
-              <ApiCard
-                endpoint={endpoint}
-                model={svc.id}
-                params={params}
-                copied={copied === "curl"}
-                onCopy={() => copyText(gatewayCurl(endpoint, svc.id, params), "curl")}
-              />
-            ) : null}
-          </Box>
-        )}
+        </Card>
       </Box>
     </Box>
   );
