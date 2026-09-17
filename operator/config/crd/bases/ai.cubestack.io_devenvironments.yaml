@@ -632,9 +632,10 @@ spec:
                   from: the user-provided one from spec.ssh.keysSecret, or a
                   controller-generated one. It is recorded in status so the user can retrieve
                   generated keys. The key named here is the data entry mounted at
-                  /run/ssh/authorized_keys; in the generated case the same Secret also carries
-                  the private key to log in with, as id_ed25519. The environment's host key
-                  is not here: it lives in the separate <env>-ssh-host-key Secret.
+                  /run/ssh/authorized_keys (the volume renames it); rotating that entry reaches
+                  a running container without a restart. In the generated case the same Secret
+                  also carries the private key to log in with, as id_ed25519. The environment's
+                  host key is not here: it lives in the separate <env>-ssh-host-key Secret.
                 properties:
                   key:
                     description: The key of the secret to select from.  Must be a

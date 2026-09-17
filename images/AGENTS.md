@@ -23,12 +23,16 @@ Every image:
   runs (`common/entrypoint.sh`): mode `ssh` runs sshd; mode `jupyter` starts sshd only when the
   ssh host key is mounted, then hands off to the image CMD
 - satisfies readiness = TCP listening on the image's main port (jupyter `8888`, ssh `2222`)
-- reads the operator's ssh Secrets **directly off subPath file mounts**, with no staging:
-  `ssh_host_ed25519_key` at `/etc/ssh/ssh_host_ed25519_key` and the authorized-keys entry at the
-  absolute `/run/ssh/authorized_keys`, outside `$HOME` — a workspace claim may cover the home and the
-  account may not be able to write it. The two files come from two Secrets (the controller's host-key
-  Secret, and the user's or the controller's authorized-keys Secret), but the image sees only the two
-  paths. The mounted host key is also the ssh-enabled signal — images ship no host keys of their own
+- reads the operator's ssh Secrets **directly off Secret mounts**, with no staging:
+  `ssh_host_ed25519_key` at `/etc/ssh/ssh_host_ed25519_key` (a `subPath` file mount, since sshd wants
+  one exact path) and the authorized-keys entry at the absolute `/run/ssh/authorized_keys` (a
+  whole-Secret directory mount, whose `items` rename the selected entry to that filename) — outside
+  `$HOME`, since a workspace claim may cover the home and the account may not be able to write it. The
+  two files come from two Secrets (the controller's host-key Secret, and the user's or the controller's
+  authorized-keys Secret), but the image sees only the two paths. The host key is a `subPath` mount and
+  therefore frozen at container start; the authorized keys are an ordinary Secret mount, so a rotation
+  reaches a running container without a restart. The mounted host key is also the ssh-enabled signal —
+  images ship no host keys of their own
 - accepts its account, uid/gid, and home being named in the DevEnvironment spec
   (`spec.runtime.user`, `spec.runtime.securityContext`, `spec.storage.mountPath`) — `images/README.md`
   gives the values per image

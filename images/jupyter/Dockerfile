@@ -11,9 +11,10 @@
 #
 # Additions on top of stock:
 #   - openssh-server, started only when the operator mounted the ssh Secret. No
-#     key staging: the Secret keys are mounted with subPath (host key at
-#     /etc/ssh/ssh_host_ed25519_key, platform authorized_keys at
-#     /run/ssh/authorized_keys, outside $HOME) and sshd reads them in place.
+#     key staging: the Secret entries are mounted (host key at
+#     /etc/ssh/ssh_host_ed25519_key as a subPath file, platform authorized_keys at
+#     /run/ssh/authorized_keys via a directory mount, outside $HOME) and sshd
+#     reads them in place.
 #   - Jupyter itself honors JUPYTER_TOKEN and NOTEBOOK_ARGS natively (token,
 #     base_url, ...) — no overlay jupyter logic.
 #
@@ -43,10 +44,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-server \
     && rm -rf /var/lib/apt/lists/*
 
-# Create the ~/.ssh target for the subPath authorized_keys mount (so a manual run
-# without a workspace PVC still works; the PVC shadows it in-cluster), and drop
-# the package-generated host keys: identity comes from the mounted Secret, and
-# their absence is how the entrypoint detects that ssh is enabled.
+# Create ~/.ssh (so a manual run without a workspace PVC still works and the
+# account's own ssh-copy-id target exists; the PVC shadows it in-cluster), and
+# drop the package-generated host keys: identity comes from the mounted Secret,
+# and their absence is how the entrypoint detects that ssh is enabled.
 RUN mkdir -p /home/jovyan/.ssh \
     && chown 1000:100 /home/jovyan/.ssh \
     && chmod 700 /home/jovyan/.ssh \

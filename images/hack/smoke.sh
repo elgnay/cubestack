@@ -13,11 +13,14 @@
 # sshd listens on the unprivileged :2222 (so no NET_BIND_SERVICE is needed); the
 # platform's Service publishes it as 22. The smoke talks to 2222 directly.
 #
-# The operator mounts the Secret keys with subPath; docker has no subPath, so the
-# smoke reproduces it with per-file bind mounts:
-#   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key
-#   authorized_keys      -> /run/ssh/authorized_keys   (absolute: outside $HOME,
-#                           which a workspace claim may cover and make unwritable)
+# The operator mounts the host key with subPath and the authorized keys as a
+# whole-Secret directory whose items rename the selected entry to authorized_keys.
+# Docker has no subPath, so the smoke uses bind mounts and reproduces both shapes:
+#   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key  (per-file)
+#   keys/                -> /run/ssh                       (whole directory holding
+#                                                          authorized_keys)
+# /run/ssh is absolute: outside $HOME, which a workspace claim may cover and make
+# unwritable.
 #
 # Reads IMG_SSH / IMG_JUPYTER from the environment (the Makefile sets them).
 # Usage: hack/smoke.sh [--ssh|--jupyter]    (default: both)
@@ -79,11 +82,13 @@ check_contains() {
 # leaving that to a 30s ssh timeout.
 make_secret() {
   local base=$1
-  mkdir -p "$base/client" "$base/host"
+  mkdir -p "$base/client" "$base/host" "$base/keys"
   ssh-keygen -q -t ed25519 -N "" -f "$base/client/id_ed25519"
   ssh-keygen -q -t ed25519 -N "" -f "$base/host/ssh_host_ed25519_key"
-  cp "$base/client/id_ed25519.pub" "$base/host/authorized_keys"
-  chmod 600 "$base/host/ssh_host_ed25519_key" "$base/host/authorized_keys"
+  # Only the public half is materialised, one entry renamed to authorized_keys —
+  # the operator's items mapping, by which the login private key stays out.
+  cp "$base/client/id_ed25519.pub" "$base/keys/authorized_keys"
+  chmod 600 "$base/host/ssh_host_ed25519_key" "$base/keys/authorized_keys"
   chmod 644 "$base/host/ssh_host_ed25519_key.pub"
   chmod 700 "$base/client"
   chmod 600 "$base/client/id_ed25519"
@@ -154,7 +159,7 @@ if [ "$run_ssh" = 1 ]; then
     --user 1000:1000 \
     -p 127.0.0.1::2222 \
     -v "$tmp/ssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/ssh/host/authorized_keys:/run/ssh/authorized_keys:ro" \
+    -v "$tmp/ssh/keys:/run/ssh:ro" \
     "$IMG_SSH" >/dev/null
   # `docker port` fails on a container that is not running; `|| true` keeps that
   # from aborting the run before the checks below can report it (pipefail is on).
@@ -211,7 +216,7 @@ if [ "$run_jupyter" = 1 ]; then
     -e JUPYTER_TOKEN=testtoken \
     -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
     -v "$tmp/jupssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/jupssh/host/authorized_keys:/run/ssh/authorized_keys:ro" \
+    -v "$tmp/jupssh/keys:/run/ssh:ro" \
     "$IMG_JUPYTER" >/dev/null
   # See the ssh block: a stopped container makes `docker port` fail, which must not
   # abort the run before the Jupyter checks and the summary.

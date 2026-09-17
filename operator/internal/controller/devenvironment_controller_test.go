@@ -1057,13 +1057,15 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}))
 		})
 
-		// The images' sshd reads both files in place, so each Secret's key is
-		// mounted by subPath: the host key where sshd looks for its identity, and
-		// the platform keys at the absolute path the images' AuthorizedKeysFile
-		// names — outside any home, since a claim mounted on the home is not
-		// writable by the account and a mount target created beneath it would be
-		// root-owned.
-		It("mounts the ssh keys as subPath files at absolute paths", func() {
+		// The images' sshd reads both entries in place, so the operator mounts them
+		// rather than staging them: the host key as a subPath file where sshd looks
+		// for its identity, and the platform keys as a whole Secret under /run, the
+		// absolute path the images' AuthorizedKeysFile names — outside any home,
+		// since a claim mounted on the home is not writable by the account and a
+		// mount target created beneath it would be root-owned. The two differ in
+		// kind on purpose: a subPath file is frozen at container start and a
+		// directory mount is not, and only the authorized keys ever change.
+		It("mounts the ssh keys as a file and a directory at absolute paths", func() {
 			var env *aiv1alpha1.DevEnvironment
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				env = e
@@ -1072,25 +1074,25 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
-				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
 			}))
-			// Naming each mount's entry is what keeps the generated login keypair —
-			// which shares the authorized-keys Secret — out of the container: no
-			// mount names it.
-			Expect([]string{
-				spec.Containers[0].VolumeMounts[0].SubPath,
-				spec.Containers[0].VolumeMounts[1].SubPath,
-			}).NotTo(ContainElement(sshClientKeyKey))
 			// 0644 is load-bearing: a tighter mode makes a non-root sshd refuse
-			// its own root-owned host key and exit.
+			// its own root-owned host key and exit. The keyed volume names no
+			// subPath: items maps the one entry the pod may see onto the filename
+			// sshd reads, which is what keeps the generated login keypair — sharing
+			// that Secret — out of the container.
 			Expect(spec.Volumes).To(Equal([]corev1.Volume{
 				{
 					Name:         sshHostKeyVolumeName,
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o644))}},
 				},
 				{
-					Name:         sshAuthorizedKeysVolumeName,
-					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshAuthorizedKeysSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshAuthorizedKeysSecretName(env),
+						DefaultMode: ptrTo(int32(0o644)),
+						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+					}},
 				},
 			}))
 		})
@@ -1107,11 +1109,15 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
-				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshUserKeysDefaultKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
 			}))
 			Expect(spec.Volumes[1]).To(Equal(corev1.Volume{
-				Name:         sshAuthorizedKeysVolumeName,
-				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: testUserKeysSecret, DefaultMode: ptrTo(int32(0o644))}},
+				Name: sshAuthorizedKeysVolumeName,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  testUserKeysSecret,
+					DefaultMode: ptrTo(int32(0o644)),
+					Items:       []corev1.KeyToPath{{Key: sshUserKeysDefaultKey, Path: sshAuthorizedKeysFile}},
+				}},
 			}))
 		})
 
@@ -1131,7 +1137,7 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: workspaceClaimName, MountPath: testSSHHome},
 				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
-				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
 			}))
 			// The ssh Secrets alone: no emptyDir stands in for ~/.ssh any more.
 			Expect(spec.Volumes).To(Equal([]corev1.Volume{
@@ -1140,8 +1146,12 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o644))}},
 				},
 				{
-					Name:         sshAuthorizedKeysVolumeName,
-					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshAuthorizedKeysSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshAuthorizedKeysSecretName(env),
+						DefaultMode: ptrTo(int32(0o644)),
+						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+					}},
 				},
 			}))
 		})
@@ -1751,7 +1761,11 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("rolls the workload when the referenced keys Secret changes", func() {
+		// Rotating the user's keys must not restart their environment: the volume is
+		// a directory mount, which kubelet updates in place, and the revision covers
+		// the host key alone so that nothing rolls. Reverting the digest to include
+		// the authorized keys fails this with two different spec hashes.
+		It("does not roll the workload when the referenced keys Secret changes", func() {
 			rotated := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI rotated-key alice@example.com"
 			keys := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1776,54 +1790,63 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
-			var hostKey []byte
+			var hostKeyBefore []byte
 			var hashBefore string
 			Eventually(func(g Gomega) {
 				host := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
-				hostKey = host.Data[sshHostKeyKey]
+				hostKeyBefore = host.Data[sshHostKeyKey]
 				sts := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
-				// The revision digests the entries the pod mounts, which here are
-				// the host key and the user's own authorized_keys — the entry comes
-				// from their Secret now, not from one the controller owns.
+				// The revision digests the host key alone: the authorized keys come
+				// from the user's own Secret and are deliberately outside it.
 				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
-					To(Equal(sshKeysDigest(hostKey, []byte(testUserSSHKey))))
+					To(Equal(sshHostKeyDigest(host.Data[sshHostKeyKey])))
+				g.Expect(sts.Spec.Template.Spec.Volumes[1].Secret.Items).
+					To(Equal([]corev1.KeyToPath{{Key: sshUserKeysDefaultKey, Path: sshAuthorizedKeysFile}}))
 				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
 			}, "15s", "200ms").Should(Succeed())
 
 			// Rotate the user's keys. The watch on the referenced Secret re-reconciles
-			// the environment, and because the keys are a subPath mount the pod keeps
-			// the bytes it started with — so the rotation only reaches it through a
-			// changed revision, and with it a changed StatefulSet spec hash.
+			// the environment, which re-checks the reference — but the new bytes reach
+			// the pod through the volume, so the rotation must not enter the pod
+			// template at all.
 			freshKeys := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, envKey(keys.Name), freshKeys)).To(Succeed())
 			freshKeys.Data[sshUserKeysDefaultKey] = []byte(rotated)
 			Expect(k8sClient.Update(ctx, freshKeys)).To(Succeed())
 
+			// Deleting the StatefulSet is what makes that checkable: the reconcile
+			// that recreates it recomputes the hash from scratch, so a recreated
+			// StatefulSet carrying the same hash proves the rotated bytes are not in
+			// it. Asserting only that nothing changed would also pass if no reconcile
+			// ever ran.
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+
 			Eventually(func(g Gomega) {
-				sts := &appsv1.StatefulSet{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
-				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
-					To(Equal(sshKeysDigest(hostKey, []byte(rotated))))
-				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
+				recreated := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), recreated)).To(Succeed())
+				g.Expect(recreated.Annotations[stsSpecHashAnnotationKey]).To(Equal(hashBefore))
+				g.Expect(recreated.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
+					To(Equal(sshHostKeyDigest(hostKeyBefore)))
 			}, "15s", "200ms").Should(Succeed())
 
 			// The host identity belongs to the platform and does not move with the
 			// user's keys.
 			host := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
-			Expect(host.Data[sshHostKeyKey]).To(Equal(hostKey))
+			Expect(host.Data[sshHostKeyKey]).To(Equal(hostKeyBefore))
 		})
 
 		It("rolls the workload when keysSecret is re-pointed at an equivalent Secret", func() {
-			// The revision digests the mounted bytes, so two Secrets holding the
-			// same content digest identically. The pod template still names the
-			// Secret it mounts, and an environment reconciled by the pre-split
-			// controller is exactly this case: its bundled Secret held a copy of
-			// the user's keys, so the revision does not move when the mount source
-			// becomes the user's Secret. The spec hash has to carry the source, or
-			// the workload keeps the old mount.
+			// Two Secrets holding the same content are indistinguishable to the
+			// revision, which covers the host key alone. The pod template still
+			// names the Secret it mounts, and an environment reconciled by the
+			// pre-split controller is exactly this case: its bundled Secret held a
+			// copy of the user's keys. The spec hash has to carry the mount — the
+			// source and the shape — or the workload keeps the old one.
 			newKeysSecret := func(name string) *corev1.Secret {
 				return &corev1.Secret{
 					ObjectMeta: metav1.ObjectMeta{
@@ -1888,7 +1911,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				host := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
 				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
-					To(Equal(sshKeysDigest(host.Data[sshHostKeyKey], []byte(testUserSSHKey))))
+					To(Equal(sshHostKeyDigest(host.Data[sshHostKeyKey])))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -2021,10 +2044,10 @@ var _ = Describe("DevEnvironment controller", func() {
 		})
 
 		It("rejects a keysSecret that carries no such data key", func() {
-			// The pod mounts the selected entry by subPath, and a data key absent
-			// from a Secret leaves that mount unresolvable — the environment would
-			// sit in ContainerCreating with nothing to report. Refusing it at
-			// reconcile time says which entry was missing.
+			// The volume maps the selected entry onto the file sshd reads, and a data
+			// key absent from a Secret leaves that file out of the mount rather than
+			// failing it: the environment would come up serving nobody, with nothing
+			// to report. Refusing it at reconcile time says which entry was missing.
 			wrong := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "dev-alice-wrong-key",

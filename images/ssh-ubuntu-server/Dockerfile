@@ -2,12 +2,13 @@
 #
 # Minimal image exposing sshd on the unprivileged :2222 for the platform 'ssh'
 # DevEnvironment type (the Service publishes it as 22).
-# No key staging: the operator mounts two Secret keys as files (subPath) and sshd
-# reads them in place —
-#   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity)
-#   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, outside $HOME)
+# No key staging: the operator mounts two Secret entries and sshd reads them in
+# place —
+#   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity, subPath file)
+#   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, directory mount)
 # The container runs as uid/gid 1000 with $HOME=/home/ubuntu (the workspace PVC).
-# See images/README.md for the mount contract and its subPath caveat.
+# See images/README.md for the mount contract: the host key is frozen at container
+# start, the authorized keys are updated in place.
 #
 # Build context MUST be images/ (not this directory) so common/ is COPYable, and the platform
 # must be named: the base is multi-arch, so a bare `docker build` resolves it to the *host*
@@ -41,7 +42,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the same
 # account, group, and home the AWS Ubuntu cloud image uses. The workspace PVC
 # mounts at the home, so nothing durable is baked under it; ~/.ssh exists only so
-# a subPath Secret mount and `ssh-copy-id` have a target when no PVC is attached.
+# the account's own `ssh-copy-id` target exists when no PVC is attached.
 RUN groupadd -g 1000 ubuntu \
     && useradd -u 1000 -g 1000 -s /bin/bash -d /home/ubuntu ubuntu \
     && mkdir -p /home/ubuntu/.ssh \
