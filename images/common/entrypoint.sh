@@ -6,8 +6,9 @@
 # an optional CUBESTACK_TYPE (future platform mode injection) wins when present.
 #
 # sshd reads the operator's Secret mounts directly — there is no key staging. The
-# Secret is mounted with subPath, so its contents are frozen at container start
-# (see images/README.md).
+# host key is a subPath mount, so it is frozen at container start; the authorized
+# keys are an ordinary Secret mount, which kubelet updates in place (see
+# images/README.md).
 #
 # Modes:
 #   jupyter  start sshd only when the operator mounted the ssh Secret, then hand

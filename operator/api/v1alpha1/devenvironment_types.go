@@ -208,9 +208,14 @@ type SSHSpec struct {
 	Enabled bool `json:"enabled,omitempty"`
 
 	// KeysSecret is the SSH public key Secret reference. If specified, the
-	// controller uses the provided Secret (Secret.data[key] holds multi-line
-	// public keys, i.e. authorized_keys content); otherwise the controller
-	// generates and manages one. The plaintext is never stored in spec.
+	// controller generates the environment's host identity alone and mounts this
+	// Secret's data[key] as the container's authorized_keys, so the Secret must
+	// carry the label ai.cubestack.io/ssh-keys-delegated: "true"
+	// — only a Secret that names itself for this use is mounted into a workload.
+	// Otherwise the controller generates the host identity and a login keypair,
+	// and status.sshKeysSecret names the Secret holding the latter. The plaintext
+	// is never stored in spec.
+	// +kubebuilder:validation:XValidation:rule="self.key != ''",message="key must name the Secret data entry the container mounts"
 	// +optional
 	KeysSecret *corev1.SecretKeySelector `json:"keysSecret,omitempty"`
 }
@@ -368,9 +373,14 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Phase *Phase `json:"phase,omitempty"`
 
-	// SSHKeysSecret is the Secret holding the SSH keys in use: the user-provided
-	// one from spec.ssh.keysSecret, or a controller-generated one. It is
-	// recorded in status so the user can retrieve generated keys.
+	// SSHKeysSecret is the Secret the environment's SSH authorized_keys come
+	// from: the user-provided one from spec.ssh.keysSecret, or a
+	// controller-generated one. It is recorded in status so the user can retrieve
+	// generated keys. The key named here is the data entry mounted at
+	// /run/ssh/authorized_keys (the volume renames it); rotating that entry reaches
+	// a running container without a restart. In the generated case the same Secret
+	// also carries the private key to log in with, as id_ed25519. The environment's
+	// host key is not here: it lives in the separate <env>-ssh-host-key Secret.
 	// +optional
 	SSHKeysSecret *corev1.SecretKeySelector `json:"sshKeysSecret,omitempty"`
 

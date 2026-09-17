@@ -65,6 +65,13 @@ const (
 	testSSHPortRangeStart = 20000
 	testRuntimeUser       = "jovyan"
 	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	// testUserKeysSecret is the user-supplied authorized-keys Secret the case-2
+	// specs reference by name; testUserKeysKey is the data entry its selector
+	// names. Deliberately not "keys": the delegated key is whatever the selector
+	// says, and a fixture named after the retired default would pass even if the
+	// controller ignored it.
+	testUserKeysSecret = "dev-alice-ssh-keys"
+	testUserKeysKey    = "team-keys"
 	// testSSHUser is the account the self-authored ssh images ship, selected
 	// with spec.runtime.user; testSSHHome is the home it implies.
 	testSSHUser = "ubuntu"
@@ -80,10 +87,12 @@ var webRootPath = "/dev/" + testNamespace + "/"
 // carrying it has to be migrated.
 const testPKCS8HostKey = "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n-----END PRIVATE KEY-----\n"
 
-// hostKeyPairMatches reports whether the private key is an OpenSSH-format PEM
+// sshKeyPairMatches reports whether the private key is an OpenSSH-format PEM
 // block and the one-line public key describes the same key: the private blob
 // embeds the raw public key, so it must contain the bytes the .pub encodes.
-func hostKeyPairMatches(privPEM, pubOpenSSH []byte) bool {
+// Both keypairs the controller mints are checked with it — the environment's
+// host identity and, in the generated case, the owner's login key.
+func sshKeyPairMatches(privPEM, pubOpenSSH []byte) bool {
 	block, _ := pem.Decode(privPEM)
 	if block == nil || block.Type != sshHostKeyPEMType {
 		return false
@@ -1052,13 +1061,15 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			}))
 		})
 
-		// The images' sshd reads both files in place, so the Secret's keys are
-		// subPath file mounts: the host key where sshd looks for its identity, and
-		// the platform keys at the absolute path the images' AuthorizedKeysFile
-		// names — outside any home, since a claim mounted on the home is not
-		// writable by the account and a mount target created beneath it would be
-		// root-owned.
-		It("mounts the ssh keys as subPath files at absolute paths", func() {
+		// The images' sshd reads both entries in place, so the operator mounts them
+		// rather than staging them: the host key as a subPath file where sshd looks
+		// for its identity, and the platform keys as a whole Secret under /run, the
+		// absolute path the images' AuthorizedKeysFile names — outside any home,
+		// since a claim mounted on the home is not writable by the account and a
+		// mount target created beneath it would be root-owned. The two differ in
+		// kind on purpose: a subPath file is frozen at container start and a
+		// directory mount is not, and only the authorized keys ever change.
+		It("mounts the ssh keys as a file and a directory at absolute paths", func() {
 			var env *aiv1alpha1.DevEnvironment
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				env = e
@@ -1066,15 +1077,53 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: testSSHUser}
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
-				{Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
-				{Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
 			}))
 			// 0644 is load-bearing: a tighter mode makes a non-root sshd refuse
-			// its own root-owned host key and exit.
-			Expect(spec.Volumes).To(Equal([]corev1.Volume{{
-				Name:         sshKeysVolumeName,
-				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
-			}}))
+			// its own root-owned host key and exit. The keyed volume names no
+			// subPath: items maps the one entry the pod may see onto the filename
+			// sshd reads, which is what keeps the generated login keypair — sharing
+			// that Secret — out of the container.
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{
+				{
+					Name:         sshHostKeyVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o644))}},
+				},
+				{
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshAuthorizedKeysSecretName(env),
+						DefaultMode: ptrTo(int32(0o644)),
+						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+					}},
+				},
+			}))
+		})
+
+		// With keysSecret of its own the environment supplies the authorized keys,
+		// so that mount follows the selector's data key rather than a name the
+		// controller generates.
+		It("mounts the referenced keys Secret under the selector's data key", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true, KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: testUserKeysSecret},
+					Key:                  testUserKeysKey,
+				}}
+			})
+			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
+				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
+			}))
+			Expect(spec.Volumes[1]).To(Equal(corev1.Volume{
+				Name: sshAuthorizedKeysVolumeName,
+				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+					SecretName:  testUserKeysSecret,
+					DefaultMode: ptrTo(int32(0o644)),
+					Items:       []corev1.KeyToPath{{Key: testUserKeysKey, Path: sshAuthorizedKeysFile}},
+				}},
+			}))
 		})
 
 		// A claim mounted on the account's home hides the ~/.ssh the image bakes.
@@ -1092,14 +1141,24 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: workspaceClaimName, MountPath: testSSHHome},
-				{Name: sshKeysVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
-				{Name: sshKeysVolumeName, MountPath: sshAuthorizedKeysPath, SubPath: sshAuthorizedKeysKey, ReadOnly: true},
+				{Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true},
+				{Name: sshAuthorizedKeysVolumeName, MountPath: sshAuthorizedKeysDir, ReadOnly: true},
 			}))
-			// The ssh Secret alone: no emptyDir stands in for ~/.ssh any more.
-			Expect(spec.Volumes).To(Equal([]corev1.Volume{{
-				Name:         sshKeysVolumeName,
-				VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshSecretName(env), DefaultMode: ptrTo(int32(0o644))}},
-			}}))
+			// The ssh Secrets alone: no emptyDir stands in for ~/.ssh any more.
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{
+				{
+					Name:         sshHostKeyVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o644))}},
+				},
+				{
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshAuthorizedKeysSecretName(env),
+						DefaultMode: ptrTo(int32(0o644)),
+						Items:       []corev1.KeyToPath{{Key: sshAuthorizedKeysKey, Path: sshAuthorizedKeysFile}},
+					}},
+				},
+			}))
 		})
 
 		// The declared HOME reaches the VolumeMount, not just resolveMountPath: a
@@ -1617,7 +1676,10 @@ var _ = Describe("DevEnvironment controller", func() {
 	})
 
 	Context("ssh", func() {
-		It("generates and records the SSH secret for an ssh environment", func() {
+		// Case 1: the environment names no keys of its own, so the controller mints
+		// both Secrets — the platform's host identity, and a login keypair its owner
+		// can retrieve and actually authenticate with.
+		It("mints a host key and a retrievable login keypair when no keys are given", func() {
 			env := validDevEnvironment("de-ssh")
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -1626,31 +1688,44 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				// status names the authorized-keys Secret: the one carrying the key
+				// its owner logs in with, not the platform's host identity.
 				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: sshSecretName(env)},
+					LocalObjectReference: corev1.LocalObjectReference{Name: sshAuthorizedKeysSecretName(env)},
 					Key:                  sshAuthorizedKeysKey,
 				}))
 
-				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
-				g.Expect(s.Data).To(HaveKey(sshHostPubKeyKey))
-				g.Expect(string(s.Data[sshHostPubKeyKey])).To(HavePrefix("ssh-ed25519 "))
-				g.Expect(s.Data).To(HaveKey(sshAuthorizedKeysKey))
-				// The workload mounts the private key as-is, so it has to be in
-				// the format sshd reads — and describe the advertised public key.
-				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				host := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+				g.Expect(host.Data).To(HaveKey(sshHostPubKeyKey))
+				g.Expect(string(host.Data[sshHostPubKeyKey])).To(HavePrefix("ssh-ed25519 "))
+				// sshd reads the private key as-is, so it has to be in the format
+				// sshd accepts — and describe the advertised public key. The host
+				// Secret carries the identity and nothing else.
+				g.Expect(sshKeyPairMatches(host.Data[sshHostKeyKey], host.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(host.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
+
+				login := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), login)).To(Succeed())
+				g.Expect(sshKeyPairMatches(login.Data[sshClientKeyKey], login.Data[sshClientPubKeyKey])).To(BeTrue())
+				// authorized_keys is exactly the public half of that key, which is
+				// what makes the private half usable for a login.
+				g.Expect(login.Data[sshAuthorizedKeysKey]).To(Equal(login.Data[sshClientPubKeyKey]))
+				// Two independent keypairs: the login key is not the host key.
+				g.Expect(login.Data[sshClientPubKeyKey]).NotTo(Equal(host.Data[sshHostPubKeyKey]))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("copies user public keys into the managed authorized_keys", func() {
+		// Case 2: the environment brings its own public keys, so the controller
+		// mints the host identity only and the user's Secret is mounted as it is.
+		It("mounts the referenced keys Secret without copying out of it", func() {
 			keys := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "dev-alice-ssh-keys",
+					Name:      testUserKeysSecret,
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -1661,21 +1736,41 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
 			Eventually(func(g Gomega) {
-				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(testUserSSHKey))
-				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
+					Key:                  testUserKeysKey,
+				}))
+
+				host := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+				g.Expect(sshKeyPairMatches(host.Data[sshHostKeyKey], host.Data[sshHostPubKeyKey])).To(BeTrue())
+
+				// The user supplied the keys, so there is nothing else to mint.
+				generated := &corev1.Secret{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), generated))).To(BeTrue())
+
+				// And their Secret is left exactly as it was: the controller mounts
+				// it, it does not copy out of it.
+				fresh := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(keys.Name), fresh)).To(Succeed())
+				g.Expect(fresh.Data).To(Equal(map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)}))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("refreshes authorized_keys when the referenced keys Secret changes", func() {
+		// Rotating the user's keys must not restart their environment: the volume is
+		// a directory mount, which kubelet updates in place, and the revision covers
+		// the host key alone so that nothing rolls. Reverting the digest to include
+		// the authorized keys fails this with two different spec hashes.
+		It("does not roll the workload when the referenced keys Secret changes", func() {
 			rotated := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI rotated-key alice@example.com"
 			keys := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -1683,7 +1778,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -1694,52 +1789,134 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
-			var hostKey []byte
+			var hostKeyBefore []byte
 			var hashBefore string
 			Eventually(func(g Gomega) {
-				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(testUserSSHKey))
-				hostKey = s.Data[sshHostKeyKey]
+				host := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+				hostKeyBefore = host.Data[sshHostKeyKey]
 				sts := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
-				// The revision the pod mounts by is recorded on the template; it is
-				// what rolls the workload below.
-				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).To(Equal(sshKeysDigest(s)))
+				// The revision digests the host key alone: the authorized keys come
+				// from the user's own Secret and are deliberately outside it.
+				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
+					To(Equal(sshHostKeyDigest(host.Data[sshHostKeyKey])))
+				g.Expect(sts.Spec.Template.Spec.Volumes[1].Secret.Items).
+					To(Equal([]corev1.KeyToPath{{Key: testUserKeysKey, Path: sshAuthorizedKeysFile}}))
 				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
 			}, "15s", "200ms").Should(Succeed())
 
-			// Rotate the user's keys: the watch on spec.ssh.keysSecret re-reconciles
-			// the environment, so the managed authorized_keys follows while the host
-			// keypair stays stable.
+			// Rotate the user's keys. The watch on the referenced Secret re-reconciles
+			// the environment, which re-checks the reference — but the new bytes reach
+			// the pod through the volume, so the rotation must not enter the pod
+			// template at all.
 			freshKeys := &corev1.Secret{}
 			Expect(k8sClient.Get(ctx, envKey(keys.Name), freshKeys)).To(Succeed())
-			freshKeys.Data[sshUserKeysDefaultKey] = []byte(rotated)
+			freshKeys.Data[testUserKeysKey] = []byte(rotated)
 			Expect(k8sClient.Update(ctx, freshKeys)).To(Succeed())
 
+			// Deleting the StatefulSet is what makes that checkable: the reconcile
+			// that recreates it recomputes the hash from scratch, so a recreated
+			// StatefulSet carrying the same hash proves the rotated bytes are not in
+			// it. Asserting only that nothing changed would also pass if no reconcile
+			// ever ran.
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, sts)).To(Succeed())
+
 			Eventually(func(g Gomega) {
-				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(string(s.Data[sshAuthorizedKeysKey])).To(Equal(rotated))
-				g.Expect(s.Data[sshHostKeyKey]).To(Equal(hostKey))
+				recreated := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), recreated)).To(Succeed())
+				g.Expect(recreated.Annotations[stsSpecHashAnnotationKey]).To(Equal(hashBefore))
+				g.Expect(recreated.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
+					To(Equal(sshHostKeyDigest(hostKeyBefore)))
 			}, "15s", "200ms").Should(Succeed())
 
-			// The mounts are subPath, so the pod keeps the authorized_keys it
-			// started with: the rotated keys only reach it if the template — and
-			// with it the STS spec hash — changes, which is what rolls the pod.
+			// The host identity belongs to the platform and does not move with the
+			// user's keys.
+			host := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+			Expect(host.Data[sshHostKeyKey]).To(Equal(hostKeyBefore))
+		})
+
+		It("rolls the workload when keysSecret is re-pointed at an equivalent Secret", func() {
+			// Two Secrets holding the same content are indistinguishable to the
+			// revision, which covers the host key alone. The pod template still
+			// names the Secret it mounts, and an environment reconciled by the
+			// pre-split controller is exactly this case: its bundled Secret held a
+			// copy of the user's keys. The spec hash has to carry the mount — the
+			// source and the shape — or the workload keeps the old one.
+			newKeysSecret := func(name string) *corev1.Secret {
+				return &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      name,
+						Namespace: testNamespace,
+						Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+					},
+					Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
+				}
+			}
+			first := newKeysSecret("dev-repoint-first-keys")
+			second := newKeysSecret("dev-repoint-second-keys")
+			Expect(k8sClient.Create(ctx, first)).To(Succeed())
+			Expect(k8sClient.Create(ctx, second)).To(Succeed())
+			defer func() {
+				_ = k8sClient.Delete(ctx, first)
+				_ = k8sClient.Delete(ctx, second)
+			}()
+
+			env := validDevEnvironment("de-repoint-keys")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: first.Name},
+					Key:                  testUserKeysKey,
+				},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			mountedSource := func(g Gomega, sts *appsv1.StatefulSet) string {
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				for _, v := range sts.Spec.Template.Spec.Volumes {
+					if v.Name == sshAuthorizedKeysVolumeName {
+						g.Expect(v.Secret).NotTo(BeNil())
+						return v.Secret.SecretName
+					}
+				}
+				g.Expect(false).To(BeTrue(), "the pod template mounts no %s volume", sshAuthorizedKeysVolumeName)
+				return ""
+			}
+
+			var hashBefore string
 			Eventually(func(g Gomega) {
 				sts := &appsv1.StatefulSet{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
-				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).To(Equal(sshKeysDigest(s)))
+				g.Expect(mountedSource(g, sts)).To(Equal(first.Name))
+				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
+			}, "15s", "200ms").Should(Succeed())
+
+			fresh := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), fresh)).To(Succeed())
+			fresh.Spec.SSH.KeysSecret.Name = second.Name
+			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(mountedSource(g, sts)).To(Equal(second.Name))
 				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
+				// The bytes are identical either way: only the source moved, which
+				// is why the revision alone could not have caught this.
+				host := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+				g.Expect(sts.Spec.Template.Annotations[sshKeysRevisionAnnotationKey]).
+					To(Equal(sshHostKeyDigest(host.Data[sshHostKeyKey])))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -1752,8 +1929,8 @@ var _ = Describe("DevEnvironment controller", func() {
 			var hashBefore string
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), s)).To(Succeed())
+				g.Expect(sshKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
 				sts := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
 				hashBefore = sts.Annotations[stsSpecHashAnnotationKey]
@@ -1762,14 +1939,14 @@ var _ = Describe("DevEnvironment controller", func() {
 			// A Secret written by an older controller carries a key sshd rejects,
 			// which would leave the environment with no ssh at all.
 			stale := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), stale)).To(Succeed())
+			Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), stale)).To(Succeed())
 			stale.Data[sshHostKeyKey] = []byte(testPKCS8HostKey)
 			Expect(k8sClient.Update(ctx, stale)).To(Succeed())
 
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
-				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), s)).To(Succeed())
+				g.Expect(sshKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
 
 				// Regenerating changes the mounted material, so the revision rolls
 				// the workload onto the new key without a manual restart.
@@ -1790,30 +1967,57 @@ var _ = Describe("DevEnvironment controller", func() {
 			// key then writes into an empty map rather than a missing one.
 			emptied := &corev1.Secret{}
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), emptied)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), emptied)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 			emptied.Data = nil
 			Expect(k8sClient.Update(ctx, emptied)).To(Succeed())
 
 			// The Secret is owned by the environment, so emptying it re-reconciles:
-			// the repair has to come back with a readable host keypair.
+			// the repair has to come back with a readable host keypair. The host
+			// Secret carries the identity and nothing else.
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), s)).To(Succeed())
 				g.Expect(s.Data).To(HaveKey(sshHostKeyKey))
 				g.Expect(s.Data).To(HaveKey(sshHostPubKeyKey))
-				g.Expect(hostKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
-				g.Expect(s.Data).To(HaveKey(sshAuthorizedKeysKey))
+				g.Expect(sshKeyPairMatches(s.Data[sshHostKeyKey], s.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(s.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("rejects an undelegated keysSecret without copying its data", func() {
+		It("repairs a generated authorized-keys Secret that has no data", func() {
+			env := validDevEnvironment("de-ssh-authkeys-empty")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// The same guard, one Secret over. The recovery has to come back with a
+			// readable login keypair and an authorized_keys entry that still matches
+			// it — otherwise the private key its owner already downloaded would stop
+			// logging in.
+			emptied := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), emptied)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+			emptied.Data = nil
+			Expect(k8sClient.Update(ctx, emptied)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				s := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), s)).To(Succeed())
+				g.Expect(sshKeyPairMatches(s.Data[sshClientKeyKey], s.Data[sshClientPubKeyKey])).To(BeTrue())
+				g.Expect(s.Data[sshAuthorizedKeysKey]).To(Equal(s.Data[sshClientPubKeyKey]))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("rejects an undelegated keysSecret without reading it", func() {
 			// A Secret without the delegation label must never back
-			// authorized_keys: copying it would let the environment creator read
-			// any same-namespace Secret through the managed SSH secret.
+			// authorized_keys: the workload mounts the referenced Secret straight
+			// into the container, so an undelegated reference would let an
+			// environment creator read any same-namespace Secret from inside it.
 			leaked := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{Name: "dev-secret-undelegated", Namespace: testNamespace},
-				Data:       map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data:       map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, leaked)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, leaked) }()
@@ -1824,21 +2028,253 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: leaked.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
-			// The reconcile aborts on the undelegated secret before recording
-			// the SSH secret reference or creating the managed secret, so the
-			// referenced keys can never surface as authorized_keys.
+			// The reconcile aborts on the undelegated Secret before recording the
+			// SSH reference or creating either managed Secret, so the referenced
+			// keys can never surface as authorized_keys.
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
-				s := &corev1.Secret{}
-				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshSecretName(env)), s))).To(BeTrue())
+				for _, name := range []string{sshHostKeySecretName(env), sshAuthorizedKeysSecretName(env)} {
+					s := &corev1.Secret{}
+					g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(name), s))).To(BeTrue())
+				}
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("rejects a keysSecret that carries no such data key", func() {
+			// The volume maps the selected entry onto the file sshd reads, and a data
+			// key absent from a Secret leaves that file out of the mount rather than
+			// failing it: the environment would come up serving nobody, with nothing
+			// to report. Refusing it at reconcile time says which entry was missing.
+			wrong := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dev-alice-wrong-key",
+					Namespace: testNamespace,
+					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+				},
+				Data: map[string][]byte{"not-the-keys": []byte(testUserSSHKey)},
+			}
+			Expect(k8sClient.Create(ctx, wrong)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, wrong) }()
+
+			env := validDevEnvironment("de-missing-key")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: wrong.Name},
+					Key:                  testUserKeysKey,
+				},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("refuses to reference another environment's generated keys", func() {
+			// The generated Secrets are ordinary Secrets in the namespace, and what
+			// stops one environment from mounting a peer's login key as its own
+			// authorized_keys is only that the controller never labels them
+			// delegated.
+			peer := validDevEnvironment("de-ssh-peer")
+			peer.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, peer)).To(Succeed())
+			defer deleteEnv(peer.Name)
+
+			generated := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(peer)), generated)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+			Expect(generated.Labels).NotTo(HaveKey(devEnvSSHKeysDelegatedLabel))
+
+			thief := validDevEnvironment("de-ssh-thief")
+			thief.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			thief.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sshAuthorizedKeysSecretName(peer)},
+					Key:                  sshClientKeyKey,
+				},
+			}
+			Expect(k8sClient.Create(ctx, thief)).To(Succeed())
+			defer deleteEnv(thief.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(thief.Name), got)).To(Succeed())
+				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("follows spec.ssh.keysSecret as it is added and removed", func() {
+			keys := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dev-alice-switch-keys",
+					Namespace: testNamespace,
+					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
+				},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
+			}
+			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, keys) }()
+
+			env := validDevEnvironment("de-ssh-switch")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			refName := func(g Gomega) string {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.SSHKeysSecret).NotTo(BeNil())
+				return got.Status.SSHKeysSecret.Name
+			}
+
+			// Case 1 to start: no keysSecret, so the controller generates both.
+			Eventually(func(g Gomega) {
+				g.Expect(refName(g)).To(Equal(sshAuthorizedKeysSecretName(env)))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Add the reference: the status ref — and so the mount — follows it.
+			spec := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), spec)).To(Succeed())
+			spec.Spec.SSH = &aiv1alpha1.SSHSpec{
+				Enabled: true,
+				KeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
+					Key:                  testUserKeysKey,
+				},
+			}
+			Expect(k8sClient.Update(ctx, spec)).To(Succeed())
+			Eventually(func(g Gomega) {
+				g.Expect(refName(g)).To(Equal(keys.Name))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Remove it again: the environment falls back to generated keys, and
+			// because the generated Secret from before was left in place it is
+			// reused — so a login key already downloaded keeps working.
+			Expect(k8sClient.Get(ctx, envKey(env.Name), spec)).To(Succeed())
+			spec.Spec.SSH.KeysSecret = nil
+			Expect(k8sClient.Update(ctx, spec)).To(Succeed())
+			Eventually(func(g Gomega) {
+				g.Expect(refName(g)).To(Equal(sshAuthorizedKeysSecretName(env)))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// preSplitSecret is the bundled <env>-ssh-keys Secret the controller minted
+		// before the split: the host keypair and authorized_keys in one Secret,
+		// owned by env exactly as the controller's own Secrets are.
+		preSplitSecret := func(env *aiv1alpha1.DevEnvironment, priv, pub []byte) *corev1.Secret {
+			return &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      sshLegacySecretName(env),
+					Namespace: testNamespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: aiv1alpha1.GroupVersion.String(),
+						Kind:       "DevEnvironment",
+						Name:       env.Name,
+						UID:        env.UID,
+						Controller: ptrTo(true),
+					}},
+				},
+				Data: map[string][]byte{
+					sshHostKeyKey:        priv,
+					sshHostPubKeyKey:     pub,
+					sshAuthorizedKeysKey: []byte(testUserSSHKey),
+				},
+			}
+		}
+
+		// The split moves the host key into a Secret of its own, so an environment
+		// created before it has to keep the identity its users have pinned rather
+		// than being handed a new one.
+		It("carries the host key forward from a pre-split bundled Secret", func() {
+			env := validDevEnvironment("de-ssh-migrate")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			host := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			legacyPriv, legacyPub, err := generateSSHKeyPair()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(k8sClient.Create(ctx, preSplitSecret(env, legacyPriv, legacyPub))).To(Succeed())
+
+			// Losing the host-key Secret is the trigger: the next reconcile takes
+			// the pair from the bundled Secret instead of minting a fresh one.
+			Expect(k8sClient.Delete(ctx, host)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				restored := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), restored)).To(Succeed())
+				g.Expect(restored.Data[sshHostKeyKey]).To(Equal(legacyPriv))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("refuses to adopt a legacy Secret it does not own", func() {
+			env := validDevEnvironment("de-ssh-migrate-foreign")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			host := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Same name, no owner: a foreign Secret must never donate a host
+			// identity to an environment that merely shares its name.
+			foreignPriv, foreignPub, err := generateSSHKeyPair()
+			Expect(err).NotTo(HaveOccurred())
+			foreign := preSplitSecret(env, foreignPriv, foreignPub)
+			foreign.OwnerReferences = nil
+			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+			Expect(k8sClient.Delete(ctx, host)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				restored := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), restored)).To(Succeed())
+				g.Expect(sshKeyPairMatches(restored.Data[sshHostKeyKey], restored.Data[sshHostPubKeyKey])).To(BeTrue())
+				g.Expect(restored.Data[sshHostKeyKey]).NotTo(Equal(foreignPriv))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("refuses to carry forward a legacy key sshd cannot read", func() {
+			env := validDevEnvironment("de-ssh-migrate-pkcs8")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			host := &corev1.Secret{}
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			// An older controller minted PKCS#8; adopting it would only move the
+			// problem into the new Secret, so the pair is minted fresh instead.
+			Expect(k8sClient.Create(ctx, preSplitSecret(env, []byte(testPKCS8HostKey), []byte("ssh-ed25519 AAAA unused")))).To(Succeed())
+			Expect(k8sClient.Delete(ctx, host)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				restored := &corev1.Secret{}
+				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), restored)).To(Succeed())
+				g.Expect(sshKeyPairMatches(restored.Data[sshHostKeyKey], restored.Data[sshHostPubKeyKey])).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})
@@ -2272,7 +2708,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: testNamespace,
 					Labels:    map[string]string{devEnvSSHKeysDelegatedLabel: devEnvSSHKeysDelegatedValue},
 				},
-				Data: map[string][]byte{sshUserKeysDefaultKey: []byte(testUserSSHKey)},
+				Data: map[string][]byte{testUserKeysKey: []byte(testUserSSHKey)},
 			}
 			Expect(k8sClient.Create(ctx, keys)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, keys) }()
@@ -2282,7 +2718,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				Enabled: true,
 				KeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
-					Key:                  sshUserKeysDefaultKey,
+					Key:                  testUserKeysKey,
 				},
 			}
 			env.Spec.Ports = []aiv1alpha1.PortSpec{

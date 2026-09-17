@@ -50,20 +50,27 @@ spec:
       mountPath: /data
       readOnly: true
 
-  # SSH access. The controller mints a per-environment Secret holding an ed25519
-  # host key and the authorized_keys assembled from keysSecret, and mounts those
-  # two keys as files: the host key at /etc/ssh/ssh_host_ed25519_key (its presence
-  # is what enables ssh in the image) and the keys at /run/ssh/authorized_keys.
-  # Both paths are outside the account's home, which the workspace claim may cover
-  # and make unwritable; the controller runs an init container that chowns the
-  # workspace claim to the container's own user/group so the workspace itself is
-  # writable. sshd listens on 2222 in the container and the Service publishes it
-  # as 22.
+  # SSH access. The controller always mints a per-environment Secret holding an
+  # ed25519 host key, mounted at /etc/ssh/ssh_host_ed25519_key — its presence is
+  # what enables ssh in the image. In addition it mounts authorized_keys at
+  # /run/ssh/authorized_keys — the selected entry renamed by the volume — taken
+  # from keysSecret below when it is set, and from a generated login keypair
+  # otherwise (whose private half status.sshKeysSecret then lets the user
+  # retrieve, as id_ed25519). That mount is a whole-Secret directory mount rather
+  # than a subPath file, so kubelet delivers a rotation to the running container
+  # without a restart. A keysSecret has to carry the
+  # label ai.cubestack.io/ssh-keys-delegated: "true": the referenced Secret is
+  # mounted into the workload as it is, so only a Secret that opts in may be named.
+  # Both mount paths are outside the account's home, which the workspace claim may
+  # cover and make unwritable; the controller runs an init container that chowns
+  # the workspace claim to the container's own user/group so the workspace itself
+  # is writable. sshd listens on 2222 in the container and the Service publishes
+  # it as 22.
   ssh:
     enabled: true                # enable extra SSH for jupyter/vscode types
     keysSecret:
-      name: dev-alice-ssh-keys   # Secret.data[keys] holds multi-line public keys (authorized_keys content)
-      key: keys
+      name: dev-alice-ssh-keys   # must be labeled ai.cubestack.io/ssh-keys-delegated: "true"
+      key: keys                  # Secret.data[keys] holds the authorized_keys content
 
   # Network
   network:

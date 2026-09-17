@@ -57,13 +57,22 @@ const (
 	devEnvManagedByValue   = "devenv-controller"
 	devEnvFinalizer        = "ai.cubestack.io/dev-env-finalizer"
 
-	// SSH secret data keys: the managed secret holds the ed25519 host keypair
-	// plus the authorized_keys content assembled from spec.ssh.keysSecret (data
-	// key "keys" by default, per the design's sample CR).
-	sshHostKeyKey         = "ssh_host_ed25519_key"
-	sshHostPubKeyKey      = "ssh_host_ed25519_key.pub"
-	sshAuthorizedKeysKey  = "authorized_keys"
-	sshUserKeysDefaultKey = "keys"
+	// SSH secret data keys. The ssh material is split across two Secrets: the
+	// controller-managed host-key Secret holds the ed25519 host keypair, and the
+	// authorized-keys source holds the content the workload mounts as
+	// authorized_keys — the user's Secret when spec.ssh.keysSecret names one, at
+	// the data key its selector names, else a controller-generated one.
+	sshHostKeyKey        = "ssh_host_ed25519_key"
+	sshHostPubKeyKey     = "ssh_host_ed25519_key.pub"
+	sshAuthorizedKeysKey = "authorized_keys"
+
+	// The generated login keypair, written only into the controller-generated
+	// authorized-keys Secret: the private key its owner can retrieve through
+	// status.sshKeysSecret, and the public half that authorizes it. Only
+	// sshAuthorizedKeysKey is ever mounted, so the private key never reaches the
+	// container.
+	sshClientKeyKey    = "id_ed25519"
+	sshClientPubKeyKey = "id_ed25519.pub"
 
 	// devEnvSSHKeysDelegatedLabel marks a Secret that explicitly opts in to being
 	// used as an environment's SSH authorized_keys source. Only a Secret carrying

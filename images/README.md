@@ -66,13 +66,28 @@ always wins.
 
 ## ssh Secret mount contract
 
-The operator mints one Secret per DevEnvironment holding the ssh material and mounts **two of its keys
-as files** with `subPath` — nothing is copied, staged, or re-permissioned in the container:
+The operator mounts **two ssh files** into the container — nothing is copied, staged, or
+re-permissioned in the container. They come from **two Secrets with different owners**: the host
+identity is always the controller's, while the authorized keys are the user's when
+`spec.ssh.keysSecret` names a Secret and the controller's otherwise.
 
-| Secret key | Mounted at | Used by |
-|------------|-----------|---------|
-| `ssh_host_ed25519_key` | `/etc/ssh/ssh_host_ed25519_key` | sshd host identity; its presence gates ssh |
-| `authorized_keys` | `/run/ssh/authorized_keys` | platform keys that may log in |
+The host key is a `subPath` file, because sshd wants it at one exact path. The authorized keys are a
+whole-Secret mount of the directory `/run/ssh`, with `items` renaming the selected data key to
+`authorized_keys`. The container sees the same absolute paths either way; the difference is that
+Kubernetes updates an ordinary Secret mount in place, while a `subPath` file stays frozen at container
+start (see the operator requirements below).
+
+| Mounted at | Secret key | Secret | Used by |
+|------------|-----------|--------|---------|
+| `/etc/ssh/ssh_host_ed25519_key` (`subPath`) | `ssh_host_ed25519_key` | `<env>-ssh-host-key` (controller-minted) | sshd host identity; its presence gates ssh |
+| `/run/ssh/authorized_keys` | the entry `status.sshKeysSecret.key` names, renamed by the volume | `spec.ssh.keysSecret`, else `<env>-ssh-authorized-keys` (controller-minted) | keys that may log in |
+
+The mounted entry is `authorized_keys` in the controller-minted case and the entry the user's selector
+names in the other; `status.sshKeysSecret` names the same Secret and entry, so it is what a
+user reads to find where their login keys live. In the controller-minted case that Secret also carries
+`id_ed25519` (the private half of the generated login keypair, which the user retrieves to log in) and
+`id_ed25519.pub`, which *is* the mounted `authorized_keys` content. The volume maps that single entry
+and no other, so **the generated login private key never enters the container**.
 
 The private key has to be in **OpenSSH's own format** (`-----BEGIN OPENSSH PRIVATE KEY-----`): sshd
 does not read a PKCS#8 Ed25519 key at all, and exits with *invalid format* if handed one. The
@@ -103,8 +118,9 @@ would not close it either, since it accepts a key file owned by the account doin
 to operator-issued keys only would mean dropping this path (and `ssh-copy-id` with it) — a product
 decision, not a tightening the drop-in can make on its own.
 
-The operator must ensure the Secret always exists and carries `ssh_host_ed25519_key`; images have no
-fallback identity and fail fast without it (`ssh` mode exits; `jupyter` simply starts without sshd).
+The operator must ensure the host-key Secret always exists and carries `ssh_host_ed25519_key`; images
+have no fallback identity and fail fast without it (`ssh` mode exits; `jupyter` simply starts without
+sshd).
 A host key that is mounted but unusable is **not** that case: `jupyter` mode runs `sshd -t` before
 backgrounding sshd and exits if it fails, rather than serving a ready notebook with a dead ssh endpoint.
 
@@ -116,12 +132,17 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   OpenSSH-format PEM block — sshd rejects a PKCS#8 Ed25519 key, so a Secret carrying one leaves the
   environment with no ssh at all. The controller regenerates such a key in place when it finds one,
   which the revision annotation below then rolls the pod onto.
-- **Restart the workload when the Secret changes.** Kubernetes does not propagate Secret updates to
-  `subPath` mounts — the container keeps the bytes it started with
-  ([Secret docs](https://kubernetes.io/docs/concepts/configuration/secret/)). Rotated keys are
-  therefore inert until the pod is recreated. The controller stamps a digest of the mounted material on
-  the pod template (`ai.cubestack.io/ssh-keys-revision`, from `::sshKeysDigest`), which changes the
-  StatefulSet's spec hash and rolls the pod — the same mechanism the Jupyter token uses.
+- **Restart the workload only when the host key changes.** Kubernetes does not propagate Secret
+  updates to `subPath` mounts — the container keeps the bytes it started with
+  ([Secret docs](https://kubernetes.io/docs/concepts/configuration/secret/)) — so a repaired host key
+  is inert until the pod is recreated. The controller stamps its digest on the pod template
+  (`ai.cubestack.io/ssh-keys-revision`, from `::sshHostKeyDigest`), which changes the StatefulSet's
+  spec hash and rolls the pod — the same mechanism the Jupyter token uses. The **authorized keys need
+  no such roll**: they are an ordinary Secret mount, so kubelet delivers a rotation to the running
+  container within its sync period, and the controller deliberately keeps them out of the digest so
+  adding a colleague's key does not restart anyone's session. It still watches Secrets, mapping one
+  back to every environment whose `spec.ssh.keysSecret` names it, to re-check a reference that has been
+  undelegated or had its entry removed.
 - **Keep the files readable by the container uid.** The default Secret `defaultMode` `0644` is
   correct: the files are root-owned, and OpenSSH only enforces its private-key permission check on
   files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
@@ -158,8 +179,9 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
 - **ssh-ubuntu22.04** — key-auth ssh login as `ubuntu`, uid 1000, group `ubuntu`, `$HOME`/cwd
   `/home/ubuntu`, and the served host key equals the mounted Secret public key (host keys persist via
   the Secret, not the image).
-- Docker has no `subPath`, so the smoke reproduces the mount contract with per-file bind mounts; see
-  the fidelity note under Trade-offs.
+- Docker has no `subPath`, so the smoke reproduces the mount contract with bind mounts — the host key
+  as a file, the authorized keys as a directory holding a single `authorized_keys` entry (the shape the
+  operator's `items` mapping produces); see the fidelity note under Trade-offs.
 - **jupyter-minimal** — one container running both services at native identity (uid 1000, gid 100):
   token auth returns 200 and lab HTML on the `NOTEBOOK_ARGS` `base_url` path; no token is rejected;
   the path without the prefix is 404; plus key-auth ssh login as `jovyan` (`$HOME=/home/jovyan`) with
