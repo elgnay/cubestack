@@ -215,31 +215,90 @@ func routeAcceptance(check *routeCheck, route *gatewayv1.HTTPRoute, gatewayName,
 
 // routeAccepted reports whether the route's status.parents entry for the
 // configured Gateway reports Accepted=True and ResolvedRefs=True for the
-// CURRENT generation: a condition whose ObservedGeneration is set but does not
-// match the route's generation is stale (the gateway has not processed the
-// latest spec yet). The entry is matched by parentRef name and — when set —
-// namespace; without a matching entry the gateway has not processed the route.
+// current generation.
 func routeAccepted(route *gatewayv1.HTTPRoute, gatewayName, gatewayNamespace string) bool {
-	for _, parent := range route.Status.Parents {
-		if parent.ParentRef.Name != gatewayv1.ObjectName(gatewayName) {
+	return routeParentsAccepted(route.Status.Parents, route.Generation, gatewayName, gatewayNamespace)
+}
+
+// routeParentsAccepted reports whether parents carries an entry for the named
+// Gateway reporting Accepted=True and ResolvedRefs=True for the CURRENT
+// generation: a condition whose ObservedGeneration is set but does not match the
+// route's generation is stale (the gateway has not processed the latest spec
+// yet). Without a matching entry the gateway has not processed the route.
+//
+// A condition with an unset (zero) ObservedGeneration counts as current. The
+// Gateway API schema leaves it optional on these conditions, so a gateway may
+// simply not report it; reading those conditions as absent would withhold every
+// environment's endpoints on such a cluster — a permanent false negative bought
+// to close a transient one.
+//
+// It takes the parents rather than a route so it applies to every route kind:
+// HTTPRoute and TCPRoute are distinct types sharing only this status shape.
+func routeParentsAccepted(parents []gatewayv1.RouteParentStatus, generation int64, gatewayName, gatewayNamespace string) bool {
+	parent := routeParentFor(parents, gatewayName, gatewayNamespace)
+	if parent == nil {
+		return false
+	}
+	var accepted, resolved bool
+	for _, cond := range parent.Conditions {
+		if cond.ObservedGeneration != 0 && cond.ObservedGeneration != generation {
+			continue // stale status from a previous generation
+		}
+		switch cond.Type {
+		case string(gatewayv1.RouteConditionAccepted):
+			accepted = cond.Status == metav1.ConditionTrue
+		case string(gatewayv1.RouteConditionResolvedRefs):
+			resolved = cond.Status == metav1.ConditionTrue
+		}
+	}
+	return accepted && resolved
+}
+
+// routeParentFor returns the status.parents entry belonging to the named
+// Gateway, matched by parentRef name and — when set — namespace. It is nil when
+// the gateway has not reported on the route.
+func routeParentFor(parents []gatewayv1.RouteParentStatus, gatewayName, gatewayNamespace string) *gatewayv1.RouteParentStatus {
+	for i := range parents {
+		if parents[i].ParentRef.Name != gatewayv1.ObjectName(gatewayName) {
 			continue
 		}
-		if parent.ParentRef.Namespace != nil && string(*parent.ParentRef.Namespace) != gatewayNamespace {
+		if parents[i].ParentRef.Namespace != nil && string(*parents[i].ParentRef.Namespace) != gatewayNamespace {
 			continue
 		}
-		var accepted, resolved bool
-		for _, cond := range parent.Conditions {
-			if cond.ObservedGeneration != 0 && cond.ObservedGeneration != route.Generation {
-				continue // stale status from a previous generation
-			}
-			switch cond.Type {
-			case string(gatewayv1.RouteConditionAccepted):
-				accepted = cond.Status == metav1.ConditionTrue
-			case string(gatewayv1.RouteConditionResolvedRefs):
-				resolved = cond.Status == metav1.ConditionTrue
-			}
+		return &parents[i]
+	}
+	return nil
+}
+
+// routeParentsTo reports whether a route's spec.parentRefs attach it to the
+// named Gateway — the question routeParentFor answers for the parents status
+// reports. The API's defaults apply to the fields left unset: a parentRef
+// without a namespace means the route's own namespace, and one without a group
+// or kind means a Gateway in the Gateway API group. A ref that names another
+// resource — a Service of the same name, as a mesh route may parent to — is a
+// different parent however it is spelled, and holds no listener here.
+func routeParentsTo(refs []gatewayv1.ParentReference, routeNamespace, gatewayName, gatewayNamespace string) bool {
+	for _, ref := range refs {
+		group, kind := gatewayAPIGroup, gatewayKind
+		if ref.Group != nil {
+			group = string(*ref.Group)
 		}
-		return accepted && resolved
+		if ref.Kind != nil {
+			kind = string(*ref.Kind)
+		}
+		if group != gatewayAPIGroup || kind != gatewayKind {
+			continue
+		}
+		if ref.Name != gatewayv1.ObjectName(gatewayName) {
+			continue
+		}
+		namespace := routeNamespace
+		if ref.Namespace != nil {
+			namespace = string(*ref.Namespace)
+		}
+		if namespace == gatewayNamespace {
+			return true
+		}
 	}
 	return false
 }

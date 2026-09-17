@@ -251,3 +251,77 @@ var _ = Describe("checkRoute", func() {
 		Expect(cond.Reason).To(Equal("NotPublished"))
 	})
 })
+
+var _ = Describe("routeParentsAccepted", func() {
+	// parentsAcceptedBy renders the status.parents a gateway writes when it
+	// accepts the route, observed for the given generation (0 = a gateway that
+	// did not report one).
+	parentsAcceptedBy := func(observed int64) []gatewayv1.RouteParentStatus {
+		return gatewayRouteParents(gatewayv1.ParentReference{
+			Name:      gatewayv1.ObjectName(testGatewayName),
+			Namespace: ptrTo(gatewayv1.Namespace(testGatewayNamespace)),
+		}, observed, true, "", "")
+	}
+
+	It("accepts a status written for the current generation", func() {
+		Expect(routeParentsAccepted(parentsAcceptedBy(3), 3, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+
+	It("rejects a status written for an earlier generation", func() {
+		Expect(routeParentsAccepted(parentsAcceptedBy(2), 3, testGatewayName, testGatewayNamespace)).To(BeFalse())
+	})
+
+	It("accepts a status that leaves observedGeneration unset", func() {
+		// observedGeneration is optional in the Gateway API schema, so a gateway
+		// may omit it. Treating that as stale would withhold every environment's
+		// endpoints on such a cluster; the tolerance is deliberate.
+		Expect(routeParentsAccepted(parentsAcceptedBy(0), 3, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+})
+
+var _ = Describe("routeParentsTo", func() {
+	// refTo builds a parentRef with group and kind spelled out, as the API server
+	// stores them; "" leaves the field unset.
+	refTo := func(group gatewayv1.Group, kind gatewayv1.Kind, name, namespace string) gatewayv1.ParentReference {
+		ref := gatewayv1.ParentReference{
+			Group: ptrTo(group),
+			Kind:  ptrTo(kind),
+			Name:  gatewayv1.ObjectName(name),
+		}
+		if namespace != "" {
+			ref.Namespace = ptrTo(gatewayv1.Namespace(namespace))
+		}
+		return ref
+	}
+	gateway := func(name, namespace string) gatewayv1.ParentReference {
+		return refTo(gatewayAPIGroup, gatewayKind, name, namespace)
+	}
+
+	It("matches the configured Gateway", func() {
+		refs := []gatewayv1.ParentReference{gateway(testGatewayName, testGatewayNamespace)}
+		Expect(routeParentsTo(refs, testNamespace, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+
+	It("applies the API's defaults to an unset namespace, group and kind", func() {
+		// name alone means a Gateway in the Gateway API group, in the route's own
+		// namespace — the defaults the API server fills in on write.
+		refs := []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(testGatewayName)}}
+		Expect(routeParentsTo(refs, testGatewayNamespace, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+
+	It("ignores a parent in another namespace", func() {
+		refs := []gatewayv1.ParentReference{gateway(testGatewayName, "somewhere-else")}
+		Expect(routeParentsTo(refs, testNamespace, testGatewayName, testGatewayNamespace)).To(BeFalse())
+	})
+
+	It("ignores a parent that is not a Gateway", func() {
+		// A same-name, same-namespace Service, as a mesh route may parent to: it
+		// has no listener on our Gateway, so its route must not reserve a port.
+		svc := refTo("", serviceKind, testGatewayName, testGatewayNamespace)
+		Expect(routeParentsTo([]gatewayv1.ParentReference{svc}, testNamespace, testGatewayName, testGatewayNamespace)).To(BeFalse())
+
+		// A Gateway of the same name in another API group is likewise not ours.
+		foreign := refTo("example.com", gatewayKind, testGatewayName, testGatewayNamespace)
+		Expect(routeParentsTo([]gatewayv1.ParentReference{foreign}, testNamespace, testGatewayName, testGatewayNamespace)).To(BeFalse())
+	})
+})

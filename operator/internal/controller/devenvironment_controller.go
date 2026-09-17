@@ -31,6 +31,7 @@ limitations under the License.
 package controller
 
 import (
+	"cmp"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -113,6 +114,7 @@ const (
 	reasonGatewayNotFound        = "GatewayNotFound"
 	reasonGatewayNotReady        = "GatewayNotReady"
 	reasonGatewayAPINotInstalled = "GatewayAPINotInstalled"
+	reasonGatewayNotAccepted     = "GatewayNotAccepted"
 	reasonRouteCreateFailed      = "RouteCreateFailed"
 
 	// Pod waiting reasons that fail the environment (design §4.2: image and
@@ -1628,6 +1630,12 @@ func appendSSHString(b, s []byte) []byte {
 // Gateway, allocates the SSH/TCP ports, and builds the access endpoints. It is
 // best-effort: a missing or unready Gateway degrades RouteReady but never
 // fails the reconcile (design §6.2).
+//
+// RouteReady reports what the Gateway did with the routes, not merely that they
+// were written: a route the Gateway has not accepted (or has not reported on
+// yet) is GatewayNotAccepted and its address is withheld from status.endpoints,
+// which would otherwise advertise an address that does not connect. The route
+// watches above re-enqueue the environment when the Gateway writes that status.
 func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus) error {
 	cfg := r.defaultedConfig()
 	gw := &gatewayv1.Gateway{}
@@ -1643,7 +1651,7 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		return err
 	}
 
-	ports, err := r.publishRoutes(ctx, env, gw)
+	ports, published, err := r.publishRoutes(ctx, env, gw)
 	if err != nil {
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonRouteCreateFailed, err.Error())
 		return nil
@@ -1655,9 +1663,51 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		status.Endpoints = nil
 		return nil
 	}
+	for _, route := range published {
+		if rejection := route.rejection(cfg.GatewayName, cfg.GatewayNamespace); rejection != "" {
+			setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotAccepted, rejection)
+			status.Endpoints = nil
+			return nil
+		}
+	}
 	setDevEnvironmentRouteReadyCondition(&status.Conditions, true, reasonPublished, "Routes are published on the gateway")
 	r.buildEndpoints(env, status, gwIP, ports)
 	return nil
+}
+
+// publishedRoute is the part of a route this reconcile published that the
+// Gateway reports on: what it is, and the status the Gateway wrote for it.
+type publishedRoute struct {
+	kind       string
+	name       string
+	generation int64
+	parents    []gatewayv1.RouteParentStatus
+}
+
+// rejection returns "" when the Gateway has accepted the route, and otherwise a
+// message naming it — the Gateway's own reason for refusing, when it gave one,
+// or the fact that it has not reported on the route's current generation at all.
+func (p publishedRoute) rejection(gatewayName, gatewayNamespace string) string {
+	if routeParentsAccepted(p.parents, p.generation, gatewayName, gatewayNamespace) {
+		return ""
+	}
+	message := fmt.Sprintf("%s %s is not accepted by gateway %s/%s", p.kind, p.name, gatewayNamespace, gatewayName)
+	// Quote the Gateway's own verdict: "No listeners match this parent ref" names
+	// the fix, where a bare "not accepted" does not.
+	parent := routeParentFor(p.parents, gatewayName, gatewayNamespace)
+	if parent == nil {
+		return message + ": the gateway has not reported on its current generation"
+	}
+	for _, cond := range parent.Conditions {
+		if cond.Status == metav1.ConditionTrue {
+			continue
+		}
+		if cond.ObservedGeneration != 0 && cond.ObservedGeneration != p.generation {
+			continue // stale status for a previous generation
+		}
+		return fmt.Sprintf("%s: %s: %s", message, cond.Reason, cond.Message)
+	}
+	return message
 }
 
 // gatewayIP prefers the Gateway's first status address, falling back to the
@@ -1673,15 +1723,19 @@ func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string
 
 // publishRoutes allocates the SSH and extra TCP ports, then applies the
 // HTTPRoute and one TCPRoute per allocated port. The returned map is keyed by
-// endpoint name and drives buildEndpoints.
-func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, error) {
+// endpoint name and drives buildEndpoints; the returned routes are what the
+// Gateway's acceptance is read from.
+func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, []publishedRoute, error) {
 	cfg := r.defaultedConfig()
-	used := r.usedPorts(ctx, env.Namespace, env.Name)
+	used, err := r.usedPorts(ctx, env.Namespace, env.Name)
+	if err != nil {
+		return nil, nil, err
+	}
 	ports := map[string]int32{}
 	if sshExposed(env) {
 		p := r.allocatePort(env, sshPortName, used)
 		if p == 0 {
-			return nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
+			return nil, nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
 		}
 		ports[sshPortName] = p
 	}
@@ -1691,7 +1745,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		}
 		p := r.allocatePort(env, sp.Name, used)
 		if p == 0 {
-			return nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
+			return nil, nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
 		}
 		ports[sp.Name] = p
 	}
@@ -1700,20 +1754,32 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 	// above no longer allocates their ports, but the old TCPRoute would keep
 	// claiming the Gateway listener and block reuse of the freed port.
 	if err := r.pruneTCPRoutes(ctx, env, ports); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
+	published := []publishedRoute{}
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH || hasHTTPPorts(env) {
-		if err := r.applyHTTPRoute(ctx, env, gw); err != nil {
-			return nil, err
+		route, err := r.applyHTTPRoute(ctx, env, gw)
+		if err != nil {
+			return nil, nil, err
 		}
+		published = append(published, publishedRoute{kind: "HTTPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents})
 	}
-	for name, port := range ports {
-		if err := r.applyTCPRoute(ctx, env, gw, name, port); err != nil {
-			return nil, err
+	// Apply the TCP routes in ascending port order — the ports map iterates
+	// randomly, and the published set decides which route a rejection names.
+	names := make([]string, 0, len(ports))
+	for name := range ports {
+		names = append(names, name)
+	}
+	slices.SortFunc(names, func(a, b string) int { return cmp.Compare(ports[a], ports[b]) })
+	for _, name := range names {
+		route, err := r.applyTCPRoute(ctx, env, gw, name, ports[name])
+		if err != nil {
+			return nil, nil, err
 		}
+		published = append(published, publishedRoute{kind: "TCPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents})
 	}
-	return ports, nil
+	return ports, published, nil
 }
 
 // pruneTCPRoutes deletes this environment's TCPRoutes whose allocated port is
@@ -1773,24 +1839,36 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 }
 
 // usedPorts collects every TCP port already allocated to another environment
-// (the port pool is gateway-wide, so it spans namespaces).
-func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) map[int32]bool {
+// (the port pool is gateway-wide, so it spans namespaces). Allocations are read
+// from the TCPRoutes themselves, not from status.endpoints: the endpoint list is
+// withheld while a route is unaccepted, and a reservation that disappears from
+// under an environment lets two of them claim the same listener port. The route
+// is the durable record — its name embeds the port it holds.
+//
+// Only routes attached to the configured Gateway count: the pool is that
+// Gateway's tcp-<port> listeners, and a route parented elsewhere holds no
+// listener here. A failed List is returned rather than read as an empty pool,
+// which would hand out ports other environments' routes already hold.
+func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) (map[int32]bool, error) {
+	cfg := r.defaultedConfig()
 	used := map[int32]bool{}
-	list := &aiv1alpha1.DevEnvironmentList{}
-	if err := r.List(ctx, list); err != nil {
-		return used
+	var trs gatewayv1.TCPRouteList
+	if err := r.List(ctx, &trs); err != nil {
+		return nil, err
 	}
-	for _, e := range list.Items {
-		if e.Namespace == excludeNS && e.Name == excludeName {
+	for i := range trs.Items {
+		route := &trs.Items[i]
+		if route.Namespace == excludeNS && route.Labels[devEnvironmentLabelKey] == excludeName {
+			continue // this environment's own allocations are free for it to reuse
+		}
+		if !routeParentsTo(route.Spec.ParentRefs, route.Namespace, cfg.GatewayName, cfg.GatewayNamespace) {
 			continue
 		}
-		for _, ep := range e.Status.Endpoints {
-			if p := portFromEndpoint(ep.Address); p != 0 {
-				used[p] = true
-			}
+		if p := tcpRoutePort(route.Name); p != 0 {
+			used[p] = true
 		}
 	}
-	return used
+	return used, nil
 }
 
 // allocatePort picks a port for the named endpoint, reusing the env's own
@@ -1935,52 +2013,56 @@ func servicePortFor(env *aiv1alpha1.DevEnvironment, name string) int32 {
 	return 0
 }
 
-// applyHTTPRoute creates or updates the HTTPRoute.
-func (r *DevEnvironmentReconciler) applyHTTPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) error {
+// applyHTTPRoute creates or updates the HTTPRoute, returning the stored object
+// so its acceptance can be read. A route this call created or changed carries no
+// acceptance for its new generation until the Gateway reports on it, which is
+// what the returned object shows.
+func (r *DevEnvironmentReconciler) applyHTTPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (*gatewayv1.HTTPRoute, error) {
 	desired := r.desiredHTTPRoute(env, gw)
 	if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
-		return err
+		return nil, err
 	}
 	existing := &gatewayv1.HTTPRoute{}
 	err := r.Get(ctx, client.ObjectKey{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
+		return desired, r.Create(ctx, desired)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := ensureDevEnvOwned(existing, env); err != nil {
-		return err
+		return nil, err
 	}
 	if apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		return nil
+		return existing, nil
 	}
 	desired.ResourceVersion = existing.ResourceVersion
-	return r.Update(ctx, desired)
+	return desired, r.Update(ctx, desired)
 }
 
-// applyTCPRoute creates or updates one TCPRoute.
-func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, name string, port int32) error {
+// applyTCPRoute creates or updates one TCPRoute, returning the stored object so
+// its acceptance can be read.
+func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, name string, port int32) (*gatewayv1.TCPRoute, error) {
 	desired := r.desiredTCPRoute(env, gw, name, port)
 	if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
-		return err
+		return nil, err
 	}
 	existing := &gatewayv1.TCPRoute{}
 	err := r.Get(ctx, client.ObjectKey{Name: desired.Name, Namespace: desired.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
-		return r.Create(ctx, desired)
+		return desired, r.Create(ctx, desired)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if err := ensureDevEnvOwned(existing, env); err != nil {
-		return err
+		return nil, err
 	}
 	if apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
-		return nil
+		return existing, nil
 	}
 	desired.ResourceVersion = existing.ResourceVersion
-	return r.Update(ctx, desired)
+	return desired, r.Update(ctx, desired)
 }
 
 // buildEndpoints assembles status.endpoints from the published routes: the
