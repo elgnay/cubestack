@@ -39,6 +39,8 @@ spec:
         {{- with .Values.gateway.dataplaneNamespace }}
         - --gateway-dataplane-namespace={{ . }}
         {{- end }}
+        - --l4-port-range-start={{ .Values.l4PortRange.start }}
+        - --l4-port-range-end={{ .Values.l4PortRange.end }}
         command:
         - /manager
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

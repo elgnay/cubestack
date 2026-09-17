@@ -68,6 +68,10 @@ sed -i 's|namespace: cubestack-system|namespace: {{ .Release.Namespace }}|g' "${
 # injected as {{- if/with .Values.gateway.* }} blocks. Each flag renders only
 # while its value is non-empty, so the empty defaults reproduce the
 # unconfigured state (no gateway flags at all).
+#
+# The DevEnvironment L4 port pool flags are rewritten the same way, but
+# unconditionally: the pool always has a range, so .Values.l4PortRange.start/end
+# are always passed.
 awk '
 /^[[:space:]]*- --gateway-name=cubestack-gateway$/ {
   if (gateway_name++) { print "duplicate --gateway-name line in kustomize output" > "/dev/stderr"; exit 1 }
@@ -91,6 +95,18 @@ awk '
   if (gateway_namespace++) { print "duplicate --gateway-namespace line in kustomize output" > "/dev/stderr"; exit 1 }
   next
 }
+/^[[:space:]]*- --l4-port-range-start=[0-9]+$/ {
+  if (l4_start++) { print "duplicate --l4-port-range-start line in kustomize output" > "/dev/stderr"; exit 1 }
+  ind = substr($0, 1, index($0, "-") - 1)
+  print ind "- --l4-port-range-start={{ .Values.l4PortRange.start }}"
+  next
+}
+/^[[:space:]]*- --l4-port-range-end=[0-9]+$/ {
+  if (l4_end++) { print "duplicate --l4-port-range-end line in kustomize output" > "/dev/stderr"; exit 1 }
+  ind = substr($0, 1, index($0, "-") - 1)
+  print ind "- --l4-port-range-end={{ .Values.l4PortRange.end }}"
+  next
+}
 { print }
 END {
   # Fail loudly if the needles above matched nothing (e.g. the args in
@@ -99,6 +115,10 @@ END {
   # stays green.
   if (gateway_name != 1 || gateway_namespace != 1) {
     print "gateway args not found in kustomize output — update needle in update-helm-resources.sh" > "/dev/stderr"
+    exit 1
+  }
+  if (l4_start != 1 || l4_end != 1) {
+    print "l4 port range args not found in kustomize output — update needle in update-helm-resources.sh" > "/dev/stderr"
     exit 1
   }
 }
@@ -177,4 +197,12 @@ expect_render dataplane-empty present '^[[:space:]]*- --gateway-name=cubestack-g
 # All four empty: reproduce the unconfigured state (no gateway flags at all).
 expect_render all-empty absent "${GW_ARG}" \
   --set gateway.name= --set gateway.namespace= --set gateway.domain= --set gateway.dataplaneNamespace=
+# The L4 port pool always renders, and follows its values verbatim: the range
+# decides which ports the controller may allocate, so a value that did not
+# reach the manager would make environments collide on ports the chart's
+# gateway does not carry.
+expect_render defaults present '^[[:space:]]*- --l4-port-range-start=20000$'
+expect_render defaults present '^[[:space:]]*- --l4-port-range-end=20999$'
+expect_render l4-range-custom present '^[[:space:]]*- --l4-port-range-start=30000$' --set l4PortRange.start=30000
+expect_render l4-range-custom present '^[[:space:]]*- --l4-port-range-end=30999$' --set l4PortRange.end=30999
 echo "chart resources regenerated under ${CHART}"

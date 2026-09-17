@@ -73,6 +73,10 @@ spec:
           #   - --gateway-domain=example.com
           - --gateway-name=cubestack-gateway
           - --gateway-namespace=cubestack-system
+          # DevEnvironment L4 port pool. The helm chart renders these two
+          # flags from its l4PortRange.* values instead.
+          - --l4-port-range-start=20000
+          - --l4-port-range-end=20999
         image: controller:latest
         imagePullPolicy: IfNotPresent
         name: manager

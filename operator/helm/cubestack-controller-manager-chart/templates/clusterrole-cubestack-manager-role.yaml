@@ -106,6 +106,7 @@ rules:
   - gateway.networking.k8s.io
   resources:
   - httproutes
+  - listenersets
   - tcproutes
   verbs:
   - create

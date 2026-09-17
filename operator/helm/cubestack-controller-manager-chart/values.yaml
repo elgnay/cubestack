@@ -19,6 +19,17 @@ gateway:
   # pods default-deny inbound.
   dataplaneNamespace: envoy-gateway-system  # --gateway-dataplane-namespace
 
+# External L4 port pool each DevEnvironment draws from. A port is allocated to
+# an environment's ssh exposure and to every spec.ports[] entry of type tcp;
+# each allocated port becomes a listener the environment's own ListenerSet
+# declares on the platform Gateway, so the range must be one the Gateway's
+# Service carries (a LoadBalancer forwards it, a NodePort needs the ports
+# published as nodePorts). The pool is cluster-wide: widen it as the number of
+# environments grows.
+l4PortRange:
+  start: 20000  # --l4-port-range-start
+  end: 20999    # --l4-port-range-end
+
 replicaCount: 1
 
 resources:

@@ -123,6 +123,32 @@ The kustomize deployment (`make deploy`) carries the same `--gateway-name` /
 `--gateway-domain` and `--gateway-dataplane-namespace` are left to your overlay
 there, so a kustomize install keeps environment pods default-deny inbound.
 
+### L4 port pool (DevEnvironment exposure)
+
+Each DevEnvironment that exposes `ssh` or a `spec.ports[]` entry of type `tcp`
+takes one port from a cluster-wide pool. The manager learns the range through
+two flags, fed by the `l4PortRange.*` values — these always render:
+
+| Key | Manager flag | Default |
+|---|---|---|
+| `l4PortRange.start` | `--l4-port-range-start` | `20000` |
+| `l4PortRange.end` | `--l4-port-range-end` | `20999` |
+
+A port is allocated to the lowest free number in the range and stays with the
+environment across restarts. Each allocated port becomes a listener the
+environment's own `ListenerSet` declares on the platform Gateway, so **the
+range must be one that Gateway's Service carries**: a `LoadBalancer` forwards
+any port, while a `NodePort` Service only carries the ports published as
+nodePorts. Widen the range as the number of environments grows.
+
+```bash
+helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system \
+  --create-namespace --set l4PortRange.start=20000 --set l4PortRange.end=29999
+```
+
+The kustomize deployment (`make deploy`) carries the same two args in
+`operator/config/manager/manager.yaml`.
+
 ## Uninstall
 
 ```bash

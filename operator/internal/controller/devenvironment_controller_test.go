@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -38,9 +39,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
@@ -60,12 +63,12 @@ const (
 	testGatewayIP                 = "1.2.3.4"
 	testGRPCPortName              = "grpc"
 	testJupyterName               = "jupyter"
-	// testSSHPortRangeStart is the lowest listener port the suite's reconciler
+	// testL4PortRangeStart is the lowest listener port the suite's reconciler
 	// allocates (suite_test.go), so it is the port a fresh environment takes
 	// from an empty pool.
-	testSSHPortRangeStart = 20000
-	testRuntimeUser       = "jovyan"
-	testUserSSHKey        = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
+	testL4PortRangeStart = 20000
+	testRuntimeUser      = "jovyan"
+	testUserSSHKey       = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 	// testUserKeysSecret is the user-supplied authorized-keys Secret the case-2
 	// specs reference by name; testUserKeysKey is the data entry its selector
 	// names. Deliberately not "keys": the delegated key is whatever the selector
@@ -143,6 +146,19 @@ func envKey(name string) client.ObjectKey {
 func deleteEnv(name string) {
 	env := &aiv1alpha1.DevEnvironment{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace}}
 	_ = k8sClient.Delete(ctx, env)
+}
+
+// updateEnvSpec applies mutate to the stored environment. It retries the
+// read-modify-write because the reconciler writes status concurrently: a write
+// landing between our Get and Update bumps the resourceVersion and the update
+// fails with a conflict. mutate must be idempotent, since it runs more than once.
+func updateEnvSpec(name string, mutate func(*aiv1alpha1.DevEnvironment)) {
+	Eventually(func(g Gomega) {
+		env := &aiv1alpha1.DevEnvironment{}
+		g.Expect(k8sClient.Get(ctx, envKey(name), env)).To(Succeed())
+		mutate(env)
+		g.Expect(k8sClient.Update(ctx, env)).To(Succeed())
+	}, "15s", "200ms").Should(Succeed())
 }
 
 func deleteGateway() {
@@ -263,11 +279,24 @@ func gatewayRouteParents(ref gatewayv1.ParentReference, generation int64, accept
 }
 
 // stampDevEnvRoutes stands in for the gateway controller, which envtest does not
-// run: it writes status.parents onto every route published for the environment,
-// so RouteReady can converge. Call it from inside the Eventually that asserts on
-// the routes' effect — the routes appear one reconcile at a time, and a route
-// whose spec has since changed is re-stamped against its new generation.
+// run: it admits the environment's ListenerSet and writes status.parents onto
+// every route published for the environment, so RouteReady can converge. Call it
+// from inside the Eventually that asserts on the routes' effect — the routes and
+// the ListenerSet appear one reconcile at a time, and an object whose spec has
+// since changed is re-stamped against its new generation.
+//
+// The routes' `accepted` does not carry over to the ListenerSet: a gateway
+// admits the listeners it is offered whatever it later makes of the routes on
+// them. A spec that wants the listeners refused stamps that with
+// stampDevEnvListenerSet instead of calling this.
 func stampDevEnvRoutes(g Gomega, envName string, accepted bool, reason, message string) {
+	stampDevEnvListenerSet(g, envName, true, "", "")
+	stampDevEnvRouteParents(g, envName, accepted, reason, message)
+}
+
+// stampDevEnvRouteParents writes the gateway's verdict on each route published
+// for the environment, leaving the ListenerSet alone.
+func stampDevEnvRouteParents(g Gomega, envName string, accepted bool, reason, message string) {
 	web := &gatewayv1.HTTPRoute{}
 	err := k8sClient.Get(ctx, client.ObjectKey{Name: envName + "-web", Namespace: testNamespace}, web)
 	if err != nil {
@@ -291,6 +320,37 @@ func stampDevEnvRoutes(g Gomega, envName string, accepted bool, reason, message 
 		route.Status.Parents = wanted
 		g.Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
 	}
+}
+
+// stampDevEnvListenerSet writes the gateway's verdict on the environment's
+// ListenerSet — the one it owes before it will report on the routes attached to
+// its listeners at all. An environment with no L4 exposure has no ListenerSet,
+// which is not a failure.
+func stampDevEnvListenerSet(g Gomega, envName string, accepted bool, reason, message string) {
+	ls := &gatewayv1.ListenerSet{}
+	err := k8sClient.Get(ctx, client.ObjectKey{Name: envName + l4ListenerSetSuffix, Namespace: testNamespace}, ls)
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	g.Expect(err).NotTo(HaveOccurred())
+	cond := metav1.Condition{
+		Type:               string(gatewayv1.ListenerSetConditionAccepted),
+		Status:             metav1.ConditionTrue,
+		Reason:             string(gatewayv1.ListenerSetReasonAccepted),
+		ObservedGeneration: ls.Generation,
+		LastTransitionTime: testRouteConditionTime,
+	}
+	if !accepted {
+		cond.Status = metav1.ConditionFalse
+		cond.Reason = reason
+		cond.Message = message
+	}
+	wanted := []metav1.Condition{cond}
+	if apiequality.Semantic.DeepEqual(ls.Status.Conditions, wanted) {
+		return
+	}
+	ls.Status.Conditions = wanted
+	g.Expect(k8sClient.Status().Update(ctx, ls)).To(Succeed())
 }
 
 // devEnvTCPRoutePorts lists the listener ports the environment's TCPRoutes hold.
@@ -350,7 +410,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 	})
 
 	Describe("allocatePort", func() {
-		cfg := DevEnvironmentControllerConfig{SSHPortRangeStart: 20000, SSHPortRangeEnd: 20002}
+		cfg := DevEnvironmentControllerConfig{L4PortRangeStart: 20000, L4PortRangeEnd: 20002}
 		r := &DevEnvironmentReconciler{Config: cfg}
 		used := func(ports ...int32) map[int32]bool {
 			m := map[int32]bool{}
@@ -387,6 +447,123 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			env := envWithSSHEndpoint(0)
 			env.Status.Endpoints = nil
 			Expect(r.allocatePort(env, sshPortName, used(20000, 20001, 20002))).To(Equal(int32(0)))
+		})
+	})
+
+	// Allocation is a read of the pool followed by a create, and the create lands
+	// in the API server while the TCPRoute informer catches up on its own
+	// schedule. A reconcile that runs inside that window would see the port the
+	// previous one just reserved as free and hand it out a second time, so the
+	// read has to bypass the cache. The two clients below are that window: the
+	// cache has not seen the route, the API server has. Asserting on the port
+	// that only the live client knows about fails if the List goes back through
+	// r.Client.
+	Describe("usedPorts", func() {
+		gatewayParent := func() []gatewayv1.ParentReference {
+			return []gatewayv1.ParentReference{{
+				Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
+				Namespace: ptrTo(gatewayv1.Namespace(systemNamespace)),
+				Name:      gatewayv1.ObjectName(defaultGatewayName),
+			}}
+		}
+		newRoute := func(name, ns string) *gatewayv1.TCPRoute {
+			return &gatewayv1.TCPRoute{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec:       gatewayv1.TCPRouteSpec{CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: gatewayParent()}},
+			}
+		}
+		newReconciler := func(objs ...client.Object) *DevEnvironmentReconciler {
+			scheme := runtime.NewScheme()
+			Expect(gatewayv1.Install(scheme)).To(Succeed())
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			lagging := fake.NewClientBuilder().WithScheme(scheme).Build()
+			return &DevEnvironmentReconciler{Client: lagging, APIReader: live}
+		}
+
+		It("reads the pool through APIReader, not the lagging cache", func() {
+			r := newReconciler(newRoute("peer-tcp-20001", "ns-a"))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).To(HaveKey(int32(20001)))
+		})
+
+		It("still ignores routes that are not on the configured Gateway", func() {
+			foreign := newRoute("peer-tcp-20001", "ns-a")
+			foreign.Spec.ParentRefs[0].Name = "some-other-gateway"
+			r := newReconciler(foreign, newRoute("peer-tcp-20002", "ns-a"))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).NotTo(HaveKey(int32(20001)))
+			Expect(used).To(HaveKey(int32(20002)))
+		})
+
+		It("leaves this environment's own ports free for it to reuse", func() {
+			own := newRoute("env-b-tcp-20003", "ns-b")
+			own.Labels = map[string]string{devEnvironmentLabelKey: "env-b"}
+			r := newReconciler(own, newRoute("peer-tcp-20004", "ns-a"))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).NotTo(HaveKey(int32(20003)))
+			Expect(used).To(HaveKey(int32(20004)))
+		})
+
+		// The ListenerSet is where an environment's ports are declared now, and it
+		// is the surviving claim: a route may be pruned or reparented while the
+		// listener it declared still holds the port.
+		newListenerSet := func(name, ns, gw string, ports ...int32) *gatewayv1.ListenerSet {
+			listeners := make([]gatewayv1.ListenerEntry, 0, len(ports))
+			for _, port := range ports {
+				listeners = append(listeners, gatewayv1.ListenerEntry{
+					Name: gatewayv1.SectionName(fmt.Sprintf("tcp-%d", port)), Protocol: gatewayv1.TCPProtocolType, Port: port,
+				})
+			}
+			return &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+						Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
+						Namespace: ptrTo(gatewayv1.Namespace(systemNamespace)),
+						Name:      gatewayv1.ObjectName(gw),
+					},
+					Listeners: listeners,
+				},
+			}
+		}
+
+		It("counts a peer's ListenerSet listeners", func() {
+			r := newReconciler(newListenerSet("peer-a-l4", "ns-a", defaultGatewayName, 20005, 20006))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).To(HaveKey(int32(20005)))
+			Expect(used).To(HaveKey(int32(20006)))
+		})
+
+		It("still counts a route attached straight to the Gateway", func() {
+			// The carry-over path: ports declared before ListenerSets existed, or
+			// declared by a route whose ListenerSet is not in this read.
+			r := newReconciler(newRoute("peer-tcp-20007", "ns-a"), newListenerSet("peer-a-l4", "ns-a", defaultGatewayName, 20008))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).To(HaveKey(int32(20007)))
+			Expect(used).To(HaveKey(int32(20008)))
+		})
+
+		It("leaves its own ListenerSet's ports free and ignores one on another gateway", func() {
+			own := newListenerSet("env-b-l4", "ns-b", defaultGatewayName, 20009)
+			own.Labels = map[string]string{devEnvironmentLabelKey: "env-b"}
+			r := newReconciler(own, newListenerSet("peer-a-l4", "ns-a", "some-other-gateway", 20010))
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).NotTo(HaveKey(int32(20009)))
+			Expect(used).NotTo(HaveKey(int32(20010)))
 		})
 	})
 
@@ -561,7 +738,7 @@ var _ = Describe("emitLifecycleTransition", func() {
 	})
 })
 
-var _ = Describe("DevEnvironment pod spec rendering", func() {
+var _ = Describe("DevEnvironment object rendering and publishing", func() {
 	Describe("mainContainerPort", func() {
 		It("maps jupyter to the 8888 web port", func() {
 			Expect(mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)).To(Equal(int32(8888)))
@@ -1246,6 +1423,125 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 		})
 	})
 
+	Describe("desiredListenerSet", func() {
+		render := func(ports []int32) *gatewayv1.ListenerSet {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-l4", Namespace: "project-llm"},
+				Spec:       aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeJupyter},
+			}
+			gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: defaultGatewayName, Namespace: systemNamespace}}
+			return (&DevEnvironmentReconciler{}).desiredListenerSet(env, gw, ports)
+		}
+
+		It("declares one TCP listener per allocated port, accepting same-namespace TCPRoutes", func() {
+			ls := render([]int32{20000, 20002})
+			Expect(ls.Name).To(Equal("de-l4-l4"))
+			Expect(ls.Namespace).To(Equal("project-llm"))
+			Expect(ls.Spec.Listeners).To(HaveLen(2))
+			for i, port := range []int32{20000, 20002} {
+				l := ls.Spec.Listeners[i]
+				Expect(l.Name).To(Equal(gatewayv1.SectionName(fmt.Sprintf("tcp-%d", port))))
+				Expect(l.Protocol).To(Equal(gatewayv1.TCPProtocolType))
+				Expect(l.Port).To(Equal(port))
+				Expect(l.AllowedRoutes.Kinds).To(Equal([]gatewayv1.RouteGroupKind{{
+					Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+					Kind:  gatewayv1.Kind(tcpRouteKind),
+				}}))
+				Expect(l.AllowedRoutes.Namespaces.From).To(Equal(ptrTo(gatewayv1.NamespacesFromSame)))
+			}
+		})
+
+		// applyListenerSet compares the stored spec against this one to decide
+		// whether to update, so every field the API server would default has to be
+		// set here — otherwise the object is rewritten on every reconcile.
+		It("spells out the fields the API server would otherwise default", func() {
+			ls := render([]int32{20000})
+			Expect(ls.Spec.ParentRef).To(Equal(gatewayv1.ParentGatewayReference{
+				Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
+				Namespace: ptrTo(gatewayv1.Namespace(systemNamespace)),
+				Name:      gatewayv1.ObjectName(defaultGatewayName),
+			}))
+		})
+	})
+
+	Describe("listenerSetRejection", func() {
+		// acceptedSet renders a ListenerSet as the gateway would report it, so the
+		// condition reads back the way the real status does.
+		acceptedSet := func(mut func(*gatewayv1.ListenerSet)) *gatewayv1.ListenerSet {
+			ls := &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-l4-l4", Namespace: "project-llm", Generation: 3},
+				Spec: gatewayv1.ListenerSetSpec{Listeners: []gatewayv1.ListenerEntry{
+					{Name: "tcp-20000", Protocol: gatewayv1.TCPProtocolType, Port: 20000},
+				}},
+			}
+			ls.Status.Conditions = []metav1.Condition{{
+				Type:               string(gatewayv1.ListenerSetConditionAccepted),
+				Status:             metav1.ConditionTrue,
+				Reason:             string(gatewayv1.ListenerSetReasonAccepted),
+				ObservedGeneration: ls.Generation,
+			}}
+			if mut != nil {
+				mut(ls)
+			}
+			return ls
+		}
+
+		It("passes an environment with no L4 exposure", func() {
+			Expect(listenerSetRejection(nil)).To(BeEmpty())
+		})
+
+		It("accepts a ListenerSet the gateway admitted", func() {
+			Expect(listenerSetRejection(acceptedSet(nil))).To(BeEmpty())
+		})
+
+		// The documented prerequisite: a Gateway that has not opted the namespace
+		// into allowedListeners refuses the ListenerSet, and its reason is the only
+		// thing that names the missing label.
+		It("surfaces the gateway's own reason for refusing the ListenerSet", func() {
+			ls := acceptedSet(func(ls *gatewayv1.ListenerSet) {
+				ls.Status.Conditions[0].Status = metav1.ConditionFalse
+				ls.Status.Conditions[0].Reason = string(gatewayv1.ListenerSetReasonNotAllowed)
+				ls.Status.Conditions[0].Message = "namespace project-llm is not allowed to attach to gateway cubestack-gateway"
+			})
+			Expect(listenerSetRejection(ls)).To(ContainSubstring(string(gatewayv1.ListenerSetReasonNotAllowed)))
+			Expect(listenerSetRejection(ls)).To(ContainSubstring("not allowed to attach"))
+		})
+
+		It("withholds an environment whose ListenerSet the gateway has not reported on", func() {
+			ls := acceptedSet(func(ls *gatewayv1.ListenerSet) { ls.Status.Conditions = nil })
+			Expect(listenerSetRejection(ls)).To(ContainSubstring("has not been accepted"))
+		})
+
+		It("ignores a verdict on a previous generation", func() {
+			ls := acceptedSet(func(ls *gatewayv1.ListenerSet) {
+				ls.Status.Conditions[0].Status = metav1.ConditionFalse
+				ls.Status.Conditions[0].Reason = string(gatewayv1.ListenerSetReasonNotAllowed)
+				ls.Status.Conditions[0].ObservedGeneration = ls.Generation - 1
+			})
+			Expect(listenerSetRejection(ls)).To(ContainSubstring("has not been accepted"))
+		})
+
+		// Gateway API resolves a port conflict in the older listener's favour, so
+		// an accepted ListenerSet can still carry a listener that never reaches a
+		// dataplane — the hand-made Gateway listeners' state during a cutover.
+		It("names a listener that lost its port to another listener", func() {
+			ls := acceptedSet(func(ls *gatewayv1.ListenerSet) {
+				ls.Status.Listeners = []gatewayv1.ListenerEntryStatus{{
+					Name: "tcp-20000",
+					Conditions: []metav1.Condition{{
+						Type:    string(gatewayv1.ListenerEntryConditionConflicted),
+						Status:  metav1.ConditionTrue,
+						Reason:  string(gatewayv1.ListenerEntryReasonListenerConflict),
+						Message: "port 20000 is already in use",
+					}},
+				}}
+			})
+			Expect(listenerSetRejection(ls)).To(ContainSubstring("tcp-20000"))
+			Expect(listenerSetRejection(ls)).To(ContainSubstring("already in use"))
+		})
+	})
+
 	Describe("podTemplateAnnotations", func() {
 		It("carries the ssh keys revision only while ssh is exposed", func() {
 			env := &aiv1alpha1.DevEnvironment{
@@ -1261,6 +1557,35 @@ var _ = Describe("DevEnvironment pod spec rendering", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
 			Expect(podTemplateAnnotations(env)).To(BeNil())
 		})
+	})
+})
+var _ = Describe("DevEnvironmentReconciler construction", func() {
+	// Only the config guard is testable here. A range that passes it reaches
+	// builder.Complete, and controller-runtime's controller names are unique
+	// per *process*, not per manager — the suite registered "devenvironment" in
+	// BeforeSuite, so no second registration can succeed however it is built.
+	// The valid path is therefore covered by the suite's own construction, and
+	// these specs cover the guard by returning before the manager is touched.
+	//
+	// The error is asserted by message, not just by occurrence: with the guard
+	// gone, registration fails on the duplicate name instead, and
+	// HaveOccurred() alone would pass for that reason.
+	It("rejects an L4 port range with no ports in it", func() {
+		r := &DevEnvironmentReconciler{
+			Config: DevEnvironmentControllerConfig{L4PortRangeStart: 30000, L4PortRangeEnd: 20000},
+		}
+		Expect(r.SetupWithManager(testMgr)).To(
+			MatchError(ContainSubstring("L4 port range is empty")))
+	})
+
+	It("rejects an unset end that defaults below an explicit start", func() {
+		// The guard runs on the defaulted config, so an unset end is 20999
+		// rather than 0 — otherwise start=30000 would compare as valid.
+		r := &DevEnvironmentReconciler{
+			Config: DevEnvironmentControllerConfig{L4PortRangeStart: 30000},
+		}
+		Expect(r.SetupWithManager(testMgr)).To(
+			MatchError(ContainSubstring("L4 port range is empty")))
 	})
 })
 
@@ -2830,7 +3155,9 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 
 			// One TCPRoute per allocated port: SSH behind tcp-<port> with backend
-			// port 22, the grpc extra port with its container port.
+			// port 22, the grpc extra port with its container port. Each attaches
+			// to the matching listener of the environment's own ListenerSet, not
+			// to the shared Gateway.
 			for _, tc := range []struct {
 				endpointName string
 				port         int32
@@ -2842,6 +3169,8 @@ var _ = Describe("DevEnvironment controller", func() {
 				tr := &gatewayv1.TCPRoute{}
 				Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, tc.port), Namespace: env.Namespace}, tr)).To(Succeed())
 				Expect(tr.Spec.ParentRefs).To(HaveLen(1))
+				Expect(tr.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName(listenerSetName(env))))
+				Expect(tr.Spec.ParentRefs[0].Kind).To(Equal(ptrTo(gatewayv1.Kind(listenerSetKind))))
 				Expect(tr.Spec.ParentRefs[0].SectionName).To(Equal(ptrTo(gatewayv1.SectionName(fmt.Sprintf("tcp-%d", tc.port)))))
 				Expect(tr.Spec.Rules[0].BackendRefs).To(HaveLen(1))
 				Expect(tr.Spec.Rules[0].BackendRefs[0].Port).To(Equal(ptrTo(tc.backendPort)))
@@ -2855,6 +3184,118 @@ var _ = Describe("DevEnvironment controller", func() {
 				aiv1alpha1.Endpoint{Name: "metrics", Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/"},
 				aiv1alpha1.Endpoint{Name: testGRPCPortName, Address: fmt.Sprintf("%s:%d", testGatewayIP, pGRPC)},
 			))
+		})
+
+		It("declares its L4 listeners in a ListenerSet it owns", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-l4-set")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				// The listeners are declared first and the routes attach to them,
+				// so both ports are known from the routes' names before anything
+				// is accepted.
+				ports := devEnvTCPRoutePorts(g, env.Name)
+				g.Expect(ports).To(HaveLen(2))
+
+				ls := &gatewayv1.ListenerSet{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, ls)).To(Succeed())
+				g.Expect(ls.Spec.ParentRef.Name).To(Equal(gatewayv1.ObjectName(testDevEnvGatewayName)))
+				g.Expect(ls.Spec.ParentRef.Kind).To(Equal(ptrTo(gatewayv1.Kind(gatewayKind))))
+				g.Expect(ls.Labels).To(HaveKeyWithValue(devEnvironmentLabelKey, env.Name))
+
+				// Owned by the environment: the ListenerSet holds its ports, so it
+				// must not outlive it.
+				owner := metav1.GetControllerOf(ls)
+				g.Expect(owner).NotTo(BeNil())
+				g.Expect(owner.UID).To(Equal(env.UID))
+
+				declared := make([]int32, 0, len(ls.Spec.Listeners))
+				for _, l := range ls.Spec.Listeners {
+					g.Expect(l.Protocol).To(Equal(gatewayv1.TCPProtocolType))
+					g.Expect(l.AllowedRoutes.Kinds).To(HaveLen(1))
+					g.Expect(l.AllowedRoutes.Kinds[0].Kind).To(Equal(gatewayv1.Kind(tcpRouteKind)))
+					declared = append(declared, l.Port)
+				}
+				slices.Sort(declared)
+				slices.Sort(ports)
+				g.Expect(declared).To(Equal(ports))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("withholds the endpoints when the Gateway refuses the ListenerSet", func() {
+			// The design's documented prerequisite: a Gateway that has not opted
+			// the namespace into allowedListeners refuses the ListenerSet, and the
+			// routes attached to its listeners are never reported on at all. The
+			// refusal has to surface as its own reason, or the missing
+			// allowedListeners reads as routes that never converge.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-l4-refused")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				// The routes themselves are accepted: only the ListenerSet is
+				// refused, so nothing else explains the withheld endpoints.
+				stampDevEnvRouteParents(g, env.Name, true, "", "")
+				stampDevEnvListenerSet(g, env.Name, false, string(gatewayv1.ListenerSetReasonNotAllowed),
+					"namespace default is not allowed to attach to gateway "+testDevEnvGatewayName)
+
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal(reasonListenerNotAccepted))
+				g.Expect(cond.Message).To(ContainSubstring("NotAllowed"))
+				g.Expect(cond.Message).To(ContainSubstring("not allowed to attach"))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Admitting it lets the routes' own verdict take over again.
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				g.Expect(sshEndpointPort(got.Status.Endpoints)).To(BeNumerically(">", 0))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("deletes the ListenerSet when the environment loses its last L4 port", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-l4-empty")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			ls := &gatewayv1.ListenerSet{}
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, ls)).To(Succeed())
+				g.Expect(ls.Spec.Listeners).To(HaveLen(1))
+			}, "15s", "200ms").Should(Succeed())
+
+			// Leaving a listener behind would keep claiming its port, and Gateway
+			// API would keep preferring it as the older declaration.
+			updateEnvSpec(env.Name, func(env *aiv1alpha1.DevEnvironment) { env.Spec.SSH = nil })
+
+			Eventually(func(g Gomega) {
+				err := k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, &gatewayv1.ListenerSet{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
 		})
 
 		It("keeps the SSH port stable and allocates distinct ports", func() {
@@ -2902,9 +3343,11 @@ var _ = Describe("DevEnvironment controller", func() {
 			defer deleteGateway()
 
 			// Neither environment's route is accepted, so both withhold their
-			// status.endpoints. The pool has to come from the TCPRoutes: read from
-			// the endpoints instead and the second environment sees nothing
-			// reserved and takes the first one's listener port.
+			// status.endpoints. The pool has to come from the objects that declare
+			// the listeners — the ListenerSet, and for a peer whose route is still
+			// attached straight to the Gateway, the route: read from the endpoints
+			// instead and the second environment sees nothing reserved and takes
+			// the first one's listener port.
 			env1 := validDevEnvironment("de-port-unaccepted-a")
 			env1.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			Expect(k8sClient.Create(ctx, env1)).To(Succeed())
@@ -2929,7 +3372,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("ignores listener ports held by routes on another gateway", func() {
+		It("ignores listener ports held by objects on another gateway", func() {
 			createGateway(true)
 			defer deleteGateway()
 
@@ -2949,7 +3392,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			// reserve that port — the pool is this Gateway's listeners.
 			foreign := &gatewayv1.TCPRoute{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      fmt.Sprintf("foreign-tcp-%d", testSSHPortRangeStart),
+					Name:      fmt.Sprintf("foreign-tcp-%d", testL4PortRangeStart),
 					Namespace: testNamespace,
 				},
 				Spec: gatewayv1.TCPRouteSpec{
@@ -2972,6 +3415,28 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
 			defer func() { _ = k8sClient.Delete(ctx, foreign) }()
 
+			// Same for a ListenerSet: its listeners belong to the Gateway it names,
+			// and one naming another Gateway holds no listener here.
+			foreignSet := &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      fmt.Sprintf("foreign-l4-%d", testL4PortRangeStart+1),
+					Namespace: testNamespace,
+				},
+				Spec: gatewayv1.ListenerSetSpec{
+					ParentRef: gatewayv1.ParentGatewayReference{
+						Name:      gatewayv1.ObjectName("other-gw"),
+						Namespace: ptrTo(gatewayv1.Namespace(testNamespace)),
+					},
+					Listeners: []gatewayv1.ListenerEntry{{
+						Name:     gatewayv1.SectionName(fmt.Sprintf("tcp-%d", testL4PortRangeStart+1)),
+						Protocol: gatewayv1.TCPProtocolType,
+						Port:     gatewayv1.PortNumber(testL4PortRangeStart + 1),
+					}},
+				},
+			}
+			Expect(k8sClient.Create(ctx, foreignSet)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, foreignSet) }()
+
 			env := validDevEnvironment("de-foreign-pool")
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -2980,7 +3445,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				ports := devEnvTCPRoutePorts(g, env.Name)
 				g.Expect(ports).To(HaveLen(1))
-				g.Expect(ports[0]).To(Equal(int32(testSSHPortRangeStart)))
+				g.Expect(ports[0]).To(Equal(int32(testL4PortRangeStart)))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3011,18 +3476,19 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(pGRPC).To(BeNumerically(">", 0))
 			}, "15s", "200ms").Should(Succeed())
 
-			// Drop the extra TCP exposure: the grpc TCPRoute must be deleted
-			// while the SSH route and its port stay stable.
-			got := &aiv1alpha1.DevEnvironment{}
-			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-			got.Spec.Ports = nil
-			Expect(k8sClient.Update(ctx, got)).To(Succeed())
+			// Drop the extra TCP exposure: the grpc TCPRoute and its listener must
+			// go while the SSH route, its listener and its port stay stable.
+			updateEnvSpec(env.Name, func(env *aiv1alpha1.DevEnvironment) { env.Spec.Ports = nil })
 
 			Eventually(func(g Gomega) {
 				stampDevEnvRoutes(g, env.Name, true, "", "")
 				tr := &gatewayv1.TCPRoute{}
 				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pGRPC), Namespace: env.Namespace}, tr))).To(BeTrue())
 				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env.Name, pSSH), Namespace: env.Namespace}, tr)).To(Succeed())
+				ls := &gatewayv1.ListenerSet{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, ls)).To(Succeed())
+				g.Expect(ls.Spec.Listeners).To(HaveLen(1))
+				g.Expect(ls.Spec.Listeners[0].Port).To(Equal(pSSH))
 				got2 := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got2)).To(Succeed())
 				g.Expect(sshEndpointPort(got2.Status.Endpoints)).To(Equal(pSSH))
@@ -3082,15 +3548,18 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env1.Name, p), Namespace: env1.Namespace}, tr)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 
-			// Deleting the environment must release both the TCPRoute and the
-			// listener port. Wait until the object is fully gone: its status
-			// endpoints would otherwise still mark the port as in use.
+			// Deleting the environment must release the TCPRoute, the ListenerSet
+			// and the listener port. Wait until the object is fully gone: its
+			// status endpoints would otherwise still mark the port as in use.
 			Expect(k8sClient.Delete(ctx, env1)).To(Succeed())
 			Eventually(func(g Gomega) {
 				err := k8sClient.Get(ctx, envKey(env1.Name), &aiv1alpha1.DevEnvironment{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 				tr := &gatewayv1.TCPRoute{}
 				err = k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-tcp-%d", env1.Name, p), Namespace: env1.Namespace}, tr)
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+				ls := &gatewayv1.ListenerSet{}
+				err = k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env1), Namespace: env1.Namespace}, ls)
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 

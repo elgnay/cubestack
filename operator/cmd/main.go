@@ -69,6 +69,7 @@ func main() {
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	var gatewayDomain, gatewayName, gatewayNamespace, gatewayDataplaneNamespace string
+	var l4PortRangeStart, l4PortRangeEnd int
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&gatewayDomain, "gateway-domain", "",
@@ -78,6 +79,12 @@ func main() {
 	flag.StringVar(&gatewayDataplaneNamespace, "gateway-dataplane-namespace", "",
 		"Namespace the platform Gateway's dataplane pods run in; when set, DevEnvironment pods admit "+
 			"ingress from that Gateway. Leaving it empty keeps environments default-deny inbound.")
+	flag.IntVar(&l4PortRangeStart, "l4-port-range-start", 20000,
+		"First port of the DevEnvironment L4 port pool. Each allocated port becomes a listener the "+
+			"environment's own ListenerSet declares on the platform Gateway.")
+	flag.IntVar(&l4PortRangeEnd, "l4-port-range-end", 20999,
+		"Last port of the DevEnvironment L4 port pool. The pool is cluster-wide: each ssh exposure and "+
+			"each spec.ports[].type: tcp exposure takes one port from it.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -231,8 +238,8 @@ func main() {
 			GatewayNamespace:          "cubestack-system",
 			GatewayDataplaneNamespace: gatewayDataplaneNamespace,
 			HTTPPort:                  80,
-			SSHPortRangeStart:         20000,
-			SSHPortRangeEnd:           20999,
+			L4PortRangeStart:          int32(l4PortRangeStart),
+			L4PortRangeEnd:            int32(l4PortRangeEnd),
 		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DevEnvironment")

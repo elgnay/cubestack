@@ -27,6 +27,7 @@ limitations under the License.
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=tcproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=listenersets,verbs=get;list;watch;create;update;patch;delete
 
 package controller
 
@@ -62,6 +63,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	ctrlc "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -89,11 +91,15 @@ type DevEnvironmentControllerConfig struct {
 	GatewayIP string
 	// HTTPPort is the Gateway's HTTP listener port used in published URLs.
 	HTTPPort int32
-	// SSHPortRangeStart is the first port of the Gateway's static TCP listener
-	// pool allocated per environment (design §6.2).
-	SSHPortRangeStart int32
-	// SSHPortRangeEnd is the last port of the Gateway's static TCP listener pool.
-	SSHPortRangeEnd int32
+	// L4PortRangeStart is the first port of the external L4 port pool allocated
+	// per environment (design §6.2). The pool serves ssh and every
+	// spec.ports[].type: tcp exposure; UDP is not implemented yet (design §10)
+	// and would draw from here too.
+	L4PortRangeStart int32
+	// L4PortRangeEnd is the last port of the external L4 port pool. An allocated
+	// port becomes a listener the environment's own ListenerSet declares on the
+	// shared Gateway, so nothing has to pre-create listeners in this range.
+	L4PortRangeEnd int32
 }
 
 // Reason constants for DevEnvironment conditions and status.phase. Several
@@ -115,6 +121,7 @@ const (
 	reasonGatewayNotReady        = "GatewayNotReady"
 	reasonGatewayAPINotInstalled = "GatewayAPINotInstalled"
 	reasonGatewayNotAccepted     = "GatewayNotAccepted"
+	reasonListenerNotAccepted    = "ListenerNotAccepted"
 	reasonRouteCreateFailed      = "RouteCreateFailed"
 
 	// Pod waiting reasons that fail the environment (design §4.2: image and
@@ -131,9 +138,15 @@ const (
 	// StatefulSet is updated only when the template or replicas change.
 	stsSpecHashAnnotationKey = "ai.cubestack.io/sts-spec-hash"
 
-	// Gateway API well-known names used in route specs.
+	// Gateway API well-known names used in route specs. listenerSetKind is the
+	// parent a TCPRoute attaches to: the environment contributes its own L4
+	// listeners through a ListenerSet rather than a Gateway listener someone
+	// pre-created, which is what lets the controller allocate a port end to end
+	// without write access to the shared Gateway (design §5).
 	gatewayAPIGroup = "gateway.networking.k8s.io"
 	gatewayKind     = "Gateway"
+	listenerSetKind = "ListenerSet"
+	tcpRouteKind    = "TCPRoute"
 	serviceKind     = "Service"
 
 	// Labels Envoy Gateway puts on the dataplane pods it creates for a Gateway.
@@ -156,6 +169,10 @@ const (
 	// authorized keys — so it is two volumes and one mount each.
 	sshHostKeyVolumeName        = "ssh-host-key"
 	sshAuthorizedKeysVolumeName = "ssh-authorized-keys"
+
+	// l4ListenerSetSuffix makes the per-environment ListenerSet's name; the
+	// environment's L4 listeners all live in that one object.
+	l4ListenerSetSuffix = "-l4"
 
 	// sshServicePort is the port the platform publishes ssh on — the Service
 	// port, the TCPRoute backendRef and the endpoint address — while
@@ -263,6 +280,12 @@ type DevEnvironmentReconciler struct {
 	// §11.2). When nil it is wired from the manager in SetupWithManager; the
 	// guard keeps helper-only constructions safe.
 	Recorder events.EventRecorder
+	// APIReader reads straight from the API server instead of the manager's
+	// cache. Port allocation depends on it: usedPorts has to observe a port
+	// another reconcile just reserved, and a cached List serves whatever the
+	// informer last saw (see usedPorts). When nil it is wired from the manager in
+	// SetupWithManager, like Recorder.
+	APIReader client.Reader
 }
 
 // Reconcile runs the DevEnvironment pipeline: brand match gate, SSH secret,
@@ -567,16 +590,16 @@ func (r *DevEnvironmentReconciler) detachWorkspaceClaims(ctx context.Context, en
 	return nil
 }
 
-// deleteRoutes removes the HTTPRoute and TCPRoutes created for the
-// environment, looked up by label because TCPRoute names embed allocated
-// ports. When the Gateway API CRDs are not installed, there is nothing to do.
+// deleteRoutes removes the HTTPRoute, TCPRoutes and ListenerSet created for the
+// environment, looked up by label because the route names embed allocated ports.
+// A kind whose CRD is not served is skipped — the failed List leaves it with
+// nothing to delete — rather than returning from the function: the Gateway API
+// kinds arrive with separate CRDs, so stopping at the first miss would leak the
+// objects of the kinds that are installed.
 func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
 	opts := []client.ListOption{client.InNamespace(env.Namespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name}}
 	var hrs gatewayv1.HTTPRouteList
-	if err := r.List(ctx, &hrs, opts...); err != nil {
-		if meta.IsNoMatchError(err) {
-			return nil
-		}
+	if err := r.List(ctx, &hrs, opts...); err != nil && !meta.IsNoMatchError(err) {
 		return err
 	}
 	for i := range hrs.Items {
@@ -588,10 +611,7 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 		}
 	}
 	var trs gatewayv1.TCPRouteList
-	if err := r.List(ctx, &trs, opts...); err != nil {
-		if meta.IsNoMatchError(err) {
-			return nil
-		}
+	if err := r.List(ctx, &trs, opts...); err != nil && !meta.IsNoMatchError(err) {
 		return err
 	}
 	for i := range trs.Items {
@@ -602,6 +622,18 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 			return err
 		}
 	}
+	var lss gatewayv1.ListenerSetList
+	if err := r.List(ctx, &lss, opts...); err != nil && !meta.IsNoMatchError(err) {
+		return err
+	}
+	for i := range lss.Items {
+		if err := ensureDevEnvOwned(&lss.Items[i], env); err != nil {
+			continue
+		}
+		if err := r.Delete(ctx, &lss.Items[i]); err != nil && !apierrors.IsNotFound(err) {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -609,9 +641,24 @@ func (r *DevEnvironmentReconciler) deleteRoutes(ctx context.Context, env *aiv1al
 // and the label-based Pod/PVC watches (the pod and workspace PVC are owned by
 // the StatefulSet, not the environment). Gateway watches are added only when
 // the Gateway API CRDs are installed, since a missing CRD would fail the cache.
+// It also validates the controller config, so a misconfiguration fails at
+// startup rather than on every environment it touches.
 func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// A range with no ports in it is a configuration error, not an empty pool.
+	// Left unchecked it surfaces per environment as allocatePort finding no
+	// port, which reconcileGatewayRoutes reports as "no free port in the L4
+	// port range 30000-20000" — a message that reads as exhaustion and sends
+	// the reader looking for environments that are not there. Validated on the
+	// defaulted config so an unset end is compared as its default, not as zero.
+	if cfg := r.defaultedConfig(); cfg.L4PortRangeStart > cfg.L4PortRangeEnd {
+		return fmt.Errorf("the L4 port range is empty: start %d is greater than end %d",
+			cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
+	}
 	if r.Recorder == nil {
 		r.Recorder = mgr.GetEventRecorder(devEnvManagedByValue)
+	}
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
 	}
 	builder := ctrl.NewControllerManagedBy(mgr).
 		For(&aiv1alpha1.DevEnvironment{}).
@@ -622,12 +669,24 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvKeysSecret)).
 		Watches(&aiv1alpha1.DevEnvironment{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
-	if gatewayAPICRDsInstalled(mgr) {
+	if gatewayAPICRDInstalled(mgr, gatewayKind) {
 		builder.Owns(&gatewayv1.HTTPRoute{}).
 			Owns(&gatewayv1.TCPRoute{}).
 			Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
+		// The ListenerSet is probed separately: it is a distinct CRD, and an
+		// install carrying the Gateway API without it would otherwise fail to
+		// start the manager on an informer for a kind the server does not serve.
+		if gatewayAPICRDInstalled(mgr, listenerSetKind) {
+			builder.Owns(&gatewayv1.ListenerSet{})
+		}
 	}
-	return builder.Complete(r)
+	// MaxConcurrentReconciles is pinned to 1 rather than left to default to it.
+	// Port allocation reads the pool and then creates a TCPRoute, and nothing
+	// reserves the port in between: it is safe only because this single worker
+	// serializes the pair (see usedPorts). Raising this reopens that race and
+	// needs a real reservation primitive first, so making it explicit is what
+	// keeps the dependency from being broken by an unrelated tuning change.
+	return builder.WithOptions(ctrlc.Options{MaxConcurrentReconciles: 1}).Complete(r)
 }
 
 // enqueueForDevEnv maps a labeled Pod or PVC to its DevEnvironment.
@@ -678,11 +737,12 @@ func (r *DevEnvironmentReconciler) enqueueForDevEnvKeysSecret(ctx context.Contex
 	return reqs
 }
 
-// gatewayAPICRDsInstalled reports whether the Gateway API CRDs are present,
-// so the manager only watches Gateway routes when the API is available.
-func gatewayAPICRDsInstalled(mgr ctrl.Manager) bool {
+// gatewayAPICRDInstalled reports whether one Gateway API kind is served, so the
+// manager only watches the Gateway API objects this cluster actually has. The
+// kinds arrive with separate CRDs, so each is probed for itself.
+func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) bool {
 	_, err := mgr.GetRESTMapper().RESTMapping(
-		schema.GroupKind{Group: gatewayv1.GroupName, Kind: gatewayKind}, gatewayv1.GroupVersion.Version)
+		schema.GroupKind{Group: gatewayv1.GroupName, Kind: kind}, gatewayv1.GroupVersion.Version)
 	return err == nil
 }
 
@@ -1871,8 +1931,11 @@ func appendSSHString(b, s []byte) []byte {
 // RouteReady reports what the Gateway did with the routes, not merely that they
 // were written: a route the Gateway has not accepted (or has not reported on
 // yet) is GatewayNotAccepted and its address is withheld from status.endpoints,
-// which would otherwise advertise an address that does not connect. The route
-// watches above re-enqueue the environment when the Gateway writes that status.
+// which would otherwise advertise an address that does not connect. The L4
+// listeners are checked first and reported as ListenerNotAccepted, because a
+// Gateway that refuses the ListenerSet refuses it above the routes attached to
+// it. The route watches above re-enqueue the environment when the Gateway writes
+// that status.
 func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus) error {
 	cfg := r.defaultedConfig()
 	gw := &gatewayv1.Gateway{}
@@ -1888,9 +1951,16 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		return err
 	}
 
-	ports, published, err := r.publishRoutes(ctx, env, gw)
+	ports, l4, published, err := r.publishRoutes(ctx, env, gw)
 	if err != nil {
-		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonRouteCreateFailed, err.Error())
+		// A kind the API server does not serve means the Gateway API install is
+		// incomplete rather than that publishing failed; say that instead of
+		// reporting the no-match error as a route failure.
+		reason := reasonRouteCreateFailed
+		if meta.IsNoMatchError(err) {
+			reason = reasonGatewayAPINotInstalled
+		}
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reason, err.Error())
 		return nil
 	}
 
@@ -1900,8 +1970,13 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		status.Endpoints = nil
 		return nil
 	}
+	if rejection := listenerSetRejection(l4); rejection != "" {
+		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonListenerNotAccepted, rejection)
+		status.Endpoints = nil
+		return nil
+	}
 	for _, route := range published {
-		if rejection := route.rejection(cfg.GatewayName, cfg.GatewayNamespace); rejection != "" {
+		if rejection := route.rejection(); rejection != "" {
 			setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotAccepted, rejection)
 			status.Endpoints = nil
 			return nil
@@ -1913,27 +1988,34 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 }
 
 // publishedRoute is the part of a route this reconcile published that the
-// Gateway reports on: what it is, and the status the Gateway wrote for it.
+// Gateway reports on: what it is, the status the Gateway wrote for it, and which
+// object that status is reported against.
 type publishedRoute struct {
 	kind       string
 	name       string
 	generation int64
 	parents    []gatewayv1.RouteParentStatus
+	// parentKind/parentName/parentNamespace name the parent the route attaches
+	// to, and so the object whose status reports on it: the shared Gateway for
+	// the HTTPRoute, the environment's own ListenerSet for each TCPRoute.
+	parentKind      string
+	parentName      string
+	parentNamespace string
 }
 
-// rejection returns "" when the Gateway has accepted the route, and otherwise a
-// message naming it — the Gateway's own reason for refusing, when it gave one,
-// or the fact that it has not reported on the route's current generation at all.
-func (p publishedRoute) rejection(gatewayName, gatewayNamespace string) string {
-	if routeParentsAccepted(p.parents, p.generation, gatewayName, gatewayNamespace) {
+// rejection returns "" when the route's parent has accepted it, and otherwise a
+// message naming it — the parent's own reason for refusing, when it gave one, or
+// the fact that it has not reported on the route's current generation at all.
+func (p publishedRoute) rejection() string {
+	if routeParentsAccepted(p.parents, p.generation, p.parentName, p.parentNamespace) {
 		return ""
 	}
-	message := fmt.Sprintf("%s %s is not accepted by gateway %s/%s", p.kind, p.name, gatewayNamespace, gatewayName)
-	// Quote the Gateway's own verdict: "No listeners match this parent ref" names
+	message := fmt.Sprintf("%s %s is not accepted by %s %s/%s", p.kind, p.name, p.parentKind, p.parentNamespace, p.parentName)
+	// Quote the parent's own verdict: "No listeners match this parent ref" names
 	// the fix, where a bare "not accepted" does not.
-	parent := routeParentFor(p.parents, gatewayName, gatewayNamespace)
+	parent := routeParentFor(p.parents, p.parentName, p.parentNamespace)
 	if parent == nil {
-		return message + ": the gateway has not reported on its current generation"
+		return message + ": it has not reported on the route's current generation"
 	}
 	for _, cond := range parent.Conditions {
 		if cond.Status == metav1.ConditionTrue {
@@ -1947,6 +2029,51 @@ func (p publishedRoute) rejection(gatewayName, gatewayNamespace string) string {
 	return message
 }
 
+// listenerSetRejection returns "" when the environment's L4 listeners have been
+// admitted, and otherwise a message naming what refused them.
+//
+// It is read before the routes because a refusal lands one level above them: a
+// Gateway that does not admit the ListenerSet — the namespace is not allowed by
+// allowedListeners, or it has not processed it yet — never gives its routes a
+// verdict of their own, so the routes would report only that nothing reported on
+// them. Surfacing the ListenerSet's own reason is what makes the documented
+// allowedListeners prerequisite diagnosable instead of appearing as an
+// environment whose endpoints never appear.
+func listenerSetRejection(ls *gatewayv1.ListenerSet) string {
+	if ls == nil {
+		return ""
+	}
+	name := fmt.Sprintf("%s %s/%s", listenerSetKind, ls.Namespace, ls.Name)
+	reported := false
+	for _, cond := range ls.Status.Conditions {
+		if cond.Type != string(gatewayv1.ListenerSetConditionAccepted) {
+			continue
+		}
+		if cond.ObservedGeneration != 0 && cond.ObservedGeneration != ls.Generation {
+			continue // stale status from a previous generation
+		}
+		reported = true
+		if cond.Status != metav1.ConditionTrue {
+			return fmt.Sprintf("%s is not accepted by the gateway: %s: %s", name, cond.Reason, cond.Message)
+		}
+	}
+	if !reported {
+		return name + " has not been accepted by the gateway"
+	}
+	// A listener comes back Conflicted when another listener already holds its
+	// port. Gateway API resolves that in the older object's favour, so this
+	// environment's port stays dead even though the ListenerSet was accepted —
+	// the state the cutover off hand-made Gateway listeners passes through.
+	for _, l := range ls.Status.Listeners {
+		for _, cond := range l.Conditions {
+			if cond.Type == string(gatewayv1.ListenerEntryConditionConflicted) && cond.Status == metav1.ConditionTrue {
+				return fmt.Sprintf("%s listener %s is conflicted: %s", name, l.Name, cond.Message)
+			}
+		}
+	}
+	return ""
+}
+
 // gatewayIP prefers the Gateway's first status address, falling back to the
 // configured static address.
 func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string {
@@ -1958,21 +2085,23 @@ func gatewayIP(gw *gatewayv1.Gateway, cfg DevEnvironmentControllerConfig) string
 	return cfg.GatewayIP
 }
 
-// publishRoutes allocates the SSH and extra TCP ports, then applies the
-// HTTPRoute and one TCPRoute per allocated port. The returned map is keyed by
-// endpoint name and drives buildEndpoints; the returned routes are what the
-// Gateway's acceptance is read from.
-func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, []publishedRoute, error) {
+// publishRoutes allocates the SSH and extra TCP ports, declares them as the
+// environment's own Gateway listeners, then applies the HTTPRoute and one
+// TCPRoute per allocated port. The returned map is keyed by endpoint name and
+// drives buildEndpoints; the returned routes are what the Gateway's acceptance
+// is read from, and the returned ListenerSet is what its listeners' acceptance
+// is read from (nil when the environment has no L4 port).
+func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway) (map[string]int32, *gatewayv1.ListenerSet, []publishedRoute, error) {
 	cfg := r.defaultedConfig()
 	used, err := r.usedPorts(ctx, env.Namespace, env.Name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	ports := map[string]int32{}
 	if sshExposed(env) {
 		p := r.allocatePort(env, sshPortName, used)
 		if p == 0 {
-			return nil, nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
+			return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 		}
 		ports[sshPortName] = p
 	}
@@ -1982,7 +2111,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		}
 		p := r.allocatePort(env, sp.Name, used)
 		if p == 0 {
-			return nil, nil, fmt.Errorf("no free port in the SSH port range %d-%d", cfg.SSHPortRangeStart, cfg.SSHPortRangeEnd)
+			return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 		}
 		ports[sp.Name] = p
 	}
@@ -1991,16 +2120,28 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 	// above no longer allocates their ports, but the old TCPRoute would keep
 	// claiming the Gateway listener and block reuse of the freed port.
 	if err := r.pruneTCPRoutes(ctx, env, ports); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
+	}
+
+	// Declare the listeners before the routes that attach to them. The routes
+	// would be published either way — a route whose listener does not exist yet
+	// simply is not accepted — but creating the listener first means the
+	// environment never reports a state it has to be corrected out of.
+	l4, err := r.applyListenerSet(ctx, env, gw, allocatedPorts(ports))
+	if err != nil {
+		return nil, nil, nil, err
 	}
 
 	published := []publishedRoute{}
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH || hasHTTPPorts(env) {
 		route, err := r.applyHTTPRoute(ctx, env, gw)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		published = append(published, publishedRoute{kind: "HTTPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents})
+		published = append(published, publishedRoute{
+			kind: "HTTPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents,
+			parentKind: gatewayKind, parentName: gw.Name, parentNamespace: gw.Namespace,
+		})
 	}
 	// Apply the TCP routes in ascending port order — the ports map iterates
 	// randomly, and the published set decides which route a rejection names.
@@ -2010,13 +2151,28 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 	}
 	slices.SortFunc(names, func(a, b string) int { return cmp.Compare(ports[a], ports[b]) })
 	for _, name := range names {
-		route, err := r.applyTCPRoute(ctx, env, gw, name, ports[name])
+		route, err := r.applyTCPRoute(ctx, env, name, ports[name])
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
-		published = append(published, publishedRoute{kind: "TCPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents})
+		published = append(published, publishedRoute{
+			kind: "TCPRoute", name: route.Name, generation: route.Generation, parents: route.Status.Parents,
+			parentKind: listenerSetKind, parentName: listenerSetName(env), parentNamespace: env.Namespace,
+		})
 	}
-	return ports, published, nil
+	return ports, l4, published, nil
+}
+
+// allocatedPorts lists the external ports an environment's endpoints resolved
+// to, ascending. The order is what the ListenerSet's listeners are declared in,
+// which keeps its stored spec stable across reconciles.
+func allocatedPorts(ports map[string]int32) []int32 {
+	out := make([]int32, 0, len(ports))
+	for _, p := range ports {
+		out = append(out, p)
+	}
+	slices.Sort(out)
+	return out
 }
 
 // pruneTCPRoutes deletes this environment's TCPRoutes whose allocated port is
@@ -2075,22 +2231,46 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 	return false
 }
 
-// usedPorts collects every TCP port already allocated to another environment
+// usedPorts collects every L4 port already allocated to another environment
 // (the port pool is gateway-wide, so it spans namespaces). Allocations are read
-// from the TCPRoutes themselves, not from status.endpoints: the endpoint list is
-// withheld while a route is unaccepted, and a reservation that disappears from
-// under an environment lets two of them claim the same listener port. The route
-// is the durable record — its name embeds the port it holds.
+// from the objects that declare them, not from status.endpoints: the endpoint
+// list is withheld while a route is unaccepted, and a reservation that disappears
+// from under an environment lets two of them claim the same listener port. Both
+// objects below are durable records — the ListenerSet holds the port outright,
+// and the route's name embeds the port it holds.
 //
-// Only routes attached to the configured Gateway count: the pool is that
-// Gateway's tcp-<port> listeners, and a route parented elsewhere holds no
-// listener here. A failed List is returned rather than read as an empty pool,
-// which would hand out ports other environments' routes already hold.
+// The environment's L4 listeners are declared by its ListenerSet, and legacy
+// routes attached straight to the Gateway are still counted: the pool is that
+// Gateway's listeners, whatever declared them, and counting both is what carries
+// ports across the cutover, when routes and ListenerSets briefly coexist. A port
+// held by either is taken.
+//
+// Only objects attached to the configured Gateway count: one parented elsewhere
+// holds no listener here. A failed List is returned rather than read as an empty
+// pool, which would hand out ports other environments already hold.
+//
+// Every L4 protocol shares this pool: a UDP exposure, when it lands, allocates
+// from here and never takes a number TCP already holds. Allocation identity is
+// the port number alone — the ListenerSet scan below reads listener ports without
+// consulting protocol or listener name, which is what makes that structural. Do
+// not add a (protocol, port) key to "reclaim" the shared numbers: the Gateway
+// accepts TCP and UDP on one port, so the collision would not be rejected here
+// and envtest could not see it (design §8.3).
+//
+// The Lists go through APIReader, not the cache. Allocation is a read followed
+// by a create, and the create lands in the API server while the cache catches up
+// asynchronously: an environment reconciled inside that window reads a pool that
+// does not yet contain the port the previous reconcile just took, and claims it
+// too. Reading through avoids the window entirely, which is what lets the rest of
+// allocation stay as it is — reconciles are serialized (MaxConcurrentReconciles
+// is pinned to 1 in SetupWithManager), so nothing else can interleave between
+// this read and the create. Raising that concurrency would make the sequence racy
+// again and would need a real reservation primitive.
 func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) (map[int32]bool, error) {
 	cfg := r.defaultedConfig()
 	used := map[int32]bool{}
 	var trs gatewayv1.TCPRouteList
-	if err := r.List(ctx, &trs); err != nil {
+	if err := r.APIReader.List(ctx, &trs); err != nil {
 		return nil, err
 	}
 	for i := range trs.Items {
@@ -2105,6 +2285,22 @@ func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, exc
 			used[p] = true
 		}
 	}
+	var lss gatewayv1.ListenerSetList
+	if err := r.APIReader.List(ctx, &lss); err != nil {
+		return nil, err
+	}
+	for i := range lss.Items {
+		ls := &lss.Items[i]
+		if ls.Namespace == excludeNS && ls.Labels[devEnvironmentLabelKey] == excludeName {
+			continue
+		}
+		if !listenerSetParentsToGateway(ls, cfg.GatewayName, cfg.GatewayNamespace) {
+			continue
+		}
+		for _, listener := range ls.Spec.Listeners {
+			used[listener.Port] = true
+		}
+	}
 	return used, nil
 }
 
@@ -2115,13 +2311,13 @@ func (r *DevEnvironmentReconciler) allocatePort(env *aiv1alpha1.DevEnvironment, 
 	cfg := r.defaultedConfig()
 	for _, ep := range env.Status.Endpoints {
 		if ep.Name == name {
-			if p := portFromEndpoint(ep.Address); p != 0 && p >= cfg.SSHPortRangeStart && p <= cfg.SSHPortRangeEnd && !used[p] {
+			if p := portFromEndpoint(ep.Address); p != 0 && p >= cfg.L4PortRangeStart && p <= cfg.L4PortRangeEnd && !used[p] {
 				used[p] = true
 				return p
 			}
 		}
 	}
-	for p := cfg.SSHPortRangeStart; p <= cfg.SSHPortRangeEnd; p++ {
+	for p := cfg.L4PortRangeStart; p <= cfg.L4PortRangeEnd; p++ {
 		if !used[p] {
 			used[p] = true
 			return p
@@ -2184,15 +2380,62 @@ func webRouteName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-web"
 }
 
+// desiredListenerSet renders the environment's L4 listeners. Every allocated
+// port becomes one TCP listener here, and the environment's TCPRoutes attach to
+// those listeners rather than to listeners on the shared Gateway (design §4).
+//
+// The API server's defaults are set explicitly, as in gatewayParentRef: an
+// unset allowedRoutes.namespaces would come back as {from: Same} and an unset
+// parentRef group/kind as the Gateway API group and Gateway, and the stored
+// spec would then differ from this one on every reconcile.
+func (r *DevEnvironmentReconciler) desiredListenerSet(env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, ports []int32) *gatewayv1.ListenerSet {
+	listeners := make([]gatewayv1.ListenerEntry, 0, len(ports))
+	for _, port := range ports {
+		listeners = append(listeners, gatewayv1.ListenerEntry{
+			Name:     gatewayv1.SectionName(l4ListenerName(port)),
+			Protocol: gatewayv1.TCPProtocolType,
+			Port:     port,
+			AllowedRoutes: &gatewayv1.AllowedRoutes{
+				Kinds: []gatewayv1.RouteGroupKind{{
+					Group: ptr(gatewayv1.Group(gatewayAPIGroup)),
+					Kind:  gatewayv1.Kind(tcpRouteKind),
+				}},
+				// The ListenerSet and the TCPRoute it serves are both in the
+				// environment's namespace, so no other namespace has business
+				// attaching here.
+				Namespaces: &gatewayv1.RouteNamespaces{
+					From: ptr(gatewayv1.NamespacesFromSame),
+				},
+			},
+		})
+	}
+	return &gatewayv1.ListenerSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      listenerSetName(env),
+			Namespace: env.Namespace,
+			Labels:    r.envLabels(env.Name),
+		},
+		Spec: gatewayv1.ListenerSetSpec{
+			ParentRef: gatewayv1.ParentGatewayReference{
+				Group:     ptr(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:      ptr(gatewayv1.Kind(gatewayKind)),
+				Namespace: ptr(gatewayv1.Namespace(gw.Namespace)),
+				Name:      gatewayv1.ObjectName(gw.Name),
+			},
+			Listeners: listeners,
+		},
+	}
+}
+
 // desiredTCPRoute renders the TCPRoute for one allocated port: it attaches to
-// the Gateway's static tcp-<port> listener and forwards to the matching
-// Service port (design §6.2).
-func (r *DevEnvironmentReconciler) desiredTCPRoute(env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, name string, port int32) *gatewayv1.TCPRoute {
+// the matching listener of the environment's own ListenerSet and forwards to
+// the matching Service port (design §4).
+func (r *DevEnvironmentReconciler) desiredTCPRoute(env *aiv1alpha1.DevEnvironment, name string, port int32) *gatewayv1.TCPRoute {
 	return &gatewayv1.TCPRoute{
 		ObjectMeta: metav1.ObjectMeta{Name: tcpRouteName(env, port), Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: gatewayv1.TCPRouteSpec{
 			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
-				gatewayParentRef(gw, fmt.Sprintf("tcp-%d", port)),
+				listenerSetParentRef(env, port),
 			}},
 			Rules: []gatewayv1.TCPRouteRule{{
 				BackendRefs: []gatewayv1.BackendRef{serviceBackendRef(env.Name, servicePortFor(env, name))},
@@ -2203,6 +2446,36 @@ func (r *DevEnvironmentReconciler) desiredTCPRoute(env *aiv1alpha1.DevEnvironmen
 
 func tcpRouteName(env *aiv1alpha1.DevEnvironment, port int32) string {
 	return fmt.Sprintf("%s-tcp-%d", env.Name, port)
+}
+
+// listenerSetName is the per-environment ListenerSet that carries the
+// environment's L4 listeners. One per environment, so the listeners come and go
+// with it (design §7.2).
+func listenerSetName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + l4ListenerSetSuffix
+}
+
+// l4ListenerName names one listener within the ListenerSet. Listener names only
+// have to be unique within their ListenerSet, and an allocated port is unique
+// across the whole gateway, so spelling the port keeps them distinct without a
+// second naming scheme.
+func l4ListenerName(port int32) string {
+	return fmt.Sprintf("tcp-%d", port)
+}
+
+// listenerSetParentRef points a route at one listener of the environment's
+// ListenerSet. The ListenerSet lives in the environment's namespace, so unlike
+// gatewayParentRef this resolves without fetching anything. As there, the
+// explicit defaults are set so the stored spec compares equal across
+// reconciles.
+func listenerSetParentRef(env *aiv1alpha1.DevEnvironment, port int32) gatewayv1.ParentReference {
+	return gatewayv1.ParentReference{
+		Group:       ptr(gatewayv1.Group(gatewayAPIGroup)),
+		Kind:        ptr(gatewayv1.Kind(listenerSetKind)),
+		Namespace:   ptr(gatewayv1.Namespace(env.Namespace)),
+		Name:        gatewayv1.ObjectName(listenerSetName(env)),
+		SectionName: ptr(gatewayv1.SectionName(l4ListenerName(port))),
+	}
 }
 
 // gatewayParentRef builds a ParentReference to the shared Gateway, setting the
@@ -2279,8 +2552,8 @@ func (r *DevEnvironmentReconciler) applyHTTPRoute(ctx context.Context, env *aiv1
 
 // applyTCPRoute creates or updates one TCPRoute, returning the stored object so
 // its acceptance can be read.
-func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, name string, port int32) (*gatewayv1.TCPRoute, error) {
-	desired := r.desiredTCPRoute(env, gw, name, port)
+func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1alpha1.DevEnvironment, name string, port int32) (*gatewayv1.TCPRoute, error) {
+	desired := r.desiredTCPRoute(env, name, port)
 	if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
 		return nil, err
 	}
@@ -2291,6 +2564,49 @@ func (r *DevEnvironmentReconciler) applyTCPRoute(ctx context.Context, env *aiv1a
 	}
 	if err != nil {
 		return nil, err
+	}
+	if err := ensureDevEnvOwned(existing, env); err != nil {
+		return nil, err
+	}
+	if apiequality.Semantic.DeepEqual(existing.Spec, desired.Spec) {
+		return existing, nil
+	}
+	desired.ResourceVersion = existing.ResourceVersion
+	return desired, r.Update(ctx, desired)
+}
+
+// applyListenerSet creates or updates the environment's ListenerSet so it
+// declares exactly the allocated ports, returning the stored object so its
+// acceptance can be read. With no ports there is no L4 exposure and the object
+// is removed instead: a listener left behind keeps its port claimed (see
+// usedPorts) and Gateway API would still prefer it as the older declaration.
+func (r *DevEnvironmentReconciler) applyListenerSet(ctx context.Context, env *aiv1alpha1.DevEnvironment, gw *gatewayv1.Gateway, ports []int32) (*gatewayv1.ListenerSet, error) {
+	existing := &gatewayv1.ListenerSet{}
+	err := r.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, existing)
+	notFound := apierrors.IsNotFound(err)
+	if err != nil && !notFound {
+		return nil, err
+	}
+
+	// No ports means no L4 exposure: remove the object rather than leave a
+	// listener behind, which would keep its port claimed (see usedPorts) and,
+	// being the older declaration, would win any conflict over a new owner's.
+	if len(ports) == 0 {
+		if notFound {
+			return nil, nil
+		}
+		if err := ensureDevEnvOwned(existing, env); err != nil {
+			return nil, err
+		}
+		return nil, r.Delete(ctx, existing)
+	}
+
+	desired := r.desiredListenerSet(env, gw, ports)
+	if err := ctrl.SetControllerReference(env, desired, r.Scheme); err != nil {
+		return nil, err
+	}
+	if notFound {
+		return desired, r.Create(ctx, desired)
 	}
 	if err := ensureDevEnvOwned(existing, env); err != nil {
 		return nil, err
@@ -2553,11 +2869,11 @@ func (r *DevEnvironmentReconciler) defaultedConfig() DevEnvironmentControllerCon
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 80
 	}
-	if cfg.SSHPortRangeStart == 0 {
-		cfg.SSHPortRangeStart = 20000
+	if cfg.L4PortRangeStart == 0 {
+		cfg.L4PortRangeStart = 20000
 	}
-	if cfg.SSHPortRangeEnd == 0 {
-		cfg.SSHPortRangeEnd = 20999
+	if cfg.L4PortRangeEnd == 0 {
+		cfg.L4PortRangeEnd = 20999
 	}
 	return cfg
 }
