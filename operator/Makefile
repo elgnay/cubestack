@@ -108,6 +108,12 @@ KIND_CLUSTER_HELM ?= cubestack-helm-e2e
 HELM_E2E_KUBECTL = $(KUBECTL) --context kind-$(KIND_CLUSTER_HELM)
 HELM_E2E_HELM = $(HELM) --kube-context kind-$(KIND_CLUSTER_HELM)
 HELM_NAMESPACE ?= cubestack-system
+# Envoy Gateway version whose CRDs the helm e2e installs. The chart ships an
+# EnvoyProxy (the Gateway's dataplane parameters), so the kind cluster needs that
+# CRD registered before `helm upgrade` can create one. Pinned because it is
+# v1alpha1 and churns between EG minors; v1.9.1 is the version the chart README
+# verifies ListenerSet reconciliation against.
+ENVOY_GATEWAY_VERSION ?= v1.9.1
 HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
 HELM_RELEASE ?= cubestack
@@ -141,6 +147,20 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	GW_CRD_DIR="$$(go env GOMODCACHE)/sigs.k8s.io/gateway-api@$${GW_VER}/config/crd/standard"; \
 	[ -d "$$GW_CRD_DIR" ] || { echo "gateway-api CRD dir not found: $${GW_CRD_DIR}"; exit 1; }; \
 	$(HELM_E2E_KUBECTL) apply -f "$${GW_CRD_DIR}"
+	# The Envoy Gateway bundle also carries the gateway-api CRDs, and installing
+	# those here is denied by gateway-api's own safe-upgrades VAP: the step above
+	# already installed the standard channel from the pinned go module. Keep only
+	# the group the chart's objects belong to.
+	# --server-side is required, not stylistic: the envoyproxies and
+	# securitypolicies CRDs are too big for client-side apply's 256KB
+	# last-applied-configuration annotation, and envoyproxies is the one the
+	# chart's EnvoyProxy needs.
+	@echo "Installing Envoy Gateway CRDs (the chart ships a Gateway with an EnvoyProxy)..." ; \
+	$(HELM) show crds oci://docker.io/envoyproxy/gateway-helm --version $(ENVOY_GATEWAY_VERSION) \
+		| awk 'BEGIN { buf = "---\n" } /^---[[:space:]]*$$/ { if (keep) printf "%s", buf; buf = "---\n"; keep = 0; next } \
+			{ buf = buf $$0 "\n"; if ($$0 == "  group: gateway.envoyproxy.io") keep = 1 } \
+			END { if (keep) printf "%s", buf }' \
+		| $(HELM_E2E_KUBECTL) apply --server-side -f -
 	@echo "Provisioning the upstream LeaderWorkerSet controller (image from the pinned lws go module)..." ; \
 	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KIND="$(KIND)" KUBECTL="$(KUBECTL)" hack/install-lws-controller.sh
 
@@ -181,6 +201,19 @@ helm-e2e-crd-check: ## Verify chart CRDs plus the prerequisite lws/gateway CRDs,
 	$(HELM_E2E_KUBECTL) auth can-i update devenvironments.ai.cubestack.io \
 		--as=system:serviceaccount:$(HELM_NAMESPACE):cubestack-controller-manager -n $(HELM_NAMESPACE) | grep -qx yes \
 		|| { echo "manager SA cannot update DevEnvironments (the controller adds and removes its finalizer with Update)"; exit 1; }; \
+	echo "platform Gateway:"; \
+	$(HELM_E2E_KUBECTL) get gateway cubestack-gateway -n $(HELM_NAMESPACE) >/dev/null \
+		|| { echo "MISSING: the chart did not create Gateway/cubestack-gateway"; exit 1; }; \
+	$(HELM_E2E_KUBECTL) get gateway cubestack-gateway -n $(HELM_NAMESPACE) -o jsonpath='{.spec.infrastructure.parametersRef.name}' | grep -qx cubestack-gateway-proxy \
+		|| { echo "Gateway/cubestack-gateway does not point at EnvoyProxy/cubestack-gateway-proxy"; exit 1; }; \
+	$(HELM_E2E_KUBECTL) get envoyproxy cubestack-gateway-proxy -n $(HELM_NAMESPACE) >/dev/null \
+		|| { echo "MISSING: the chart did not create EnvoyProxy/cubestack-gateway-proxy (which carries the dataplane Service type)"; exit 1; }; \
+	$(HELM_E2E_KUBECTL) get deploy cubestack-controller-manager -n $(HELM_NAMESPACE) -o jsonpath='{.spec.template.spec.containers[0].args}' \
+		| grep -q -- "--gateway-name=cubestack-gateway" \
+		|| { echo "the manager was not told the Gateway's name: gateway.name must reach --gateway-name, or the object above is not the one it publishes through"; exit 1; }; \
+	$(HELM_E2E_KUBECTL) get deploy cubestack-controller-manager -n $(HELM_NAMESPACE) -o jsonpath='{.spec.template.spec.containers[0].args}' \
+		| grep -q -- "--gateway-namespace=$(HELM_NAMESPACE)" \
+		|| { echo "the manager was not told the release namespace: --gateway-namespace must render .Release.Namespace, or it looks for the Gateway in cubestack-system"; exit 1; }; \
 	echo "schema validation (invalid MV must be rejected):"; \
 	if printf '%s\n' 'apiVersion: ai.cubestack.io/v1alpha1' 'kind: ModelVersion' 'metadata:' '  name: e2e-invalid-should-fail' 'spec:' '  model: x' | $(HELM_E2E_KUBECTL) apply -f -; then \
 		echo "ERROR: invalid ModelVersion was accepted — CRD schema not enforced"; \

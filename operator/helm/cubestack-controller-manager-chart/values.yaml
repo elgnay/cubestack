@@ -3,14 +3,23 @@ image:
   tag: latest
 
 # Platform Gateway the operator publishes InferenceService routes to
-# (spec.route.publish: true). Each key maps to one manager flag; an empty
-# value omits the flag, keeping the manager default (an empty name or domain
-# leaves publishing off — RouteReady=False, GatewayNotConfigured). Set
-# gateway.domain to enable publishing:
+# (spec.route.publish: true), and that DevEnvironment ListenerSets attach to.
+# The chart creates that Gateway and the EnvoyProxy it references, both in the
+# release namespace, and the manager is told that same namespace — so the
+# release can be installed anywhere. Set gateway.domain to enable publishing:
 #   helm install ... --set gateway.domain=example.com
 gateway:
-  name: cubestack-gateway       # --gateway-name
-  namespace: cubestack-system   # --gateway-namespace
+  # Name of the Gateway the chart creates. One value, three names: the Gateway
+  # object, the EnvoyProxy beside it (<name>-proxy, which the Gateway
+  # references) and the --gateway-name the manager receives. Renaming it
+  # therefore renames the objects and repoints the controller together. An
+  # empty value still creates the conventionally named Gateway but omits the
+  # flag, which leaves publishing off.
+  name: cubestack-gateway
+  # GatewayClass the Gateway asks to be served by. Not a manager flag: only
+  # the cluster's Gateway controller reads it, and it must name a class that
+  # controller has established (`eg` is the one Envoy Gateway installs).
+  className: eg
   domain: ""                    # --gateway-domain
   # Namespace the Gateway's dataplane (proxy) pods run in — not the namespace
   # of the Gateway object itself. Read by the DevEnvironment controller: it is
@@ -18,6 +27,18 @@ gateway:
   # through the Gateway can reach the environment pod. Empty keeps environment
   # pods default-deny inbound.
   dataplaneNamespace: envoy-gateway-system  # --gateway-dataplane-namespace
+  # Written into the EnvoyProxy this Gateway references. EnvoyProxy belongs to
+  # Envoy Gateway (gateway.envoyproxy.io), not to the Gateway API: nothing under
+  # here is read by the manager, and none of it means anything on a cluster
+  # served by a different Gateway implementation.
+  envoyProxy:
+    # Type of the Service Envoy Gateway creates for this Gateway's proxy pods.
+    # With NodePort the controller reads that Service back and publishes the
+    # nodePort each listener actually landed on (status.endpoints[].address),
+    # which is what makes a cluster without a load-balancer controller work — a
+    # LoadBalancer Service there never gets an address, so nothing is published
+    # at all. ClusterIP publishes neither.
+    serviceType: NodePort
 
 # External L4 port pool each DevEnvironment draws from. A port is allocated to
 # an environment's ssh exposure and to every spec.ports[] entry of type tcp;

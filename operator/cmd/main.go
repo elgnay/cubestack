@@ -75,7 +75,8 @@ func main() {
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&gatewayDomain, "gateway-domain", "",
 		"Platform domain; the public hostname of a published InferenceService is <modelName>.<gateway-domain>.")
-	flag.StringVar(&gatewayName, "gateway-name", "", "Name of the platform Gateway published HTTPRoutes attach to.")
+	flag.StringVar(&gatewayName, "gateway-name", "",
+		"Name of the platform Gateway that published HTTPRoutes and DevEnvironment ListenerSets attach to.")
 	flag.StringVar(&gatewayNamespace, "gateway-namespace", "cubestack-system", "Namespace of the platform Gateway.")
 	flag.StringVar(&gatewayDataplaneNamespace, "gateway-dataplane-namespace", "",
 		"Namespace the platform Gateway's dataplane Service and pods run in; when set, DevEnvironment "+
@@ -255,8 +256,8 @@ func main() {
 		Client: mgr.GetClient(),
 		Scheme: mgr.GetScheme(),
 		Config: controller.DevEnvironmentControllerConfig{
-			GatewayName:               "cubestack-gateway",
-			GatewayNamespace:          "cubestack-system",
+			GatewayName:               gatewayName,
+			GatewayNamespace:          gatewayNamespace,
 			GatewayDataplaneNamespace: gatewayDataplaneNamespace,
 			HTTPPort:                  80,
 			L4PortRangeStart:          int32(l4PortRangeStart),

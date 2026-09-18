@@ -30,9 +30,7 @@ spec:
         {{- with .Values.gateway.name }}
         - --gateway-name={{ . }}
         {{- end }}
-        {{- with .Values.gateway.namespace }}
-        - --gateway-namespace={{ . }}
-        {{- end }}
+        - --gateway-namespace={{ .Release.Namespace }}
         {{- if .Values.gateway.domain }}
         - --gateway-domain={{ .Values.gateway.domain }}
         {{- end }}

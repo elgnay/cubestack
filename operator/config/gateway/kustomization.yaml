@@ -1,0 +1,6 @@
+# The platform Gateway and the dataplane parameters it references. Both become
+# chart templates of their own (gateway-cubestack-gateway.yaml,
+# envoyproxy-cubestack-gateway-proxy.yaml).
+resources:
+- gateway.yaml
+- envoyproxy.yaml

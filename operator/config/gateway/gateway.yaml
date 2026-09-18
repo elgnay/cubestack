@@ -1,0 +1,42 @@
+# The platform Gateway every published route attaches to. Its name and
+# namespace are what the DevEnvironment controller hardcodes
+# (cmd/main.go, devenvironment_controller.go), so the metadata.name below is
+# deliberately unprefixed here and becomes cubestack-gateway via the
+# namePrefix in config/default.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: gateway
+spec:
+  # The Envoy Gateway install creates this GatewayClass.
+  gatewayClassName: eg
+  # ListenerSets contributed by tenant namespaces (one per DevEnvironment,
+  # see the L4 port pool) are rejected unless the Gateway opts in: the API
+  # default is "None", which refuses every one of them. "All" admits them and
+  # leaves who may publish to RBAC — anyone able to create a ListenerSet in
+  # their own namespace can contribute a listener.
+  allowedListeners:
+    namespaces:
+      from: All
+  # Envoy Gateway creates the proxy Service as a LoadBalancer unless an
+  # EnvoyProxy says otherwise, and a cluster without a load-balancer
+  # controller then leaves the Gateway address-less, so nothing is ever
+  # published. The reference is namespace-local and has no namespace field:
+  # the EnvoyProxy must live beside this Gateway (envoyproxy.yaml).
+  infrastructure:
+    parametersRef:
+      group: gateway.envoyproxy.io
+      kind: EnvoyProxy
+      # Spelled with the namePrefix already applied: kustomize's nameReference
+      # config does not know this field, so it is not rewritten. A bare
+      # "gateway-proxy" here would dangle.
+      name: cubestack-gateway-proxy
+  listeners:
+    - name: http
+      port: 80
+      protocol: HTTP
+      # Routes from every namespace may attach; allowedRoutes.kinds is left
+      # unset so the API derives them from the protocol (HTTPRoute, GRPCRoute).
+      allowedRoutes:
+        namespaces:
+          from: All
