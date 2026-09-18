@@ -313,8 +313,32 @@ type PortSpec struct {
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
-	// Type is the exposure form: http (web over sub path) / tcp (port range +
-	// TCPRoute) / udp (UDPRoute).
+	// Type is the exposure form.
+	//
+	// http publishes the port as a sub path of the Gateway's HTTP listener —
+	// /dev/<namespace>/<name>/port/<this port's name>/ — and the request
+	// reaches the container in cleartext. It is not a way to expose a port that
+	// serves TLS: the container would receive a plain HTTP request where it
+	// expects a TLS handshake, and the Gateway does not re-encrypt to it.
+	//
+	// tcp publishes the port over L4 instead — a listener of the environment's
+	// own, on a port from the platform's L4 range, plus a TCPRoute — with
+	// nothing above it interpreting the stream.
+	//
+	// A port that serves TLS is exposed as tcp, and as tcp only: the handshake
+	// crosses the Gateway untouched and the client validates the certificate
+	// the container itself presents, so the address in status.endpoints is
+	// reached by prefixing the scheme — an app terminating TLS on 8443 is
+	// published with type tcp and containerPort 8443, and reached at
+	// https://<address>. The platform neither terminates nor re-originates TLS,
+	// and what it publishes is an address, not a hostname: matching an endpoint
+	// by SNI (a TLSRoute on a shared TLS listener) is not implemented, so the
+	// certificate has to cover the address the client dials.
+	//
+	// udp publishes the port over L4 the same way, as a listener and a UDPRoute
+	// of its own, and the address in status.endpoints is reached by prefixing
+	// udp://. tcp and udp draw on the same pool, and a number is held by one
+	// protocol only: the two cannot be published on the same port number.
 	// +kubebuilder:validation:Enum=http;tcp;udp
 	// +kubebuilder:default=http
 	// +optional
@@ -421,10 +445,12 @@ type Endpoint struct {
 	// ListenerPort is the Gateway listener port the endpoint is published on: the
 	// port the environment's ListenerSet declares, or the Gateway's HTTP listener
 	// port for the web endpoint. The controller reuses it across reconciles, so
-	// the environment keeps the same listener — and therefore the same Address —
-	// for as long as the exposure exists. It is not necessarily the port in
-	// Address: a NodePort dataplane renumbers each listener onto a port from the
-	// cluster's node-port range.
+	// the environment's listener allocation is stable for as long as the exposure
+	// exists. It is not necessarily the port in Address: a NodePort dataplane
+	// renumbers each listener onto a port from the cluster's node-port range, and
+	// that renumbering is not part of the allocation — a dataplane Service
+	// recreated with different nodePorts changes Address while this does not.
+	// Address says where the endpoint is reachable now, not where it will stay.
 	// +optional
 	ListenerPort int32 `json:"listenerPort,omitempty"`
 }

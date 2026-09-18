@@ -128,8 +128,8 @@ there, so a kustomize install keeps environment pods default-deny inbound.
 ### L4 port pool (DevEnvironment exposure)
 
 Each DevEnvironment that exposes `ssh` or a `spec.ports[]` entry of type `tcp`
-takes one port from a cluster-wide pool. The manager learns the range through
-two flags, fed by the `l4PortRange.*` values — these always render:
+or `udp` takes one port from a cluster-wide pool. The manager learns the range
+through two flags, fed by the `l4PortRange.*` values — these always render:
 
 | Key | Manager flag | Default |
 |---|---|---|
@@ -137,7 +137,9 @@ two flags, fed by the `l4PortRange.*` values — these always render:
 | `l4PortRange.end` | `--l4-port-range-end` | `20999` |
 
 A port is allocated to the lowest free number in the range and stays with the
-environment across restarts. Each allocated port becomes a listener the
+environment across restarts. `tcp` and `udp` draw on the same numbering — one
+number is held by one protocol, so a udp port never shares a number with a tcp
+one. Each allocated port becomes a listener the
 environment's own `ListenerSet` declares on the platform Gateway. **Nothing has
 to pre-publish the range**: Envoy Gateway adds the port of every accepted
 listener to the proxy Service it manages for the Gateway, and where that

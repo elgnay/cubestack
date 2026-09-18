@@ -108,6 +108,7 @@ rules:
   - httproutes
   - listenersets
   - tcproutes
+  - udproutes
   verbs:
   - create
   - delete

@@ -46,6 +46,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -64,6 +65,9 @@ const (
 	testGatewayIP                 = "1.2.3.4"
 	testGRPCPortName              = "grpc"
 	testJupyterName               = "jupyter"
+	testMetricsPortName           = "metrics"
+	// testSyslogPortName is the extra udp port the UDP specs expose.
+	testSyslogPortName = "syslog"
 	// testL4PortRangeStart is the lowest listener port the suite's reconciler
 	// allocates (suite_test.go), so it is the port a fresh environment takes
 	// from an empty pool.
@@ -321,6 +325,18 @@ func stampDevEnvRouteParents(g Gomega, envName string, accepted bool, reason, me
 		route.Status.Parents = wanted
 		g.Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
 	}
+
+	udpRoutes := &gatewayv1.UDPRouteList{}
+	g.Expect(k8sClient.List(ctx, udpRoutes, client.InNamespace(testNamespace), client.MatchingLabels{devEnvironmentLabelKey: envName})).To(Succeed())
+	for i := range udpRoutes.Items {
+		route := &udpRoutes.Items[i]
+		wanted := gatewayRouteParents(route.Spec.ParentRefs[0], route.Generation, accepted, reason, message)
+		if apiequality.Semantic.DeepEqual(route.Status.Parents, wanted) {
+			continue
+		}
+		route.Status.Parents = wanted
+		g.Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
+	}
 }
 
 // stampDevEnvListenerSet writes the gateway's verdict on the environment's
@@ -368,6 +384,17 @@ func devEnvTCPRoutePorts(g Gomega, envName string) []int32 {
 		}
 	}
 	return ports
+}
+
+// devEnvEndpointPort is the listener port published under the given endpoint
+// name, or 0 when there is no such endpoint.
+func devEnvEndpointPort(endpoints []aiv1alpha1.Endpoint, name string) int32 {
+	for _, ep := range endpoints {
+		if ep.Name == name {
+			return ep.ListenerPort
+		}
+	}
+	return 0
 }
 
 func sshEndpointPort(endpoints []aiv1alpha1.Endpoint) int32 {
@@ -578,6 +605,21 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(used).To(HaveKey(int32(20007)))
 			Expect(used).To(HaveKey(int32(20008)))
+		})
+
+		It("counts a peer's udp listener against the same numbering as tcp", func() {
+			// Allocation identity is the bare port number (design §8.3), so a udp
+			// listener takes its number out of the one pool: the scan reads the
+			// port and neither the protocol nor the listener's name, which is what
+			// keeps a udp port from being handed the number a tcp one holds.
+			udp := newListenerSet("peer-a-l4", "ns-a", defaultGatewayName, 20011)
+			udp.Spec.Listeners[0].Name = "udp-20011"
+			udp.Spec.Listeners[0].Protocol = gatewayv1.UDPProtocolType
+			r := newReconciler(udp)
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).To(HaveKey(int32(20011)))
 		})
 
 		It("leaves its own ListenerSet's ports free and ignores one on another gateway", func() {
@@ -1449,38 +1491,55 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 	})
 
 	Describe("desiredListenerSet", func() {
-		render := func(ports []int32) *gatewayv1.ListenerSet {
+		// render declares the listeners for an environment whose spec carries the
+		// given extra ports, allocated the given listener ports by port name.
+		render := func(spec []aiv1alpha1.PortSpec, ports map[string]int32) *gatewayv1.ListenerSet {
 			env := &aiv1alpha1.DevEnvironment{
 				ObjectMeta: metav1.ObjectMeta{Name: "de-l4", Namespace: "project-llm"},
-				Spec:       aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeJupyter},
+				Spec:       aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeJupyter, Ports: spec},
 			}
 			gw := &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{Name: defaultGatewayName, Namespace: systemNamespace}}
 			return (&DevEnvironmentReconciler{}).desiredListenerSet(env, gw, ports)
 		}
 
-		It("declares one TCP listener per allocated port, accepting same-namespace TCPRoutes", func() {
-			ls := render([]int32{20000, 20002})
+		It("declares one listener per allocated port, of the protocol it is exposed over", func() {
+			// Allocated out of ascending order: the listeners come back sorted by
+			// port anyway, so that a stored ListenerSet spec is stable.
+			ls := render([]aiv1alpha1.PortSpec{
+				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				{Name: "syslog", Type: aiv1alpha1.PortTypeUDP, ContainerPort: 514},
+			}, map[string]int32{testMetricsPortName: 20002, "syslog": 20000})
 			Expect(ls.Name).To(Equal("de-l4-l4"))
 			Expect(ls.Namespace).To(Equal("project-llm"))
 			Expect(ls.Spec.Listeners).To(HaveLen(2))
-			for i, port := range []int32{20000, 20002} {
-				l := ls.Spec.Listeners[i]
-				Expect(l.Name).To(Equal(gatewayv1.SectionName(fmt.Sprintf("tcp-%d", port))))
-				Expect(l.Protocol).To(Equal(gatewayv1.TCPProtocolType))
-				Expect(l.Port).To(Equal(port))
-				Expect(l.AllowedRoutes.Kinds).To(Equal([]gatewayv1.RouteGroupKind{{
-					Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)),
-					Kind:  gatewayv1.Kind(tcpRouteKind),
-				}}))
-				Expect(l.AllowedRoutes.Namespaces.From).To(Equal(ptrTo(gatewayv1.NamespacesFromSame)))
-			}
+
+			Expect(ls.Spec.Listeners[0].Name).To(Equal(gatewayv1.SectionName("udp-20000")))
+			Expect(ls.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.UDPProtocolType))
+			Expect(ls.Spec.Listeners[0].Port).To(Equal(int32(20000)))
+			Expect(ls.Spec.Listeners[0].AllowedRoutes.Kinds).To(Equal([]gatewayv1.RouteGroupKind{{
+				Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:  gatewayv1.Kind(udpRouteKind),
+			}}))
+			Expect(ls.Spec.Listeners[0].AllowedRoutes.Namespaces.From).To(Equal(ptrTo(gatewayv1.NamespacesFromSame)))
+
+			// The UDP listener is not enough on its own: a tcp port beside it is
+			// still a TCP listener, on its own allocated number, admitting only
+			// TCPRoutes.
+			Expect(ls.Spec.Listeners[1].Name).To(Equal(gatewayv1.SectionName("tcp-20002")))
+			Expect(ls.Spec.Listeners[1].Protocol).To(Equal(gatewayv1.TCPProtocolType))
+			Expect(ls.Spec.Listeners[1].Port).To(Equal(int32(20002)))
+			Expect(ls.Spec.Listeners[1].AllowedRoutes.Kinds).To(Equal([]gatewayv1.RouteGroupKind{{
+				Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:  gatewayv1.Kind(tcpRouteKind),
+			}}))
 		})
 
 		// applyListenerSet compares the stored spec against this one to decide
 		// whether to update, so every field the API server would default has to be
 		// set here — otherwise the object is rewritten on every reconcile.
 		It("spells out the fields the API server would otherwise default", func() {
-			ls := render([]int32{20000})
+			ls := render([]aiv1alpha1.PortSpec{{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090}},
+				map[string]int32{testMetricsPortName: 20000})
 			Expect(ls.Spec.ParentRef).To(Equal(gatewayv1.ParentGatewayReference{
 				Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
 				Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
@@ -3179,7 +3238,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				},
 			}
 			env.Spec.Ports = []aiv1alpha1.PortSpec{
-				{Name: "metrics", Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 9090},
+				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 9090},
 				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -3244,7 +3303,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(got.Status.Endpoints).To(ContainElements(
 				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/", ListenerPort: 80},
 				aiv1alpha1.Endpoint{Name: "ssh", Address: fmt.Sprintf("ssh://%s@%s:%d", defaultRuntimeUser, testGatewayIP, pSSH), ListenerPort: pSSH},
-				aiv1alpha1.Endpoint{Name: "metrics", Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/", ListenerPort: 80},
+				aiv1alpha1.Endpoint{Name: testMetricsPortName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/port/metrics/", ListenerPort: 80},
 				aiv1alpha1.Endpoint{Name: testGRPCPortName, Address: fmt.Sprintf("%s:%d", testGatewayIP, pGRPC), ListenerPort: pGRPC},
 			))
 		})
@@ -3290,6 +3349,168 @@ var _ = Describe("DevEnvironment controller", func() {
 				slices.Sort(declared)
 				slices.Sort(ports)
 				g.Expect(declared).To(Equal(ports))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("publishes a udp port as a UDP listener and a UDPRoute", func() {
+			// UDP is published exactly as TCP is, through its own kind: a
+			// UDPRoute on a listener of the environment's ListenerSet. Nothing
+			// about the exposure may quietly stay TCP — the listener protocol,
+			// the route kind, the Service port the route forwards to and the
+			// address — or the port would be accepted and forward nothing.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-udp")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 514},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var pUDP int32
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				pUDP = devEnvEndpointPort(got.Status.Endpoints, testSyslogPortName)
+				g.Expect(pUDP).To(BeNumerically(">", 0))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The Service port has to speak UDP: a TCP entry would be accepted
+			// and forward no datagram.
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: env.Name, Namespace: env.Namespace}, svc)).To(Succeed())
+			var syslogPort *corev1.ServicePort
+			for i := range svc.Spec.Ports {
+				if svc.Spec.Ports[i].Name == testSyslogPortName {
+					syslogPort = &svc.Spec.Ports[i]
+				}
+			}
+			Expect(syslogPort).NotTo(BeNil())
+			Expect(syslogPort.Protocol).To(Equal(corev1.ProtocolUDP))
+			Expect(syslogPort.Port).To(Equal(int32(514)))
+
+			ls := &gatewayv1.ListenerSet{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, ls)).To(Succeed())
+			Expect(ls.Spec.Listeners).To(HaveLen(1))
+			Expect(ls.Spec.Listeners[0].Name).To(Equal(gatewayv1.SectionName(fmt.Sprintf("udp-%d", pUDP))))
+			Expect(ls.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.UDPProtocolType))
+			Expect(ls.Spec.Listeners[0].Port).To(Equal(pUDP))
+			Expect(ls.Spec.Listeners[0].AllowedRoutes.Kinds).To(Equal([]gatewayv1.RouteGroupKind{{
+				Group: ptrTo(gatewayv1.Group(gatewayAPIGroup)),
+				Kind:  gatewayv1.Kind(udpRouteKind),
+			}}))
+
+			ur := &gatewayv1.UDPRoute{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-udp-%d", env.Name, pUDP), Namespace: env.Namespace}, ur)).To(Succeed())
+			Expect(ur.Spec.ParentRefs).To(HaveLen(1))
+			Expect(ur.Spec.ParentRefs[0].Name).To(Equal(gatewayv1.ObjectName(listenerSetName(env))))
+			Expect(ur.Spec.ParentRefs[0].Kind).To(Equal(ptrTo(gatewayv1.Kind(listenerSetKind))))
+			Expect(ur.Spec.ParentRefs[0].SectionName).To(Equal(ptrTo(gatewayv1.SectionName(fmt.Sprintf("udp-%d", pUDP)))))
+			Expect(ur.Spec.Rules[0].BackendRefs[0].Port).To(Equal(ptrTo(gatewayv1.PortNumber(514))))
+			owner := metav1.GetControllerOf(ur)
+			Expect(owner).NotTo(BeNil())
+			Expect(owner.UID).To(Equal(env.UID))
+
+			// The address is a bare host:port like a tcp one, and it names the
+			// listener port — no dataplane Service is published in this suite, so
+			// the listener port is the reachable one.
+			got := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			Expect(devEnvEndpointPort(got.Status.Endpoints, testSyslogPortName)).To(Equal(pUDP))
+			for _, ep := range got.Status.Endpoints {
+				if ep.Name == testSyslogPortName {
+					Expect(ep.Address).To(Equal(fmt.Sprintf("%s:%d", testGatewayIP, pUDP)))
+				}
+			}
+			// The web endpoint beside it is untouched: an L4 udp port does not
+			// take the environment off the HTTP listener.
+			Expect(got.Status.Endpoints).To(ContainElement(
+				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/", ListenerPort: 80}))
+		})
+
+		It("holds a udp port and a tcp port on different numbers", func() {
+			// tcp and udp share one pool (design §8.3): a udp port takes its
+			// number out of the same range and never shares it with a tcp one,
+			// so the two exposures of one environment are on different numbers.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-udp-tcp")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testGRPCPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 50051},
+				{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 514},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				pSSH := sshEndpointPort(got.Status.Endpoints)
+				pTCP := devEnvEndpointPort(got.Status.Endpoints, testGRPCPortName)
+				pUDP := devEnvEndpointPort(got.Status.Endpoints, testSyslogPortName)
+				g.Expect(pSSH).To(BeNumerically(">", 0))
+				g.Expect(pTCP).To(BeNumerically(">", 0))
+				g.Expect(pUDP).To(BeNumerically(">", 0))
+				g.Expect([]int32{pSSH, pTCP}).NotTo(ContainElement(pUDP))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The two routes are separate objects under separate names, so each
+			// exposes the port it holds.
+			urs := &gatewayv1.UDPRouteList{}
+			Expect(k8sClient.List(ctx, urs, client.InNamespace(env.Namespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name})).To(Succeed())
+			Expect(urs.Items).To(HaveLen(1))
+			Expect(udpRoutePort(urs.Items[0].Name)).To(BeNumerically(">", 0))
+
+			trs := &gatewayv1.TCPRouteList{}
+			Expect(k8sClient.List(ctx, trs, client.InNamespace(env.Namespace), client.MatchingLabels{devEnvironmentLabelKey: env.Name})).To(Succeed())
+			Expect(trs.Items).To(HaveLen(2))
+		})
+
+		It("prunes the UDPRoute and frees its listener port", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-udp-prune")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 514},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var pUDP int32
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				pUDP = devEnvEndpointPort(got.Status.Endpoints, testSyslogPortName)
+				g.Expect(pUDP).To(BeNumerically(">", 0))
+
+				// There is a udp route and listener to remove in the first place:
+				// without this the spec would pass on an environment that never
+				// published one, and prove nothing about pruning it.
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-udp-%d", env.Name, pUDP), Namespace: env.Namespace}, &gatewayv1.UDPRoute{})).To(Succeed())
+				ls := &gatewayv1.ListenerSet{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, ls)).To(Succeed())
+				g.Expect(ls.Spec.Listeners[0].Protocol).To(Equal(gatewayv1.UDPProtocolType))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The exposure goes: its route and its listener go with it, or the
+			// port stays claimed by a declaration the environment no longer makes.
+			updateEnvSpec(env.Name, func(env *aiv1alpha1.DevEnvironment) { env.Spec.Ports = nil })
+
+			Eventually(func(g Gomega) {
+				ur := &gatewayv1.UDPRoute{}
+				err := k8sClient.Get(ctx, client.ObjectKey{Name: fmt.Sprintf("%s-udp-%d", env.Name, pUDP), Namespace: env.Namespace}, ur)
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+				err = k8sClient.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, &gatewayv1.ListenerSet{})
+				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3686,6 +3907,52 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		It("withdraws the endpoints when the Gateway loses its address", func() {
+			// The condition has to fall as well as rise. An address assigned when
+			// the routes were published can be withdrawn afterwards — the dataplane
+			// is rescheduled or rebuilt — and RouteReady=True would keep publishing
+			// endpoints that no longer answer.
+			//
+			// What carries the fall is the Gateway watch: nothing else touches the
+			// environment when the address goes, so without it the condition stays
+			// True (verified by dropping the watch and watching this time out). A
+			// green run is not by itself proof of that, since a status write can
+			// still be in flight when the address is withdrawn and re-enqueue the
+			// environment through the DevEnvironment watch.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-gw-address-lost")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				g.Expect(got.Status.Endpoints).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Only the address goes: the routes stay accepted, so what moves the
+			// condition is the missing address and nothing else.
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: testDevEnvGatewayName, Namespace: testNamespace}, gw)).To(Succeed())
+			gw.Status.Addresses = nil
+			Expect(k8sClient.Status().Update(ctx, gw)).To(Succeed())
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal(reasonGatewayNotReady))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		It("withholds the endpoints of routes the Gateway has not accepted", func() {
 			// The shape found on the cs2 cluster: the Gateway has an address and
 			// is Programmed, but carries no listener for the port an SSH route
@@ -3846,9 +4113,9 @@ var _ = Describe("published endpoint ports", func() {
 	}
 
 	// programListenerSet writes the verdict the gateway reaches once a listener is
-	// in its dataplane. That write is what re-enqueues the environment after the
-	// dataplane Service changes underneath it: the controller watches the
-	// environment's own objects, and the shared dataplane Service is not one.
+	// in its dataplane. Writing it re-enqueues the environment — the ListenerSet
+	// is one of its own objects — which is what publishes it against the
+	// dataplane that has since appeared.
 	programListenerSet := func(envName string) {
 		ls := &gatewayv1.ListenerSet{}
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: envName + l4ListenerSetSuffix, Namespace: testNamespace}, ls)).To(Succeed())
@@ -3932,6 +4199,60 @@ var _ = Describe("published endpoint ports", func() {
 		}, "15s", "200ms").Should(Succeed())
 	})
 
+	It("republishes the address when the dataplane renumbers the listener", func() {
+		createGateway(true)
+		defer deleteGateway()
+
+		env := newSSHEnvironment("de-nodeport-renumber")
+		defer deleteEnv(env.Name)
+
+		listenerPorts := listenerPortsOf(env.Name, 1)
+		createDataplaneService(corev1.ServiceTypeNodePort, []corev1.ServicePort{
+			{Name: testPortName, Port: 80, NodePort: 31080},
+			{Name: fmt.Sprintf("tcp-%d", listenerPorts[0]), Port: listenerPorts[0], NodePort: nodePortFor(0)},
+		})
+		defer deleteDataplaneService()
+		programListenerSet(env.Name)
+
+		// publishedSSHPort reads the port the ssh address is reachable on, and
+		// checks the allocation under it has not moved: the two are what the
+		// renumbering is expected to separate.
+		publishedSSHPort := func(g Gomega) int32 {
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			g.Expect(got.Status.Endpoints).NotTo(BeEmpty())
+			for _, ep := range got.Status.Endpoints {
+				if ep.Name == sshPortName {
+					g.Expect(ep.ListenerPort).To(Equal(listenerPorts[0]))
+					return addressPort(ep.Address)
+				}
+			}
+			g.Expect(got.Status.Endpoints).To(ContainElement(HaveField("Name", sshPortName)))
+			return 0
+		}
+		Eventually(publishedSSHPort, "15s", "200ms").Should(Equal(nodePortFor(0)))
+
+		// The dataplane comes back with a different nodePort — Envoy Gateway's
+		// assignment, not this environment's allocation — and nothing else about
+		// the environment changes. The new port reaches status only because the
+		// dataplane Service is watched: an address that outlives the port it names
+		// is the failure this watches for.
+		svc := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: dataplaneName, Namespace: testGatewayDataplaneNamespace}, svc)).To(Succeed())
+		renumbered := false
+		for i := range svc.Spec.Ports {
+			if svc.Spec.Ports[i].Port == listenerPorts[0] {
+				svc.Spec.Ports[i].NodePort = nodePortFor(9)
+				renumbered = true
+			}
+		}
+		Expect(renumbered).To(BeTrue())
+		Expect(k8sClient.Update(ctx, svc)).To(Succeed())
+
+		Eventually(publishedSSHPort, "15s", "200ms").Should(Equal(nodePortFor(9)))
+	})
+
 	It("keeps the address on the listener port when the dataplane is not a NodePort", func() {
 		createGateway(true)
 		defer deleteGateway()
@@ -3985,5 +4306,62 @@ var _ = Describe("published endpoint ports", func() {
 			g.Expect(cond.Message).To(ContainSubstring("exposes no nodePort"))
 			g.Expect(got.Status.Endpoints).To(BeEmpty())
 		}, "15s", "200ms").Should(Succeed())
+	})
+})
+
+var _ = Describe("enqueueForDataplaneService", func() {
+	// Only the Gateway's own dataplane Service says anything about an
+	// environment's addresses. Every other Service in the cluster reaches this
+	// mapFunc, and enqueuing all environments for each of them would turn an
+	// unrelated Service write into a reconcile of every environment.
+	dataplaneReconciler := func() *DevEnvironmentReconciler {
+		return &DevEnvironmentReconciler{
+			Client: k8sClient,
+			Scheme: testMgr.GetScheme(),
+			Config: DevEnvironmentControllerConfig{
+				GatewayName:               testDevEnvGatewayName,
+				GatewayNamespace:          testNamespace,
+				GatewayDataplaneNamespace: testGatewayDataplaneNamespace,
+			},
+		}
+	}
+	service := func(namespace string, labels map[string]string) *corev1.Service {
+		// The name is the mapFunc's business only through its labels; Envoy
+		// Gateway's own naming is not part of what it matches on.
+		return &corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "dataplane", Namespace: namespace, Labels: labels}}
+	}
+	owningLabels := map[string]string{
+		gatewayDataplaneNameLabel:      testDevEnvGatewayName,
+		gatewayDataplaneNamespaceLabel: testNamespace,
+	}
+
+	It("maps the Gateway's dataplane Service to every environment", func() {
+		env := validDevEnvironment("de-dataplane-watch")
+		Expect(k8sClient.Create(ctx, env)).To(Succeed())
+		defer deleteEnv(env.Name)
+
+		r := dataplaneReconciler()
+		Eventually(func(g Gomega) {
+			g.Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace, owningLabels))).
+				To(ContainElement(reconcile.Request{
+					NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: env.Name},
+				}))
+		}, "15s", "200ms").Should(Succeed())
+	})
+
+	It("ignores Services that are not it, and a namespace that is not configured", func() {
+		r := dataplaneReconciler()
+		Expect(r.enqueueForDataplaneService(ctx, service(testNamespace, owningLabels))).To(BeEmpty())
+		Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace,
+			map[string]string{
+				gatewayDataplaneNameLabel:      "another-gateway",
+				gatewayDataplaneNamespaceLabel: testNamespace,
+			}))).To(BeEmpty())
+		Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace, nil))).To(BeEmpty())
+
+		// The flag is what turns the lookup on: with no namespace configured the
+		// controller never reads the dataplane Service either.
+		r.Config.GatewayDataplaneNamespace = ""
+		Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace, owningLabels))).To(BeEmpty())
 	})
 })
