@@ -274,9 +274,9 @@ files are `COPY common/...`.
 
 - The `jupyter-minimal` overlay is intentionally thin: identical stock layout, sshd only. Tokens and the
   URL prefix flow through stock env (`JUPYTER_TOKEN`, `NOTEBOOK_ARGS`); the operator injects the
-  `base_url` prefix into `NOTEBOOK_ARGS` (Gap C / decision doc §8), merging into a value the
-  environment declares rather than replacing it. Its native `gid 100` and `/home/jovyan` are what a
-  DevEnvironment has to be configured with (see above).
+  `base_url` prefix into `NOTEBOOK_ARGS` (Gap C / decision doc §8), replacing a `base_url` the
+  environment declares while keeping its other notebook flags. Its native `gid 100` and `/home/jovyan`
+  are what a DevEnvironment has to be configured with (see above).
 - sshd binds the unprivileged `2222`, so the images need **no capability at all** — design Gap B
   (`NET_BIND_SERVICE`) is closed by port choice rather than by granting a privilege. Two things follow:
   the operator must set the Service's `targetPort` to `2222` (#173), and a local smoke cannot validate

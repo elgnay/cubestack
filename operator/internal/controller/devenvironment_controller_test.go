@@ -1520,11 +1520,14 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
-		It("keeps a base_url the environment declares, without doubling the flag", func() {
+		// The route forwards webPath unchanged, so a notebook serving under any
+		// other prefix 404s on every published URL. The controller's flag replaces
+		// the environment's rather than letting the two disagree.
+		It("replaces a base_url the environment declares, keeping its other flags", func() {
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
 				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
-					{Name: notebookArgsEnv, Value: "--ServerApp.base_url=/served/elsewhere/"},
+					{Name: notebookArgsEnv, Value: "--ServerApp.base_url=/served/elsewhere/ --ServerApp.allow_origin=*"},
 				}}
 			})
 			declared := []string{}
@@ -1533,7 +1536,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					declared = append(declared, v.Value)
 				}
 			}
-			Expect(declared).To(Equal([]string{"--ServerApp.base_url=/served/elsewhere/"}))
+			Expect(declared).To(Equal([]string{
+				"--ServerApp.allow_origin=* --ServerApp.base_url=/dev/default/de-render/",
+			}))
 		})
 
 		It("leaves an environment that does not serve a notebook without NOTEBOOK_ARGS", func() {
@@ -1950,6 +1955,66 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			sts := &appsv1.StatefulSet{}
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
+		})
+
+		// NOTEBOOK_ARGS is where the controller tells the notebook which prefix to
+		// serve, and the published route is the prefix it picked. A valueFrom
+		// source cannot be read while reconciling, so the environment is refused
+		// rather than provisioned with an address that 404s.
+		It("refuses a jupyter environment whose NOTEBOOK_ARGS comes from valueFrom", func() {
+			env := validDevEnvironment("de-notebook-args-from")
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{{
+				Name: notebookArgsEnv,
+				ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "notebook-args"},
+					Key:                  "args",
+				}},
+			}}}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonNotebookArgsUnusable))
+				// The message has to name the variable and the flag: it is the only
+				// place the user learns what to change.
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Message).To(ContainSubstring(notebookArgsEnv))
+				g.Expect(cond.Message).To(ContainSubstring(notebookBaseURLFlag))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
+		})
+
+		// The gate must not catch a plain value: the controller can read one, and
+		// rewrites it in the pod spec instead of refusing the environment.
+		It("provisions a jupyter environment that declares NOTEBOOK_ARGS as a plain value", func() {
+			env := validDevEnvironment("de-notebook-args-plain")
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+				{Name: notebookArgsEnv, Value: "--ServerApp.base_url=/served/elsewhere/"},
+			}}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.Template.Spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+					Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env),
+				}))
+			}, "15s", "200ms").Should(Succeed())
+
+			got := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			Expect(got.Status.Phase).NotTo(BeNil())
+			Expect(got.Status.Phase.Name).NotTo(Equal(aiv1alpha1.PhaseFailed))
 		})
 
 		It("accepts a matching image brand and provisions", func() {

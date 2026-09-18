@@ -119,6 +119,7 @@ const (
 	reasonNotApplicable          = "NotApplicable"
 	reasonBrandMismatch          = "BrandMismatch"
 	reasonBrandValid             = "BrandMatchValid"
+	reasonNotebookArgsUnusable   = "NotebookArgsUnusable"
 	reasonPublished              = "Published"
 	reasonGatewayNotFound        = "GatewayNotFound"
 	reasonGatewayNotReady        = "GatewayNotReady"
@@ -373,6 +374,31 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonNotApplicable, "no GPU requested; image brand not checked")
 	} else {
 		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpuType matches the image brand")
+	}
+
+	// 1b. Notebook path gate: the controller owns the prefix a jupyter
+	// environment's route publishes and has to be able to tell the notebook to
+	// serve it. An environment that hides NOTEBOOK_ARGS behind a valueFrom
+	// source cannot be told, so it is refused like a brand mismatch rather than
+	// published with an address that 404s — nothing is provisioned, and an
+	// environment that was running is withdrawn.
+	if reason := unsupportedNotebookArgsReason(&env); reason != "" {
+		if err := r.stopCompute(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.deleteRoutes(ctx, &env); err != nil {
+			return ctrl.Result{}, err
+		}
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
+		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+		desired.Status.Endpoints = nil
+		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonNotebookArgsUnusable)
+		setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonNotebookArgsUnusable, reason)
+		if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
+			return ctrl.Result{}, err
+		}
+		r.emitLifecycleTransition(&env, desired)
+		return ctrl.Result{}, nil
 	}
 
 	// 2. SSH secrets: a managed host keypair and the authorized_keys source when
@@ -1228,26 +1254,56 @@ func declaredHome(env *aiv1alpha1.DevEnvironment) string {
 }
 
 // withNotebookBaseURL merges notebookBaseURLFlag+path into the environment's
-// NOTEBOOK_ARGS, adding the variable when the environment declares none. The
-// published path is a convention, not a mandate: an environment that already
-// names a base_url keeps it, so a deployment serving its notebook elsewhere is
-// not handed a second, contradictory flag.
+// NOTEBOOK_ARGS, adding the variable when the environment declares none.
 //
-// An entry fed by valueFrom is likewise left alone. Its value cannot be read
-// while reconciling without watching whatever it reads, and appending a second
-// NOTEBOOK_ARGS would not merge anyway — the last one wins.
+// The route forwards webPath(env) unchanged, so a container serving anywhere
+// else 404s on every published URL: a base_url the environment declares of its
+// own is therefore dropped, not kept. Every other flag is preserved, and
+// JUPYTER_TOKEN sets the same precedent for a value the controller owns
+// (::desiredPodSpec). Dropping rather than appending a second flag keeps a
+// contradictory value out of the container's own environment.
+//
+// Splitting the value into whitespace-separated arguments is what makes the
+// drop safe: Jupyter's launcher splits the same way, and a flag whose value
+// contains a space is written quoted, so it stays one argument across
+// strings.Fields and the join that follows.
+//
+// An entry fed by valueFrom never reaches here — its value cannot be read while
+// reconciling, so the reconcile refuses the environment instead
+// (::unsupportedNotebookArgsReason).
 func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 	for i, v := range envVars {
 		if v.Name != notebookArgsEnv {
 			continue
 		}
-		if v.ValueFrom != nil || strings.Contains(v.Value, notebookBaseURLFlag) {
-			return envVars
-		}
-		envVars[i].Value = strings.TrimSpace(v.Value + " " + notebookBaseURLFlag + path)
+		kept := slices.DeleteFunc(strings.Fields(v.Value), func(arg string) bool {
+			return strings.HasPrefix(arg, notebookBaseURLFlag)
+		})
+		envVars[i].Value = strings.TrimSpace(strings.Join(append(kept, notebookBaseURLFlag+path), " "))
 		return envVars
 	}
 	return append(envVars, corev1.EnvVar{Name: notebookArgsEnv, Value: notebookBaseURLFlag + path})
+}
+
+// unsupportedNotebookArgsReason reports a jupyter environment whose
+// NOTEBOOK_ARGS the controller cannot bring in line with the published path.
+//
+// Only a valueFrom source qualifies. A plain value is not refused: the
+// controller reads it, drops any base_url it carries and appends its own
+// (::withNotebookBaseURL). A valueFrom source is unreadable while reconciling —
+// reading it would mean watching whatever it reads — so whether it hides a
+// conflicting base_url is unknowable, and the environment would be published
+// with an address that 404s.
+func unsupportedNotebookArgsReason(env *aiv1alpha1.DevEnvironment) string {
+	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeJupyter || env.Spec.Runtime == nil {
+		return ""
+	}
+	for _, v := range env.Spec.Runtime.Env {
+		if v.Name == notebookArgsEnv && v.ValueFrom != nil {
+			return fmt.Sprintf("%s cannot come from valueFrom: the controller injects %s%s into it so the notebook serves the prefix its route publishes, which it cannot do for a value it cannot read", notebookArgsEnv, notebookBaseURLFlag, webPath(env))
+		}
+	}
+	return ""
 }
 
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
