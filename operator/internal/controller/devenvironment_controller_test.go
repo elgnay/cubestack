@@ -1825,7 +1825,7 @@ var _ = Describe("DevEnvironment apply is idempotent", func() {
 			Expect(client.IgnoreAlreadyExists(r.applyNetworkPolicy(ctx, stored))).To(Succeed())
 			_, err := r.applyHTTPRoute(ctx, stored, gw)
 			Expect(client.IgnoreAlreadyExists(err)).To(Succeed())
-			_, err = r.applyTCPRoute(ctx, stored, gw, sshPortName, sshServicePort)
+			_, err = r.applyTCPRoute(ctx, stored, sshPortName, sshServicePort)
 			Expect(client.IgnoreAlreadyExists(err)).To(Succeed())
 		}
 
