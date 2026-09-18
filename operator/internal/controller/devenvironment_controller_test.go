@@ -3912,6 +3912,48 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		// A listener declared on the Gateway itself heads the merged listener list,
+		// so an environment given the same port loses that collision: its ListenerSet
+		// listener comes back Conflicted and is never programmed, while the port
+		// stays claimed and blocks every later environment too.
+		It("skips a pool port the Gateway itself declares", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			// Start from an empty pool: earlier specs release their environments
+			// and routes asynchronously via the finalizer.
+			Eventually(func(g Gomega) {
+				envs := &aiv1alpha1.DevEnvironmentList{}
+				g.Expect(k8sClient.List(ctx, envs)).To(Succeed())
+				g.Expect(envs.Items).To(BeEmpty())
+				routes := &gatewayv1.TCPRouteList{}
+				g.Expect(k8sClient.List(ctx, routes, client.InNamespace(testNamespace))).To(Succeed())
+				g.Expect(routes.Items).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, envKey(testDevEnvGatewayName), gw)).To(Succeed())
+			gw.Spec.Listeners = append(gw.Spec.Listeners, gatewayv1.Listener{
+				Name:     "platform-tcp",
+				Port:     gatewayv1.PortNumber(testL4PortRangeStart),
+				Protocol: gatewayv1.TCPProtocolType,
+			})
+			Expect(k8sClient.Update(ctx, gw)).To(Succeed())
+
+			env := validDevEnvironment("de-gateway-pool-port")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// The lowest port of the range is the one the Gateway holds, so the
+			// environment has to land on the next one.
+			Eventually(func(g Gomega) {
+				ports := devEnvTCPRoutePorts(g, env.Name)
+				g.Expect(ports).To(HaveLen(1))
+				g.Expect(ports[0]).To(Equal(int32(testL4PortRangeStart + 1)))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		It("prunes TCPRoutes for removed exposures and frees the listener port", func() {
 			createGateway(true)
 			defer deleteGateway()

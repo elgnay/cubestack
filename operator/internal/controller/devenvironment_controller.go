@@ -2430,6 +2430,17 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		// A listener the platform declares on the Gateway itself outranks every
+		// ListenerSet bound to it: the Gateway API merges the two lists with the
+		// parent first, and a listener that loses a port collision is marked
+		// Conflicted and never programmed. So a pool port the Gateway already
+		// binds must not be handed out. The failure would not be recoverable
+		// either — the environment's ListenerSet still holds the port, so every
+		// later environment skips it while this one waits on a listener that
+		// will never be accepted.
+		for _, l := range gw.Spec.Listeners {
+			used[l.Port] = true
+		}
 		if sshExposed(env) {
 			p := r.allocatePort(env, sshPortName, used)
 			if p == 0 {
