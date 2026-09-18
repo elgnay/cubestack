@@ -8,7 +8,14 @@ kind: Gateway
 metadata:
   name: gateway
 spec:
-  # The Envoy Gateway install creates this GatewayClass.
+  # The GatewayClass owns the dataplane: Envoy Gateway derives the proxy
+  # Deployment and its Service from the EnvoyProxy the class references (in its
+  # spec.parametersRef), and only from there. Nothing here can set the proxy's
+  # Service type or image, so this Gateway must name a class that carries an
+  # EnvoyProxy setting both — a class with no parametersRef yields Envoy
+  # Gateway's defaults: a LoadBalancer Service, which never gets an address on a
+  # cluster with no load-balancer controller, and an image pulled from
+  # docker.io. See the chart README for the class the platform must provide.
   gatewayClassName: eg
   # ListenerSets contributed by tenant namespaces (one per DevEnvironment,
   # see the L4 port pool) are rejected unless the Gateway opts in: the API
@@ -18,19 +25,6 @@ spec:
   allowedListeners:
     namespaces:
       from: All
-  # Envoy Gateway creates the proxy Service as a LoadBalancer unless an
-  # EnvoyProxy says otherwise, and a cluster without a load-balancer
-  # controller then leaves the Gateway address-less, so nothing is ever
-  # published. The reference is namespace-local and has no namespace field:
-  # the EnvoyProxy must live beside this Gateway (envoyproxy.yaml).
-  infrastructure:
-    parametersRef:
-      group: gateway.envoyproxy.io
-      kind: EnvoyProxy
-      # Spelled with the namePrefix already applied: kustomize's nameReference
-      # config does not know this field, so it is not rewritten. A bare
-      # "gateway-proxy" here would dangle.
-      name: cubestack-gateway-proxy
   listeners:
     - name: http
       port: 80

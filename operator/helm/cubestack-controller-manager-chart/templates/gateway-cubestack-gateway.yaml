@@ -9,11 +9,6 @@ spec:
     namespaces:
       from: All
   gatewayClassName: {{ .Values.gateway.className | default "eg" }}
-  infrastructure:
-    parametersRef:
-      group: gateway.envoyproxy.io
-      kind: EnvoyProxy
-      name: {{ .Values.gateway.name | default "cubestack-gateway" }}-proxy
   listeners:
   - allowedRoutes:
       namespaces:

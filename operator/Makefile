@@ -108,11 +108,13 @@ KIND_CLUSTER_HELM ?= cubestack-helm-e2e
 HELM_E2E_KUBECTL = $(KUBECTL) --context kind-$(KIND_CLUSTER_HELM)
 HELM_E2E_HELM = $(HELM) --kube-context kind-$(KIND_CLUSTER_HELM)
 HELM_NAMESPACE ?= cubestack-system
-# Envoy Gateway version whose CRDs the helm e2e installs. The chart ships an
-# EnvoyProxy (the Gateway's dataplane parameters), so the kind cluster needs that
-# CRD registered before `helm upgrade` can create one. Pinned because it is
-# v1alpha1 and churns between EG minors; v1.9.1 is the version the chart README
-# verifies ListenerSet reconciliation against.
+# Envoy Gateway version whose CRDs the helm e2e installs. The chart does not
+# ship an EnvoyProxy — the dataplane belongs to the EnvoyProxy the GatewayClass
+# references, which the platform owns — but the CRDs are part of the same
+# install a real cluster would have (README, Prerequisites), so the kind cluster
+# gets them and a platform-style class-level EnvoyProxy would be accepted here.
+# Pinned because it is v1alpha1 and churns between EG minors; v1.9.1 is the
+# version the chart README verifies ListenerSet reconciliation against.
 ENVOY_GATEWAY_VERSION ?= v1.9.1
 HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
@@ -153,9 +155,8 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# the group the chart's objects belong to.
 	# --server-side is required, not stylistic: the envoyproxies and
 	# securitypolicies CRDs are too big for client-side apply's 256KB
-	# last-applied-configuration annotation, and envoyproxies is the one the
-	# chart's EnvoyProxy needs.
-	@echo "Installing Envoy Gateway CRDs (the chart ships a Gateway with an EnvoyProxy)..." ; \
+	# last-applied-configuration annotation.
+	@echo "Installing Envoy Gateway CRDs (the platform prerequisite's API surface)..." ; \
 	$(HELM) show crds oci://docker.io/envoyproxy/gateway-helm --version $(ENVOY_GATEWAY_VERSION) \
 		| awk 'BEGIN { buf = "---\n" } /^---[[:space:]]*$$/ { if (keep) printf "%s", buf; buf = "---\n"; keep = 0; next } \
 			{ buf = buf $$0 "\n"; if ($$0 == "  group: gateway.envoyproxy.io") keep = 1 } \
@@ -203,11 +204,16 @@ helm-e2e-crd-check: ## Verify chart CRDs plus the prerequisite lws/gateway CRDs,
 		|| { echo "manager SA cannot update DevEnvironments (the controller adds and removes its finalizer with Update)"; exit 1; }; \
 	echo "platform Gateway:"; \
 	$(HELM_E2E_KUBECTL) get gateway cubestack-gateway -n $(HELM_NAMESPACE) >/dev/null \
-		|| { echo "MISSING: the chart did not create Gateway/cubestack-gateway"; exit 1; }; \
-	$(HELM_E2E_KUBECTL) get gateway cubestack-gateway -n $(HELM_NAMESPACE) -o jsonpath='{.spec.infrastructure.parametersRef.name}' | grep -qx cubestack-gateway-proxy \
-		|| { echo "Gateway/cubestack-gateway does not point at EnvoyProxy/cubestack-gateway-proxy"; exit 1; }; \
-	$(HELM_E2E_KUBECTL) get envoyproxy cubestack-gateway-proxy -n $(HELM_NAMESPACE) >/dev/null \
-		|| { echo "MISSING: the chart did not create EnvoyProxy/cubestack-gateway-proxy (which carries the dataplane Service type)"; exit 1; }; \
+		|| { echo "MISSING: the chart did not create Gateway/cubestack-gateway"; exit 1; }
+	# The chart creates the Gateway and nothing else. No dataplane object may
+	# live here: a Gateway carrying an EnvoyProxy of its own replaces its class's
+	# provider config rather than merging with it, so a chart-shipped one would
+	# silently override whatever the platform configured for the whole class.
+	@set -e; \
+	[ -z "$$($(HELM_E2E_KUBECTL) get gateway cubestack-gateway -n $(HELM_NAMESPACE) -o jsonpath='{.spec.infrastructure}')" ] \
+		|| { echo "Gateway/cubestack-gateway carries spec.infrastructure: the dataplane belongs to the GatewayClass's EnvoyProxy"; exit 1; }; \
+	[ -z "$$($(HELM_E2E_KUBECTL) get envoyproxy -n $(HELM_NAMESPACE) -o name 2>/dev/null)" ] \
+		|| { echo "the release shipped an EnvoyProxy of its own — the dataplane belongs to the GatewayClass"; exit 1; }; \
 	$(HELM_E2E_KUBECTL) get deploy cubestack-controller-manager -n $(HELM_NAMESPACE) -o jsonpath='{.spec.template.spec.containers[0].args}' \
 		| grep -q -- "--gateway-name=cubestack-gateway" \
 		|| { echo "the manager was not told the Gateway's name: gateway.name must reach --gateway-name, or the object above is not the one it publishes through"; exit 1; }; \
