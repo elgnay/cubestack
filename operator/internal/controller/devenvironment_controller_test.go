@@ -41,10 +41,12 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
@@ -631,6 +633,49 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(err).NotTo(HaveOccurred())
 			Expect(used).NotTo(HaveKey(int32(20009)))
 			Expect(used).NotTo(HaveKey(int32(20010)))
+		})
+
+		// A cluster serving the Gateway API's standard channel has no TCPRoute kind
+		// at all, so the only way to exercise that cluster here is to make the read
+		// itself fail the way its discovery does.
+		newReconcilerFailingRouteRead := func(err error) *DevEnvironmentReconciler {
+			scheme := runtime.NewScheme()
+			Expect(gatewayv1.Install(scheme)).To(Succeed())
+			live := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(newListenerSet("peer-a-l4", "ns-a", defaultGatewayName, 20012)).
+				WithInterceptorFuncs(interceptor.Funcs{
+					List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+						if _, ok := list.(*gatewayv1.TCPRouteList); ok {
+							return err
+						}
+						return c.List(ctx, list, opts...)
+					},
+				}).Build()
+			return &DevEnvironmentReconciler{APIReader: live}
+		}
+
+		It("tolerates a cluster that serves no TCPRoute kind", func() {
+			// Nothing to carry over, and the ListenerSet scan — which still runs —
+			// is what holds every port this operator allocates. Read as a failure,
+			// this would fail allocation for every L4 environment on such a cluster,
+			// including the udp-only and ssh-only ones that never had a route.
+			r := newReconcilerFailingRouteRead(&meta.NoKindMatchError{
+				GroupKind:        schema.GroupKind{Group: gatewayAPIGroup, Kind: tcpRouteKind},
+				SearchedVersions: []string{gatewayv1.GroupVersion.Version},
+			})
+
+			used, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(used).To(HaveKey(int32(20012)))
+		})
+
+		It("fails on any other error from the route read", func() {
+			// Tolerated here, a transient failure would read as an empty pool and
+			// hand out the port a peer's route already holds.
+			r := newReconcilerFailingRouteRead(fmt.Errorf("the API server is having a bad day"))
+
+			_, err := r.usedPorts(context.Background(), "ns-b", "env-b")
+			Expect(err).To(HaveOccurred())
 		})
 	})
 
@@ -1438,9 +1483,62 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					LocalObjectReference: corev1.LocalObjectReference{Name: authSecretName(env)},
 					Key:                  jupyterTokenKey,
 				}}},
+				{Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env)},
 			}))
 			// A jupyter environment without ssh.enabled mounts no ssh volume.
 			Expect(c.VolumeMounts).To(BeEmpty())
+		})
+
+		// The prefix Jupyter is told to serve under has to be the prefix its route
+		// publishes: the route forwards the path unchanged, so a container serving
+		// anywhere else 404s on every published URL. Asserting both against one
+		// literal is what catches the two drifting apart.
+		It("tells jupyter to serve under the prefix its route publishes", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			r := &DevEnvironmentReconciler{}
+			route := r.desiredHTTPRoute(env, &gatewayv1.Gateway{ObjectMeta: metav1.ObjectMeta{
+				Name: testDevEnvGatewayName, Namespace: testNamespace,
+			}})
+			published := route.Spec.Rules[0].Matches[0].Path.Value
+			Expect(*published).To(Equal("/dev/default/de-render/"))
+			Expect(r.desiredPodSpec(env).Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name: notebookArgsEnv, Value: notebookBaseURLFlag + *published,
+			}))
+		})
+
+		It("merges the base_url into a declared NOTEBOOK_ARGS, keeping its other flags", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+					{Name: notebookArgsEnv, Value: "--ServerApp.allow_origin=*"},
+				}}
+			})
+			Expect(spec.Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  notebookArgsEnv,
+				Value: "--ServerApp.allow_origin=* --ServerApp.base_url=/dev/default/de-render/",
+			}))
+		})
+
+		It("keeps a base_url the environment declares, without doubling the flag", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+					{Name: notebookArgsEnv, Value: "--ServerApp.base_url=/served/elsewhere/"},
+				}}
+			})
+			declared := []string{}
+			for _, v := range spec.Containers[0].Env {
+				if v.Name == notebookArgsEnv {
+					declared = append(declared, v.Value)
+				}
+			}
+			Expect(declared).To(Equal([]string{"--ServerApp.base_url=/served/elsewhere/"}))
+		})
+
+		It("leaves an environment that does not serve a notebook without NOTEBOOK_ARGS", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) { e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH })
+			Expect(spec.Containers[0].Env).NotTo(ContainElement(HaveField("Name", notebookArgsEnv)))
 		})
 	})
 
@@ -2808,6 +2906,15 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(metav1.GetControllerOf(s).UID).To(Equal(env.UID))
 				g.Expect(s.Labels).To(HaveKeyWithValue(devEnvironmentLabelKey, env.Name))
 
+				// status names that same Secret, so the token is retrievable from
+				// the API instead of from a naming convention.
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.JupyterAuthSecret).To(Equal(&corev1.SecretReference{
+					Name:      authSecretName(env),
+					Namespace: testNamespace,
+				}))
+
 				sts := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
 				var injected *corev1.EnvVar
@@ -2907,6 +3014,13 @@ var _ = Describe("DevEnvironment controller", func() {
 				}
 				err := k8sClient.Get(ctx, envKey(authSecretName(env)), &corev1.Secret{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+
+				// The status field is jupyter-only and stays unset here, rather
+				// than naming a Secret that was never created. The StatefulSet
+				// above proves the reconcile got past the branch that would set it.
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.JupyterAuthSecret).To(BeNil())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -4307,6 +4421,35 @@ var _ = Describe("published endpoint ports", func() {
 			g.Expect(got.Status.Endpoints).To(BeEmpty())
 		}, "15s", "200ms").Should(Succeed())
 	})
+
+	It("publishes an ssh environment on a dataplane that carries no HTTP port", func() {
+		createGateway(true)
+		defer deleteGateway()
+
+		env := newSSHEnvironment("de-nodeport-no-http")
+		defer deleteEnv(env.Name)
+
+		// The mirror of the spec above, on the other side of the same rule. An ssh
+		// environment has no endpoint on the Gateway's HTTP listener, so a dataplane
+		// without that port — a Gateway serving no HTTP at all — says nothing about
+		// its ssh address, which resolved perfectly well. Requiring the HTTP port
+		// here would withhold every endpoint the environment has.
+		listenerPorts := listenerPortsOf(env.Name, 1)
+		createDataplaneService(corev1.ServiceTypeNodePort, []corev1.ServicePort{
+			{Name: fmt.Sprintf("tcp-%d", listenerPorts[0]), Port: listenerPorts[0], NodePort: nodePortFor(0)},
+		})
+		defer deleteDataplaneService()
+
+		Eventually(func(g Gomega) {
+			stampDevEnvRoutes(g, env.Name, true, "", "")
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			g.Expect(sshEndpointPort(got.Status.Endpoints)).To(Equal(listenerPorts[0]))
+			g.Expect(got.Status.Endpoints).To(HaveLen(1))
+			g.Expect(addressPort(got.Status.Endpoints[0].Address)).To(Equal(nodePortFor(0)))
+		}, "15s", "200ms").Should(Succeed())
+	})
 })
 
 var _ = Describe("enqueueForDataplaneService", func() {
@@ -4336,16 +4479,34 @@ var _ = Describe("enqueueForDataplaneService", func() {
 	}
 
 	It("maps the Gateway's dataplane Service to every environment", func() {
-		env := validDevEnvironment("de-dataplane-watch")
-		Expect(k8sClient.Create(ctx, env)).To(Succeed())
-		defer deleteEnv(env.Name)
+		// The mapping lists every environment in the cluster, and earlier specs
+		// release theirs asynchronously (via the finalizer), so drain first: the
+		// assertion below is over the complete set and would otherwise be
+		// counting somebody else's leftovers.
+		Eventually(func(g Gomega) {
+			list := &aiv1alpha1.DevEnvironmentList{}
+			g.Expect(k8sClient.List(ctx, list)).To(Succeed())
+			g.Expect(list.Items).To(BeEmpty())
+		}, "15s", "200ms").Should(Succeed())
+
+		first := validDevEnvironment("de-dataplane-watch-a")
+		second := validDevEnvironment("de-dataplane-watch-b")
+		Expect(k8sClient.Create(ctx, first)).To(Succeed())
+		Expect(k8sClient.Create(ctx, second)).To(Succeed())
+		defer deleteEnv(first.Name)
+		defer deleteEnv(second.Name)
 
 		r := dataplaneReconciler()
+		// ConsistOf rather than ContainElement: each environment is enqueued
+		// exactly once. A mapping that drops an environment, repeats one or
+		// invents one leaves that environment publishing an address the dataplane
+		// no longer serves, and a subset assertion cannot see it.
 		Eventually(func(g Gomega) {
 			g.Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace, owningLabels))).
-				To(ContainElement(reconcile.Request{
-					NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: env.Name},
-				}))
+				To(ConsistOf(
+					reconcile.Request{NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: first.Name}},
+					reconcile.Request{NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: second.Name}},
+				))
 		}, "15s", "200ms").Should(Succeed())
 	})
 
@@ -4363,5 +4524,47 @@ var _ = Describe("enqueueForDataplaneService", func() {
 		// controller never reads the dataplane Service either.
 		r.Config.GatewayDataplaneNamespace = ""
 		Expect(r.enqueueForDataplaneService(ctx, service(testGatewayDataplaneNamespace, owningLabels))).To(BeEmpty())
+	})
+})
+
+var _ = Describe("enqueueAllDevEnvironments", func() {
+	// The Gateway watch maps a Gateway event — the address appearing, changing, or
+	// going away — to every environment. The Gateway is shared, so nothing on an
+	// environment says the address it published under is still the one the Gateway
+	// hands out; every environment has to be re-reconciled on each event, and
+	// exactly once, because that reconcile is what withdraws an address that has
+	// stopped answering.
+	//
+	// This covers the mapping, which is what a Gateway event goes through. That the
+	// watch is registered at all is what "withdraws the endpoints when the Gateway
+	// loses its address" above exercises, and it cannot prove that on its own: the
+	// DevEnvironment watch can carry the same fall if a status write is still in
+	// flight.
+	It("maps one Gateway event to every environment, once each", func() {
+		// Everything in the cluster is mapped, so drain first: this asserts the
+		// complete set, and earlier specs release their environments
+		// asynchronously.
+		Eventually(func(g Gomega) {
+			list := &aiv1alpha1.DevEnvironmentList{}
+			g.Expect(k8sClient.List(ctx, list)).To(Succeed())
+			g.Expect(list.Items).To(BeEmpty())
+		}, "15s", "200ms").Should(Succeed())
+
+		first := validDevEnvironment("de-gw-event-a")
+		second := validDevEnvironment("de-gw-event-b")
+		Expect(k8sClient.Create(ctx, first)).To(Succeed())
+		Expect(k8sClient.Create(ctx, second)).To(Succeed())
+		defer deleteEnv(first.Name)
+		defer deleteEnv(second.Name)
+
+		r := &DevEnvironmentReconciler{Client: k8sClient}
+		Eventually(func(g Gomega) {
+			g.Expect(r.enqueueAllDevEnvironments(ctx, &gatewayv1.Gateway{
+				ObjectMeta: metav1.ObjectMeta{Name: testDevEnvGatewayName, Namespace: testNamespace},
+			})).To(ConsistOf(
+				reconcile.Request{NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: first.Name}},
+				reconcile.Request{NamespacedName: types.NamespacedName{Namespace: testNamespace, Name: second.Name}},
+			))
+		}, "15s", "200ms").Should(Succeed())
 	})
 })

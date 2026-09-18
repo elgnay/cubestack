@@ -257,6 +257,11 @@ func (in *DevEnvironmentStatus) DeepCopyInto(out *DevEnvironmentStatus) {
 		*out = new(v1.SecretReference)
 		**out = **in
 	}
+	if in.JupyterAuthSecret != nil {
+		in, out := &in.JupyterAuthSecret, &out.JupyterAuthSecret
+		*out = new(v1.SecretReference)
+		**out = **in
+	}
 	if in.LastActivityTime != nil {
 		in, out := &in.LastActivityTime, &out.LastActivityTime
 		*out = (*in).DeepCopy()

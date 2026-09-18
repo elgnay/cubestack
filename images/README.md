@@ -273,8 +273,9 @@ files are `COPY common/...`.
 ## Trade-offs / notes
 
 - The `jupyter-minimal` overlay is intentionally thin: identical stock layout, sshd only. Tokens and the
-  URL prefix flow through stock env (`JUPYTER_TOKEN`, `NOTEBOOK_ARGS`); `base_url` is not yet injected by
-  the operator (Gap C / decision doc §8). Its native `gid 100` and `/home/jovyan` are what a
+  URL prefix flow through stock env (`JUPYTER_TOKEN`, `NOTEBOOK_ARGS`); the operator injects the
+  `base_url` prefix into `NOTEBOOK_ARGS` (Gap C / decision doc §8), merging into a value the
+  environment declares rather than replacing it. Its native `gid 100` and `/home/jovyan` are what a
   DevEnvironment has to be configured with (see above).
 - sshd binds the unprivileged `2222`, so the images need **no capability at all** — design Gap B
   (`NET_BIND_SERVICE`) is closed by port choice rather than by granting a privilege. Two things follow:

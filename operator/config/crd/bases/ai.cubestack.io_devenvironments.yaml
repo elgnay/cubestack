@@ -633,6 +633,25 @@ spec:
                   - name
                   type: object
                 type: array
+              jupyterAuthSecret:
+                description: |-
+                  JupyterAuthSecret is the Secret the environment's Jupyter token comes from,
+                  for a jupyter environment: the managed <env>-auth Secret the controller
+                  generates, holding the token under the data key "token". It is recorded in
+                  status so the user can retrieve the token, which the web route requires.
+                  Absent for every other environment type, which serves no authenticated web
+                  path.
+                properties:
+                  name:
+                    description: name is unique within a namespace to reference a
+                      secret resource.
+                    type: string
+                  namespace:
+                    description: namespace defines the space within which the secret
+                      name must be unique.
+                    type: string
+                type: object
+                x-kubernetes-map-type: atomic
               lastActivityTime:
                 description: |-
                   LastActivityTime is the last activity time, used for idle timeout

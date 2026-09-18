@@ -410,6 +410,15 @@ type DevEnvironmentStatus struct {
 	// +optional
 	SSHKeysSecret *corev1.SecretReference `json:"sshKeysSecret,omitempty"`
 
+	// JupyterAuthSecret is the Secret the environment's Jupyter token comes from,
+	// for a jupyter environment: the managed <env>-auth Secret the controller
+	// generates, holding the token under the data key "token". It is recorded in
+	// status so the user can retrieve the token, which the web route requires.
+	// Absent for every other environment type, which serves no authenticated web
+	// path.
+	// +optional
+	JupyterAuthSecret *corev1.SecretReference `json:"jupyterAuthSecret,omitempty"`
+
 	// LastActivityTime is the last activity time, used for idle timeout
 	// determination.
 	// +optional

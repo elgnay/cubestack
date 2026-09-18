@@ -233,6 +233,15 @@ const (
 	jupyterTokenKey = "token"
 	jupyterTokenEnv = "JUPYTER_TOKEN"
 
+	// notebookArgsEnv is the variable the stock Jupyter launcher appends to the
+	// notebook command line, and notebookBaseURLFlag the launcher flag that makes
+	// Jupyter serve under a URL prefix. The web route forwards its path prefix
+	// unchanged — there is no URLRewrite filter — so Jupyter has to serve under
+	// webPath, and the controller hands it the prefix rather than having the
+	// gateway strip it (::withNotebookBaseURL).
+	notebookArgsEnv     = "NOTEBOOK_ARGS"
+	notebookBaseURLFlag = "--ServerApp.base_url="
+
 	// jupyterTokenRevisionAnnotationKey records a non-sensitive sha256 digest of
 	// the managed Jupyter token on the StatefulSet pod template. JUPYTER_TOKEN
 	// is read from the Secret at container start, so a refilled token must roll
@@ -397,6 +406,9 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		// Named through the same helper the workload's SecretKeyRef uses, so the
+		// status and the injected JUPYTER_TOKEN cannot point at different Secrets.
+		desired.Status.JupyterAuthSecret = &corev1.SecretReference{Name: authSecretName(&env), Namespace: env.Namespace}
 		// Carry the token revision to applyStatefulSet below. env is re-fetched
 		// every reconcile and only its status is persisted, so this in-memory
 		// annotation never lands on the DevEnvironment object; it only drives the
@@ -405,6 +417,8 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 			env.Annotations = map[string]string{}
 		}
 		env.Annotations[jupyterTokenRevisionAnnotationKey] = digest
+	} else {
+		desired.Status.JupyterAuthSecret = nil
 	}
 
 	// 3. Core resources.
@@ -702,21 +716,30 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	// arrive with separate CRDs — TCPRoute ships in the Gateway API's
 	// experimental channel, ListenerSet is separate again — so an install can
 	// carry the Gateway and the HTTPRoute without either, and a watch on a kind
-	// the server does not serve fails the manager at startup.
-	if gatewayAPICRDInstalled(mgr, gatewayKind) {
-		builder.Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
+	// the server does not serve fails the manager at startup. A probe that fails
+	// for any reason other than an absent kind fails setup here instead of
+	// silently dropping that watch for the manager's lifetime: see
+	// gatewayAPICRDInstalled.
+	watches := []struct {
+		kind string
+		add  func()
+	}{
+		{gatewayKind, func() {
+			builder.Watches(&gatewayv1.Gateway{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
+		}},
+		{httpRouteKind, func() { builder.Owns(&gatewayv1.HTTPRoute{}) }},
+		{tcpRouteKind, func() { builder.Owns(&gatewayv1.TCPRoute{}) }},
+		{udpRouteKind, func() { builder.Owns(&gatewayv1.UDPRoute{}) }},
+		{listenerSetKind, func() { builder.Owns(&gatewayv1.ListenerSet{}) }},
 	}
-	if gatewayAPICRDInstalled(mgr, httpRouteKind) {
-		builder.Owns(&gatewayv1.HTTPRoute{})
-	}
-	if gatewayAPICRDInstalled(mgr, tcpRouteKind) {
-		builder.Owns(&gatewayv1.TCPRoute{})
-	}
-	if gatewayAPICRDInstalled(mgr, udpRouteKind) {
-		builder.Owns(&gatewayv1.UDPRoute{})
-	}
-	if gatewayAPICRDInstalled(mgr, listenerSetKind) {
-		builder.Owns(&gatewayv1.ListenerSet{})
+	for _, watch := range watches {
+		installed, err := gatewayAPICRDInstalled(mgr, watch.kind)
+		if err != nil {
+			return fmt.Errorf("probing whether the %s kind is served: %w", watch.kind, err)
+		}
+		if installed {
+			watch.add()
+		}
 	}
 	// MaxConcurrentReconciles is pinned to 1 rather than left to default to it.
 	// Port allocation reads the pool and then creates a TCPRoute, and nothing
@@ -804,10 +827,23 @@ func (r *DevEnvironmentReconciler) enqueueForDataplaneService(ctx context.Contex
 // gatewayAPICRDInstalled reports whether one Gateway API kind is served, so the
 // manager only watches the Gateway API objects this cluster actually has. The
 // kinds arrive with separate CRDs, so each is probed for itself.
-func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) bool {
+//
+// Only "no such kind" means absent. Every other discovery failure is returned:
+// the probe runs once, at startup, and a watch skipped here is skipped for the
+// manager's lifetime — there is no periodic resync to notice later. Reading a
+// transient discovery error or a missing RBAC grant on the CRDs as "not
+// installed" would leave the manager running happily with objects it never
+// watches, publishing addresses it never learns have gone stale.
+func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 	_, err := mgr.GetRESTMapper().RESTMapping(
 		schema.GroupKind{Group: gatewayv1.GroupName, Kind: kind}, gatewayv1.GroupVersion.Version)
-	return err == nil
+	if err == nil {
+		return true, nil
+	}
+	if meta.IsNoMatchError(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 // brandMismatchReason returns a non-empty message when gpuType does not match
@@ -1191,6 +1227,29 @@ func declaredHome(env *aiv1alpha1.DevEnvironment) string {
 	return home
 }
 
+// withNotebookBaseURL merges notebookBaseURLFlag+path into the environment's
+// NOTEBOOK_ARGS, adding the variable when the environment declares none. The
+// published path is a convention, not a mandate: an environment that already
+// names a base_url keeps it, so a deployment serving its notebook elsewhere is
+// not handed a second, contradictory flag.
+//
+// An entry fed by valueFrom is likewise left alone. Its value cannot be read
+// while reconciling without watching whatever it reads, and appending a second
+// NOTEBOOK_ARGS would not merge anyway — the last one wins.
+func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
+	for i, v := range envVars {
+		if v.Name != notebookArgsEnv {
+			continue
+		}
+		if v.ValueFrom != nil || strings.Contains(v.Value, notebookBaseURLFlag) {
+			return envVars
+		}
+		envVars[i].Value = strings.TrimSpace(v.Value + " " + notebookBaseURLFlag + path)
+		return envVars
+	}
+	return append(envVars, corev1.EnvVar{Name: notebookArgsEnv, Value: notebookBaseURLFlag + path})
+}
+
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
 // spec.running, the workspace volumeClaimTemplate, and PVC retention. The
 // workspace PVC's lifecycle belongs to the StatefulSet: it creates the claim
@@ -1275,6 +1334,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 				},
 			},
 		})
+		// Jupyter has to serve under the prefix its route publishes, and the
+		// launcher only learns the prefix from NOTEBOOK_ARGS (design §6.4).
+		envVars = withNotebookBaseURL(envVars, webPath(env))
 	}
 	container.Env = envVars
 	if env.Spec.Storage != nil {
@@ -2108,11 +2170,18 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 	// dataplane renumbers its listeners, so an address built from the listener
 	// port alone would name a port that is closed on the node. The HTTP listener
 	// is TCP whatever the environment's own ports are.
+	//
+	// Only the environments that publish it have to resolve it (publishesHTTP):
+	// an ssh-only environment has no endpoint on the HTTP listener, so a
+	// dataplane Service that does not carry that port — a Gateway serving no
+	// HTTP — says nothing about its ssh address, which resolved perfectly well.
 	wanted := make(map[int32]corev1.Protocol, len(ports)+1)
 	for name, p := range ports {
 		wanted[p] = l4Protocol(env, name)
 	}
-	wanted[cfg.HTTPPort] = corev1.ProtocolTCP
+	if publishesHTTP(env) {
+		wanted[cfg.HTTPPort] = corev1.ProtocolTCP
+	}
 	external, err := r.externalPorts(ctx, gw, wanted)
 	if err != nil {
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotReady, err.Error())
@@ -2344,7 +2413,7 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 	}
 
 	published := []publishedRoute{}
-	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH || hasHTTPPorts(env) {
+	if publishesHTTP(env) {
 		route, err := r.applyHTTPRoute(ctx, env, gw)
 		if err != nil {
 			return nil, nil, nil, err
@@ -2470,6 +2539,18 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 	return false
 }
 
+// publishesHTTP reports whether the environment has anything on the Gateway's
+// HTTP listener: every type except ssh, which serves no web surface of its own,
+// plus ssh environments that add an explicit http port. Two decisions ride on
+// it and have to agree — whether an HTTPRoute is applied, and whether the HTTP
+// listener's port has to be resolved in the dataplane Service before the
+// environment's endpoints are published. No endpoint is built for an
+// environment that publishes no HTTP, so requiring the port there would withhold
+// addresses that did resolve (see reconcileGatewayRoutes).
+func publishesHTTP(env *aiv1alpha1.DevEnvironment) bool {
+	return env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH || hasHTTPPorts(env)
+}
+
 // usedPorts collects every L4 port already allocated to another environment
 // (the port pool is gateway-wide, so it spans namespaces). Allocations are read
 // from the objects that declare them, not from status.endpoints: the endpoint
@@ -2486,7 +2567,9 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 //
 // Only objects attached to the configured Gateway count: one parented elsewhere
 // holds no listener here. A failed List is returned rather than read as an empty
-// pool, which would hand out ports other environments already hold.
+// pool, which would hand out ports other environments already hold — the one
+// exception is a kind the API server does not serve, which holds no objects by
+// definition (see the TCPRoute read below).
 //
 // Every L4 protocol shares this pool: a UDP exposure allocates from here and
 // never takes a number TCP already holds. Allocation identity is
@@ -2508,8 +2591,15 @@ func hasHTTPPorts(env *aiv1alpha1.DevEnvironment) bool {
 func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, excludeName string) (map[int32]bool, error) {
 	cfg := r.defaultedConfig()
 	used := map[int32]bool{}
+	// A cluster serving the Gateway API's standard channel has no TCPRoute kind
+	// at all. That means there are no legacy routes to count — the ListenerSet
+	// scan below is what holds every port this operator allocates — so only "no
+	// such kind" is tolerated here: read as a failure it would fail allocation
+	// for every L4 environment, including the udp-only and ssh-only ones that
+	// never had a TCPRoute to count. Every other error is a failed read of a
+	// pool this must not mistake for empty.
 	var trs gatewayv1.TCPRouteList
-	if err := r.APIReader.List(ctx, &trs); err != nil {
+	if err := r.APIReader.List(ctx, &trs); err != nil && !meta.IsNoMatchError(err) {
 		return nil, err
 	}
 	// Only TCPRoutes are scanned for their own parent here, and deliberately so:
@@ -2582,7 +2672,7 @@ func (r *DevEnvironmentReconciler) desiredHTTPRoute(env *aiv1alpha1.DevEnvironme
 		rules = append(rules, gatewayv1.HTTPRouteRule{
 			Matches: []gatewayv1.HTTPRouteMatch{{Path: &gatewayv1.HTTPPathMatch{
 				Type:  ptr(gatewayv1.PathMatchPathPrefix),
-				Value: ptr(fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name)),
+				Value: ptr(webPath(env)),
 			}}},
 			BackendRefs: []gatewayv1.HTTPBackendRef{{BackendRef: serviceBackendRef(env.Name, mainContainerPort(env.Spec.Type))}},
 		})
@@ -2610,6 +2700,15 @@ func (r *DevEnvironmentReconciler) desiredHTTPRoute(env *aiv1alpha1.DevEnvironme
 
 func webRouteName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-web"
+}
+
+// webPath is the path prefix an environment's web endpoint is published under
+// (design §6.4). The route matches it and forwards it unchanged, so the
+// endpoint address and any container serving there have to agree on it — the
+// Jupyter base_url injection (::withNotebookBaseURL) reads the same function
+// rather than repeating the format.
+func webPath(env *aiv1alpha1.DevEnvironment) string {
+	return fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name)
 }
 
 // desiredListenerSet renders the environment's L4 listeners. Every allocated
@@ -2942,7 +3041,7 @@ func (r *DevEnvironmentReconciler) buildEndpoints(env *aiv1alpha1.DevEnvironment
 	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
 		status.Endpoints = append(status.Endpoints, aiv1alpha1.Endpoint{
 			Name:         string(env.Spec.Type),
-			Address:      "http://" + hostPort(cfg.HTTPPort) + fmt.Sprintf("/dev/%s/%s/", env.Namespace, env.Name),
+			Address:      "http://" + hostPort(cfg.HTTPPort) + webPath(env),
 			ListenerPort: cfg.HTTPPort,
 		})
 	}
