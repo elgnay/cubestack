@@ -11,13 +11,14 @@ spec:
 
   # Compute / resources
   resources:
-    gpuType: nvidia
-    # gpuCount is the number of GPU cards. Omit it for the default of 1 — an
-    # omitted count always means one GPU. Set it to 0 for a CPU-only
-    # environment: the pod then carries no GPU resource at all, and the image
-    # brand is not checked, which is how the CPU images (ssh-ubuntu22.04,
-    # jupyter-minimal) are used.
-    gpuCount: 1
+    # gpu requests accelerators. It is the whole request: how many cards, and of
+    # which vendor. Omit the block entirely for a CPU-only environment — the pod
+    # then carries no GPU resource at all, and the image brand is not checked,
+    # which is how the CPU images (ssh-ubuntu22.04, jupyter-minimal) are used.
+    # There is no count of 0: an absent block is the only way to ask for none.
+    gpu:
+      vendor: nvidia             # nvidia (nvidia.com/gpu) / metax (metax-tech.com/gpu)
+      count: 1                   # omit for the default of 1
     cpu: "16"
     memory: "64Gi"
 

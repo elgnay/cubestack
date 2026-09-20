@@ -65,10 +65,9 @@ func validDevEnvironment(name string) *DevEnvironment {
 			Image:   testDevImage,
 			Running: true,
 			Resources: ResourcesSpec{
-				GPUType:  GPUTypeNVIDIA,
-				GPUCount: ptrTo(int32(1)),
-				CPU:      "16",
-				Memory:   "64Gi",
+				GPU:    &GPUSpec{Vendor: AcceleratorVendorNvidia, Count: ptrTo(int32(1))},
+				CPU:    "16",
+				Memory: "64Gi",
 			},
 			Storage: &StorageSpec{
 				Size:         "200Gi",
@@ -124,8 +123,10 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
 			Expect(got.Spec.Type).To(Equal(DevEnvironmentTypeSSH))
 			Expect(got.Spec.Running).To(BeFalse())
-			Expect(got.Spec.Resources.GPUType).To(Equal(GPUTypeNVIDIA))
-			Expect(got.Spec.Resources.GPUCount).To(Equal(ptrTo(int32(1))))
+			// The gpu block is deliberately not defaulted into existence: defaulting
+			// it would put an accelerator on every environment and leave "no
+			// accelerator" with no way to be expressed. Absent stays absent.
+			Expect(got.Spec.Resources.GPU).To(BeNil())
 			Expect(got.Spec.Storage.Size).To(Equal("10Gi"))
 			// The workspace claim is provisioned and owned by the platform, so
 			// omitting the policy reclaims it with the environment; keeping the
@@ -208,9 +209,9 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-type",
 				func(s *DevEnvironmentSpec) { s.Type = DevEnvironmentType("docker") },
 				"Unsupported value"),
-			Entry("unsupported gpuType",
-				"de-invalid-gputype",
-				func(s *DevEnvironmentSpec) { s.Resources.GPUType = GPUType("amd") },
+			Entry("unsupported gpu vendor",
+				"de-invalid-gpuvendor",
+				func(s *DevEnvironmentSpec) { s.Resources.GPU = &GPUSpec{Vendor: AcceleratorVendor("amd")} },
 				"Unsupported value"),
 			Entry("unsupported pvcRetention",
 				"de-invalid-retention",
@@ -275,10 +276,8 @@ var _ = Describe("DevEnvironment", func() {
 		DescribeTable("rejects objects with missing required fields",
 			func(name string, mutate func(map[string]any), wantMessage string) {
 				spec := map[string]any{
-					"image": testDevImage,
-					"resources": map[string]any{
-						"gpuType": GPUTypeNVIDIA,
-					},
+					"image":     testDevImage,
+					"resources": map[string]any{},
 				}
 				mutate(spec)
 
@@ -306,8 +305,10 @@ var _ = Describe("DevEnvironment", func() {
 				spec := map[string]any{
 					"image": testDevImage,
 					"resources": map[string]any{
-						"gpuType":  GPUTypeNVIDIA,
-						"gpuCount": 1,
+						"gpu": map[string]any{
+							"vendor": "nvidia",
+							"count":  1,
+						},
 					},
 				}
 				mutate(spec)
@@ -319,23 +320,47 @@ var _ = Describe("DevEnvironment", func() {
 				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected Invalid error, got: %v", err)
 				Expect(err.Error()).To(ContainSubstring(wantMessage))
 			},
-			Entry("gpuCount below minimum",
+			Entry("gpu count below minimum",
 				"de-invalid-gpucount-raw",
-				func(s map[string]any) { s["resources"].(map[string]any)["gpuCount"] = -1 },
-				"spec.resources.gpuCount"),
+				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["count"] = -1 },
+				"spec.resources.gpu.count"),
+			// There is no count of zero: the block's absence is how an environment
+			// asks for no accelerator, so a zero inside the block describes nothing
+			// and is refused rather than quietly reinterpreted.
+			Entry("gpu count of zero",
+				"de-invalid-gpucount-zero-raw",
+				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["count"] = 0 },
+				"spec.resources.gpu.count"),
 		)
 
-		// gpuCount 0 means "no accelerator" and must survive a write. As a plain
-		// int32 with omitempty the zero would be dropped on the way out and the
-		// schema default of 1 restored — silently turning a CPU-only environment
-		// back into a GPU one on the controller's first Update.
-		It("keeps an explicit gpuCount of 0 across a write", func() {
-			de := validDevEnvironment("de-cpu-only")
-			de.Spec.Resources.GPUCount = ptrTo(int32(0))
+		// Within the block, an omitted vendor and an omitted count are defaulted —
+		// the block's presence is the request, and there is nothing sensible for
+		// the halves to be missing.
+		It("defaults the halves of a gpu block that is present", func() {
+			de := validDevEnvironment("de-gpu-block-defaults")
+			de.Spec.Resources.GPU = &GPUSpec{Count: ptrTo(int32(2))}
 
 			Expect(k8sClient.Create(ctx, de)).To(Succeed())
-			Expect(de.Spec.Resources.GPUCount).NotTo(BeNil())
-			Expect(*de.Spec.Resources.GPUCount).To(Equal(int32(0)))
+
+			got := &DevEnvironment{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
+			Expect(got.Spec.Resources.GPU).NotTo(BeNil())
+			Expect(got.Spec.Resources.GPU.Vendor).To(Equal(AcceleratorVendorNvidia))
+			Expect(got.Spec.Resources.GPU.Count).To(Equal(ptrTo(int32(2))))
+
+			Expect(k8sClient.Delete(ctx, de)).To(Succeed())
+		})
+
+		// An environment that asks for no accelerator must stay that way across a
+		// write. If the CRD ever grew a default on the block itself, the block would
+		// be materialised on the way in and the environment would silently become a
+		// GPU one on the controller's first Update.
+		It("keeps an absent gpu block absent across a write", func() {
+			de := validDevEnvironment("de-cpu-only")
+			de.Spec.Resources.GPU = nil
+
+			Expect(k8sClient.Create(ctx, de)).To(Succeed())
+			Expect(de.Spec.Resources.GPU).To(BeNil())
 
 			// A write that does not touch resources — the shape the controller's
 			// finalizer Update takes.
@@ -344,8 +369,7 @@ var _ = Describe("DevEnvironment", func() {
 
 			got := &DevEnvironment{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
-			Expect(got.Spec.Resources.GPUCount).NotTo(BeNil())
-			Expect(*got.Spec.Resources.GPUCount).To(Equal(int32(0)))
+			Expect(got.Spec.Resources.GPU).To(BeNil())
 
 			Expect(k8sClient.Delete(ctx, de)).To(Succeed())
 		})

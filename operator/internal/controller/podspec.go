@@ -33,6 +33,10 @@ const mainContainerName = "main"
 func ptr[T any](v T) *T { return &v }
 
 // vendorResource maps an AcceleratorVendor to the GPU extended resource name.
+// It is total: an unrecognised vendor resolves to metax-tech.com/gpu, and its
+// counterpart brandMarker likewise. Callers that can hold a half-filled or
+// hand-built spec (the DevEnvironment path) must resolve the vendor first —
+// desiredGPU does, so only the two literals ever reach here.
 func vendorResource(vendor aiv1alpha1.AcceleratorVendor) string {
 	switch vendor {
 	case aiv1alpha1.AcceleratorVendorNvidia:

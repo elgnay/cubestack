@@ -344,13 +344,12 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// any path below writes status.
 	meta.RemoveStatusCondition(&desired.Status.Conditions, legacyStorageReadyCondition)
 
-	// 1. Brand match gate: gpuType must match the image brand. A mismatch is a
-	// hard failure — nothing is provisioned (design §4.2). An environment that
-	// was running before the image or gpuType changed is withdrawn so the Failed
-	// phase reflects reality: the workload is stopped and the routes removed.
-	// An environment requesting no GPU (gpuCount 0) is exempt: with no
-	// accelerator there is no brand to match, which is what makes a CPU image
-	// usable at all.
+	// 1. Brand match gate: the requested GPU vendor must match the image brand. A
+	// mismatch is a hard failure — nothing is provisioned (design §4.2). An
+	// environment that was running before the image or vendor changed is withdrawn
+	// so the Failed phase reflects reality: the workload is stopped and the routes
+	// removed. An environment requesting no GPU is exempt: with no accelerator
+	// there is no brand to match, which is what makes a CPU image usable at all.
 	if reason := brandMismatchReason(&env); reason != "" {
 		if err := r.stopCompute(ctx, &env); err != nil {
 			return ctrl.Result{}, err
@@ -370,10 +369,10 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		r.emitLifecycleTransition(&env, desired)
 		return ctrl.Result{}, nil
 	}
-	if desiredGPUCount(&env) == 0 {
+	if _, _, ok := desiredGPU(&env); !ok {
 		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonNotApplicable, "no GPU requested; image brand not checked")
 	} else {
-		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpuType matches the image brand")
+		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpu vendor matches the image brand")
 	}
 
 	// 1b. Notebook path gate: the controller owns the prefix a jupyter
@@ -872,25 +871,31 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 	return false, err
 }
 
-// brandMismatchReason returns a non-empty message when gpuType does not match
-// the image brand: nvidia <-> base-cuda and metax <-> base-maca (design §4.2).
-// Custom images must carry their brand marker in the name (P1 baseline). An
-// environment that requests no GPU has no brand to match, so it is exempt —
-// which is what lets a CPU-only environment run a CPU image.
+// brandMarker is the token every image of a vendor must carry in its name
+// (design §4.2). Like vendorResource it is total, so an unresolvable vendor
+// produces a mismatch rather than silently switching the gate off — the two
+// mappings have to agree about which vendors exist.
+func brandMarker(vendor aiv1alpha1.AcceleratorVendor) string {
+	switch vendor {
+	case aiv1alpha1.AcceleratorVendorNvidia:
+		return "base-cuda"
+	default:
+		return "base-maca"
+	}
+}
+
+// brandMismatchReason returns a non-empty message when the requested GPU vendor
+// does not match the image brand: nvidia <-> base-cuda and metax <-> base-maca
+// (design §4.2). Custom images must carry their brand marker in the name
+// (P1 baseline). An environment that requests no GPU has no brand to match, so
+// it is exempt — which is what lets a CPU-only environment run a CPU image.
 func brandMismatchReason(env *aiv1alpha1.DevEnvironment) string {
-	if desiredGPUCount(env) == 0 {
+	vendor, _, ok := desiredGPU(env)
+	if !ok {
 		return ""
 	}
-	image := strings.ToLower(env.Spec.Image)
-	switch env.Spec.Resources.GPUType {
-	case aiv1alpha1.GPUTypeNVIDIA:
-		if !strings.Contains(image, "base-cuda") {
-			return fmt.Sprintf("image %q does not match gpuType nvidia (expected a base-cuda image); set spec.resources.gpuCount: 0 for a CPU-only environment", env.Spec.Image)
-		}
-	case aiv1alpha1.GPUTypeMetaX:
-		if !strings.Contains(image, "base-maca") {
-			return fmt.Sprintf("image %q does not match gpuType metax (expected a base-maca image); set spec.resources.gpuCount: 0 for a CPU-only environment", env.Spec.Image)
-		}
+	if marker := brandMarker(vendor); !strings.Contains(strings.ToLower(env.Spec.Image), marker) {
+		return fmt.Sprintf("image %q does not match gpu.vendor %s (expected a %s image); omit spec.resources.gpu for a CPU-only environment", env.Spec.Image, vendor, marker)
 	}
 	return ""
 }
@@ -1010,34 +1015,45 @@ func mainContainerPort(t aiv1alpha1.DevEnvironmentType) int32 {
 	}
 }
 
-// desiredGPUCount resolves the requested accelerator count. A nil count means
-// the field was never defaulted — a Go-constructed object — which the API
-// server would have set to 1.
-func desiredGPUCount(env *aiv1alpha1.DevEnvironment) int32 {
-	if env.Spec.Resources.GPUCount == nil {
-		return 1
+// desiredGPU resolves the requested accelerator: its vendor, its count, and
+// whether one is requested at all. An absent block is the only way to ask for no
+// accelerator — it is deliberately not defaulted into existence — so there is no
+// count-is-zero special case to remember. This is the single place that applies
+// the GPUSpec defaults a Go-constructed object never went through, matching what
+// the API server would have written: a nil count is 1, a count below the
+// minimum is 1, and an unset vendor is nvidia.
+//
+// The two resolutions are total on purpose: every caller gets one of exactly two
+// vendors and a count of at least one, so the readers of this block cannot
+// disagree about what was asked for. That is what the block buys over two flat
+// fields, where the vendor→resource mapping fell through to nvidia while the
+// vendor→brand mapping fell through to "no constraint at all".
+func desiredGPU(env *aiv1alpha1.DevEnvironment) (aiv1alpha1.AcceleratorVendor, int32, bool) {
+	gpu := env.Spec.Resources.GPU
+	if gpu == nil {
+		return "", 0, false
 	}
-	return *env.Spec.Resources.GPUCount
-}
-
-// gpuResource is the GPU extended resource by vendor (design §8.1).
-func gpuResource(t aiv1alpha1.GPUType) corev1.ResourceName {
-	if t == aiv1alpha1.GPUTypeMetaX {
-		return "metax-tech.com/gpu"
+	count := int32(1)
+	if gpu.Count != nil && *gpu.Count > 0 {
+		count = *gpu.Count
 	}
-	return "nvidia.com/gpu"
+	vendor := aiv1alpha1.AcceleratorVendorNvidia
+	if gpu.Vendor == aiv1alpha1.AcceleratorVendorMetax {
+		vendor = aiv1alpha1.AcceleratorVendorMetax
+	}
+	return vendor, count, true
 }
 
 // desiredResources maps the requested compute to container resources: the GPU
 // is both requested and limited; CPU/memory are limits only (design §3.2.2).
-// A GPUCount of 0 asks for no accelerator, so the vendor resource is left out
-// entirely rather than requested at zero — a zero request would still pin the
+// An environment that requests no accelerator leaves the vendor resource out
+// entirely rather than requesting zero — a zero request would still pin the
 // pod to a node advertising that resource.
 func desiredResources(env *aiv1alpha1.DevEnvironment) corev1.ResourceRequirements {
 	limits := corev1.ResourceList{}
 	requests := corev1.ResourceList{}
-	if count := desiredGPUCount(env); count > 0 {
-		gpuName := gpuResource(env.Spec.Resources.GPUType)
+	if vendor, count, ok := desiredGPU(env); ok {
+		gpuName := corev1.ResourceName(vendorResource(vendor))
 		gpu := resource.NewQuantity(int64(count), resource.DecimalSI)
 		limits[gpuName] = *gpu
 		requests[gpuName] = *gpu

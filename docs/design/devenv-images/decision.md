@@ -26,7 +26,7 @@ images are final** — they cannot be solved inside the images themselves.
 
 | # | Operator assumption | Code evidence | Requirement on the image | Status |
 |---|---|---|---|---|
-| 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** `base-cuda` / `base-maca`. Checked **only when a GPU is requested** — `gpuCount: 0` is exempt | Image registry path must include the `base-cuda` / `base-maca` segment **when it is a GPU image**; CPU images are named freely | ✅ consistent with the brand gate |
+| 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** `base-cuda` / `base-maca`. Checked **only when a GPU is requested** — an absent `spec.resources.gpu` block is exempt | Image registry path must include the `base-cuda` / `base-maca` segment **when it is a GPU image**; CPU images are named freely | ✅ consistent with the brand gate |
 | 2 | Type → port | `::mainContainerPort`: jupyter 8888 / vscode 8080 / ssh `sshContainerPort`; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP — **except ssh**, where the container listens on the unprivileged **2222** (see B) and the Service publishes that as 22 | ✅ implemented (#173): the probe targets the container port (2222 for ssh) and the Service publishes `port: 22 → targetPort: 2222` |
 | 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as the **uid/gid the spec resolves to** (`spec.runtime.securityContext`, platform default 1000/1000), non-root, incl. writing `$HOME` (stock images ship uid 1000) | ✅ (but see #6, #9) |
 | 4 | `$HOME` / working dir = the workspace mount | comment in `devenvironment_types.go`: PVC mounted at the derived workspace path; the image's home/workdir should land on it | Image `USER`/`HOME`/workdir must land on the workspace PVC mount. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — docker-stacks images keep `/home/jovyan` by naming `jovyan`; the self-authored images get `/home/ubuntu`. A non-root account must be able to **write** that mount, which no image can arrange for itself | ✅ Gap A closed: an init container repairs the claim's ownership — the root alone while it already matches, the whole tree when it does not — before the container starts |
@@ -36,7 +36,7 @@ images are final** — they cannot be solved inside the images themselves.
 | 8 | `base_url` = `/dev/<ns>/<env>/` | HTTPRoute forwards the prefix **unchanged** (no URLRewrite filter); the controller injects the prefix into the container as `NOTEBOOK_ARGS=--ServerApp.base_url=<prefix>` (`::withNotebookBaseURL`), replacing a `base_url` the environment declares while keeping that variable's other flags | Jupyter must serve under that prefix via `ServerApp.base_url`, which the injected flag supplies | ✅ Gap C closed: the controller injects the flag and drops a conflicting `base_url` the environment declares; a `NOTEBOOK_ARGS` fed by `valueFrom` cannot be rewritten, so it fails the environment instead of publishing a 404 |
 | 9 | Runtime-mode inference | Single-container pod; `type` and `image` are independent axes; the controller injects no `type`/mode env | The same image must decide by itself whether to run jupyter or sshd (e.g. inferred from whether `JUPYTER_TOKEN` is injected / ssh keys are mounted) | ✅ defined by the images: `CUBESTACK_IMAGE` is baked per image and an optional injected `CUBESTACK_TYPE` wins when present (see Gap D) |
 | 10 | Multi-service in one container | `sshExposed` adds a 22 Service and mounts keys for jupyter/vscode types, sharing the main container | jupyter type + `ssh.enabled` ⇒ the same process group must run jupyter *and* sshd. The entrypoint starts sshd in the background and hands off to the stock launcher. **The mounted host key is the ssh-enabled signal** — images ship no host key of their own, so `ssh` mode fails fast without it and jupyter simply stays ssh-less | ✅ handled by entrypoint script |
-| 11 | GPU extended resource | `::gpuResource`: nvidia `nvidia.com/gpu` / metax `metax-tech.com/gpu`, written to requests and limits at `resources.gpuCount`. With `gpuCount: 0` the key is **omitted entirely** — a zero request would still pin the pod to a node advertising that resource | The image is device-agnostic; `nvidia-smi`/`mx-smi` come from driver injection. A CPU image must not need either | ✅ see §3 |
+| 11 | GPU extended resource | `::vendorResource`: nvidia `nvidia.com/gpu` / metax `metax-tech.com/gpu`, written to requests and limits at `resources.gpu.count`. With no `gpu` block the key is **omitted entirely** — a zero request would still pin the pod to a node advertising that resource | The image is device-agnostic; `nvidia-smi`/`mx-smi` come from driver injection. A CPU image must not need either | ✅ see §3 |
 | 12 | SSH login user | `defaultRuntimeUser="user"` (:142) is the platform default → endpoint `ssh://user@<gw>`; `spec.runtime.user` overrides it, and the endpoint carries that account. The first-party images do not ship the default: the self-authored ones run `ubuntu`, the docker-stacks-derived `jupyter-minimal` runs `jovyan` | The image must contain the account `spec.runtime.user` names (default `user`, uid 1000); for jupyter that is the stock `jovyan` account | ✅ |
 
 ### Runtime metadata: named per environment, not declared by the image
@@ -332,11 +332,12 @@ key handling) is written once. They differ in the base and the layout they carry
 
 Key points:
 
-- **Reaching the CPU images.** A CPU image is selected by setting `spec.resources.gpuCount: 0`
-  alongside it. That is what exempts it from the brand gate (§2 #1) and keeps the vendor GPU resource
-  out of the pod spec (§2 #11); omitting `gpuCount` instead defaults it to 1 and the brand gate then
-  rejects any image whose name lacks `base-cuda`/`base-maca`. There is no default that yields a
-  CPU-only environment — it is always explicit.
+- **Reaching the CPU images.** A CPU image is selected by **omitting `spec.resources.gpu`**. That is
+  what exempts it from the brand gate (§2 #1) and keeps the vendor GPU resource out of the pod spec
+  (§2 #11). The block is the request: it names both the vendor and the count, so there is no way to
+  state a vendor without a device, and its absence is the only spelling of "no accelerator". Saying
+  nothing about GPUs therefore means no GPU — a manifest that used to rely on the old `gpuCount`
+  default of 1 has to name a `gpu` block to keep its accelerator.
 - **What is shared is the runtime config**: the entrypoint (`images/common/entrypoint.sh` — mode
   selection, the optional sshd, and the hand-off to the image CMD) *and* the sshd drop-in
   (`images/common/sshd/10-nonroot.conf`), which GPU and CPU images and the docker-stacks

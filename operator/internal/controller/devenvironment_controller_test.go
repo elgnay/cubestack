@@ -122,6 +122,17 @@ func sshKeyPairMatches(privPEM, pubOpenSSH []byte) bool {
 	return bytes.Contains(block.Bytes, blob[len(blob)-ed25519.PublicKeySize:])
 }
 
+// nvidiaGPU and metaxGPU build the requested-accelerator block the way a spec
+// would carry it, so the cases below read as the request rather than as struct
+// literals.
+func nvidiaGPU(count int32) *aiv1alpha1.GPUSpec {
+	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(count)}
+}
+
+func metaxGPU(count int32) *aiv1alpha1.GPUSpec {
+	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorMetax, Count: ptrTo(count)}
+}
+
 // validDevEnvironment mirrors the API package fixture (minus the SSH config,
 // which individual tests enable when they need it).
 func validDevEnvironment(name string) *aiv1alpha1.DevEnvironment {
@@ -132,10 +143,9 @@ func validDevEnvironment(name string) *aiv1alpha1.DevEnvironment {
 			Image:   testDevImage,
 			Running: true,
 			Resources: aiv1alpha1.ResourcesSpec{
-				GPUType:  aiv1alpha1.GPUTypeNVIDIA,
-				GPUCount: ptrTo(int32(1)),
-				CPU:      "16",
-				Memory:   "64Gi",
+				GPU:    &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(1))},
+				CPU:    "16",
+				Memory: "64Gi",
 			},
 			Storage: &aiv1alpha1.StorageSpec{
 				Size:         "200Gi",
@@ -866,9 +876,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 	})
 
 	Describe("desiredResources", func() {
-		It("requests and limits the nvidia gpu by gpuCount", func() {
+		It("requests and limits the nvidia gpu by count", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
-				GPUType: aiv1alpha1.GPUTypeNVIDIA, GPUCount: ptrTo(int32(2)),
+				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(2))},
 			}}}
 			got := desiredResources(env)
 			key := corev1.ResourceName(testGPUResource)
@@ -880,9 +890,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(lim.Value()).To(Equal(int64(2)))
 		})
 
-		It("maps a metax gpuType to the metax-tech.com/gpu resource", func() {
+		It("maps a metax vendor to the metax-tech.com/gpu resource", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
-				GPUType: aiv1alpha1.GPUTypeMetaX, GPUCount: ptrTo(int32(1)),
+				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorMetax, Count: ptrTo(int32(1))},
 			}}}
 			got := desiredResources(env)
 			key := corev1.ResourceName("metax-tech.com/gpu")
@@ -893,7 +903,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 
 		It("maps optional cpu and memory to limits only", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
-				GPUType: aiv1alpha1.GPUTypeNVIDIA, GPUCount: ptrTo(int32(1)), CPU: "16", Memory: "32Gi",
+				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(1))}, CPU: "16", Memory: "32Gi",
 			}}}
 			got := desiredResources(env)
 			Expect(got.Limits.Cpu().Cmp(resource.MustParse("16"))).To(Equal(0))
@@ -902,9 +912,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceMemory))
 		})
 
-		It("omits the gpu entirely when gpuCount is 0", func() {
+		It("omits the gpu entirely when no block is present", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
-				GPUType: aiv1alpha1.GPUTypeMetaX, GPUCount: ptrTo(int32(0)), CPU: "4", Memory: "8Gi",
+				CPU: "4", Memory: "8Gi",
 			}}}
 			got := desiredResources(env)
 			// Neither vendor: a zero request would still pin the pod to a node
@@ -917,9 +927,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(got.Limits.Memory().Cmp(resource.MustParse("8Gi"))).To(Equal(0))
 		})
 
-		It("treats an unset gpuCount as the schema default of 1", func() {
+		It("treats an unset count as the schema default of 1", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
-				GPUType: aiv1alpha1.GPUTypeNVIDIA,
+				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia},
 			}}}
 			got := desiredResources(env)
 			key := corev1.ResourceName(testGPUResource)
@@ -929,14 +939,47 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(req.Value()).To(Equal(int64(1)))
 			Expect(lim.Value()).To(Equal(int64(1)))
 		})
+
+		// A Go-constructed block that never went through the API server can carry
+		// halves the CRD would have filled. Every reader has to resolve them the
+		// same way, or the vendor resource and the brand gate disagree about what
+		// was asked for — which is the bug the block replaced two flat fields to
+		// make unrepresentable.
+		It("resolves an unset vendor to nvidia rather than to no vendor at all", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPU: &aiv1alpha1.GPUSpec{Count: ptrTo(int32(1))},
+			}}}
+			got := desiredResources(env)
+			Expect(got.Requests).To(HaveKey(corev1.ResourceName(testGPUResource)))
+		})
+
+		// Minimum=1 means the API can never produce a count of zero; only a
+		// hand-built spec can. Clamping it to the schema default is what keeps the
+		// resource request and the brand gate in agreement — reading it as "no
+		// accelerator" would put a second route to CPU-only back into the model.
+		It("clamps a count below the minimum to 1 rather than reading it as no gpu", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(0))},
+			}}}
+			vendor, count, ok := desiredGPU(env)
+			Expect(ok).To(BeTrue())
+			Expect(vendor).To(Equal(aiv1alpha1.AcceleratorVendorNvidia))
+			Expect(count).To(Equal(int32(1)))
+
+			got := desiredResources(env)
+			key := corev1.ResourceName(testGPUResource)
+			Expect(got.Requests).To(HaveKey(key))
+			req := got.Requests[key]
+			Expect(req.Value()).To(Equal(int64(1)))
+		})
 	})
 
 	Describe("brandMismatchReason", func() {
 		DescribeTable("gates the image brand against the requested accelerator",
-			func(image string, gpuType aiv1alpha1.GPUType, gpuCount *int32, wantMatch bool) {
+			func(image string, gpu *aiv1alpha1.GPUSpec, wantMatch bool) {
 				env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
 					Image:     image,
-					Resources: aiv1alpha1.ResourcesSpec{GPUType: gpuType, GPUCount: gpuCount},
+					Resources: aiv1alpha1.ResourcesSpec{GPU: gpu},
 				}}
 				reason := brandMismatchReason(env)
 				if wantMatch {
@@ -945,20 +988,27 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Expect(reason).NotTo(BeEmpty())
 				}
 			},
-			Entry("nvidia with a base-cuda image matches", testDevImage, aiv1alpha1.GPUTypeNVIDIA, ptrTo(int32(1)), true),
-			Entry("nvidia with a base-maca image mismatches", testMismatchImage, aiv1alpha1.GPUTypeNVIDIA, ptrTo(int32(1)), false),
-			Entry("metax with a base-cuda image mismatches", testDevImage, aiv1alpha1.GPUTypeMetaX, ptrTo(int32(1)), false),
-			// No accelerator ⇒ nothing to match, whatever the image or gpuType.
-			Entry("gpuCount 0 exempts a non-brand image", testCPUImage, aiv1alpha1.GPUTypeNVIDIA, ptrTo(int32(0)), true),
-			Entry("gpuCount 0 exempts a mismatched image", testMismatchImage, aiv1alpha1.GPUTypeNVIDIA, ptrTo(int32(0)), true),
+			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(1), true),
+			Entry("nvidia with a base-maca image mismatches", testMismatchImage, nvidiaGPU(1), false),
+			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(1), false),
+			// No accelerator ⇒ nothing to match, whatever the image. The block's
+			// absence is the only spelling of this, so there is no count to zero out
+			// and no vendor left over to contradict it.
+			Entry("an absent block exempts a non-brand image", testCPUImage, nil, true),
+			Entry("an absent block exempts a mismatched image", testMismatchImage, nil, true),
+			// The vendor is resolved before the comparison, so a value the API can
+			// never store still lands on a brand rather than falling out of the
+			// switch and disabling the gate — the old two-field shape's failure mode.
+			Entry("an unrecognised vendor is still gated",
+				testMismatchImage, &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendor("amd"), Count: ptrTo(int32(1))}, false),
 		)
 
 		It("names the CPU-only escape in the mismatch message", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
 				Image:     testMismatchImage,
-				Resources: aiv1alpha1.ResourcesSpec{GPUType: aiv1alpha1.GPUTypeNVIDIA, GPUCount: ptrTo(int32(1))},
+				Resources: aiv1alpha1.ResourcesSpec{GPU: nvidiaGPU(1)},
 			}}
-			Expect(brandMismatchReason(env)).To(ContainSubstring("gpuCount: 0"))
+			Expect(brandMismatchReason(env)).To(ContainSubstring("omit spec.resources.gpu"))
 		})
 	})
 
@@ -1937,7 +1987,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("fails a gpuType/image brand mismatch without provisioning", func() {
+		It("fails a gpu vendor/image brand mismatch without provisioning", func() {
 			env := validDevEnvironment("de-brand-bad")
 			env.Spec.Image = "harbor.local/ai-images/base-maca:1.0"
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
@@ -2034,9 +2084,9 @@ var _ = Describe("DevEnvironment controller", func() {
 
 		It("provisions a CPU-only environment from a non-brand image", func() {
 			env := validDevEnvironment("de-cpu-only")
-			// A CPU image the brand gate would reject if a GPU were requested,
-			// and a gpuType that does not match it either.
-			env.Spec.Resources.GPUCount = ptrTo(int32(0))
+			// A CPU image the brand gate would reject if a GPU were requested, and
+			// no gpu block — which is the whole request.
+			env.Spec.Resources.GPU = nil
 			env.Spec.Image = testCPUImage
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
@@ -2310,7 +2360,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("records a Warning Failed event on a gpuType/image brand mismatch", func() {
+		It("records a Warning Failed event on a gpu vendor/image brand mismatch", func() {
 			env := validDevEnvironment("de-ev-fail")
 			env.Spec.Image = testMismatchImage
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
