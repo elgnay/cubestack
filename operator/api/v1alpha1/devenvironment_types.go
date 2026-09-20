@@ -211,17 +211,17 @@ type SSHSpec struct {
 	// +optional
 	Enabled bool `json:"enabled,omitempty"`
 
-	// KeysSecret is the SSH public key Secret reference. If specified, the
-	// controller generates the environment's host identity alone and mounts this
-	// Secret's data[key] as the container's authorized_keys, so the Secret must
-	// carry the label ai.cubestack.io/ssh-keys-delegated: "true"
+	// AuthorizedKeysSecret is the SSH public key Secret reference. If specified,
+	// the controller generates the environment's host identity alone and mounts
+	// this Secret's data[key] as the container's authorized_keys, so the Secret
+	// must carry the label ai.cubestack.io/ssh-keys-delegated: "true"
 	// — only a Secret that names itself for this use is mounted into a workload.
-	// Otherwise the controller generates the host identity and a login keypair,
-	// and status.sshKeysSecret names the Secret holding the latter. The plaintext
-	// is never stored in spec.
+	// Otherwise the controller generates the host identity and a client keypair,
+	// and status.sshClientKeySecret names the Secret holding the latter. The
+	// plaintext is never stored in spec.
 	// +kubebuilder:validation:XValidation:rule="self.key != ''",message="key must name the Secret data entry the container mounts"
 	// +optional
-	KeysSecret *corev1.SecretKeySelector `json:"keysSecret,omitempty"`
+	AuthorizedKeysSecret *corev1.SecretKeySelector `json:"authorizedKeysSecret,omitempty"`
 }
 
 // NetworkSpec configures the network.
@@ -401,27 +401,26 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Phase *Phase `json:"phase,omitempty"`
 
-	// SSHKeysSecret is the Secret the environment's SSH authorized_keys come
-	// from: the user-provided one from spec.ssh.keysSecret, or a
-	// controller-generated one. It is recorded in status so the user can retrieve
-	// generated keys. Which data entry holds what depends on the case: with a
-	// keysSecret of its own, the authorized_keys content is the entry that
-	// selector names, and the Secret is mounted as it is. The generated Secret
-	// instead holds a login keypair: id_ed25519, the private half to log in with,
-	// and id_ed25519.pub, which is what the container mounts as authorized_keys.
-	// The environment's host key is not here: it lives in the separate
-	// <env>-ssh-host-key Secret.
+	// SSHClientKeySecret is the client keypair the controller minted, recorded so
+	// the environment's owner can retrieve the private half and log in. It holds
+	// id_ed25519, the private half, and id_ed25519.pub, which is what the container
+	// mounts as authorized_keys.
+	//
+	// Absent when spec.ssh.authorizedKeysSecret names the user's own Secret. That
+	// Secret holds public keys rather than a client key, and its name is already in
+	// the spec, so there is nothing generated to point at. The environment's host
+	// key is not here either: it lives in the separate <env>-ssh-host-key Secret.
 	// +optional
-	SSHKeysSecret *corev1.SecretReference `json:"sshKeysSecret,omitempty"`
+	SSHClientKeySecret *corev1.SecretReference `json:"sshClientKeySecret,omitempty"`
 
-	// JupyterAuthSecret is the Secret the environment's Jupyter token comes from,
-	// for a jupyter environment: the managed <env>-auth Secret the controller
+	// JupyterTokenSecret is the Secret the environment's Jupyter token comes from,
+	// for a jupyter environment: the managed <env>-jupyter-token Secret the controller
 	// generates, holding the token under the data key "token". It is recorded in
 	// status so the user can retrieve the token, which the web route requires.
 	// Absent for every other environment type, which serves no authenticated web
 	// path.
 	// +optional
-	JupyterAuthSecret *corev1.SecretReference `json:"jupyterAuthSecret,omitempty"`
+	JupyterTokenSecret *corev1.SecretReference `json:"jupyterTokenSecret,omitempty"`
 
 	// LastActivityTime is the last activity time, used for idle timeout
 	// determination.
