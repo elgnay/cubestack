@@ -225,14 +225,56 @@ type SSHSpec struct {
 }
 
 // NetworkSpec configures the network.
+//
+// RDMA is served by a shared device plugin, not by Multus: the container
+// receives the device's verbs file (/dev/infiniband/uverbsN) plus the cgroup
+// permission to open it, and no interface of its own — a RoCE environment
+// shares the node's instead, which is what RDMAType selects between.
 type NetworkSpec struct {
-	// RDMAEnabled enables the RDMA network (Multus).
+	// RDMAEnabled gives the environment access to an RDMA device advertised by
+	// the cluster's shared device plugin. The resource name is an operator
+	// setting rather than a spec field, since it is fixed by the cluster's
+	// device-plugin configuration. The controller adds IPC_LOCK: registering a
+	// memory region locks pages, which the default capability set does not
+	// permit.
+	//
+	// What the device additionally needs depends on the fabric. InfiniBand
+	// devices carry their own addressing — a port GUID and a subnet-manager LID
+	// — both independent of the network namespace, so the device alone
+	// suffices. RoCEv2 instead derives its addresses from the IPs of the
+	// interfaces inside that namespace; in a pod's own namespace there are none
+	// to derive from, the device's GID table is empty, and no queue pair can be
+	// brought up. A RoCE environment therefore also runs on the host network —
+	// see RDMAType.
+	//
+	// Two consequences follow, and both apply before the environment starts. A
+	// namespace hosting an RDMA environment must enforce the privileged Pod
+	// Security Standard: RoCE is refused by Baseline outright for hostNetwork,
+	// and IPC_LOCK is not among the capabilities Baseline allows, so InfiniBand
+	// needs privileged as well. And a RoCE environment's NetworkPolicy stops
+	// applying, because a CNI filters the pod's own network namespace and a
+	// host-network pod has none — the default-deny floor and the DNS-only egress
+	// rule are then unenforced.
 	// +kubebuilder:default=false
 	// +optional
 	RDMAEnabled bool `json:"rdmaEnabled,omitempty"`
 
-	// RDMAType is the RDMA network type: infiniband (requires IB switches) /
-	// roce (RoCEv2, reuses lossless ethernet); effective when rdmaEnabled=true.
+	// RDMAType selects the fabric, and with it how the device is reached;
+	// effective when rdmaEnabled=true.
+	//
+	// infiniband uses the device plugin alone.
+	//
+	// roce additionally runs the environment on the host network
+	// (hostNetwork=true, with dnsPolicy=ClusterFirstWithHostNet), which is the
+	// only way a RoCE device acquires the interface addresses its GID table is
+	// built from. The environment then binds its ports on the node itself rather
+	// than in a pod namespace: the ports it declares are declared as host ports
+	// — the main port above all, which is one of a few fixed numbers per type,
+	// so the scheduler keeps a second environment wanting it off that node — and
+	// whatever the environment listens on becomes reachable on every node
+	// interface, outside the Gateway's path prefix. dnsPolicy is set together
+	// with hostNetwork because ClusterFirst degrades to the node's own resolver
+	// there, which stops cluster service names resolving.
 	// +kubebuilder:validation:Enum=infiniband;roce
 	// +kubebuilder:default=roce
 	// +optional

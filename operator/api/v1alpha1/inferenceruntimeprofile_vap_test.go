@@ -418,7 +418,7 @@ var _ = Describe("InferenceRuntimeProfile L1 admission", func() {
 			defer cleanupIRPVAP()
 
 			irp := validIRPWithMatchingName()
-			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testHCAResourceName: 0}
+			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testRDMAResourceName: 0}
 			err := k8sClient.Create(ctx, irp)
 			Expect(err).To(HaveOccurred())
 			Expect(apierrors.IsInvalid(err)).To(BeTrue(), "expected Invalid error, got: %v", err)
@@ -430,7 +430,7 @@ var _ = Describe("InferenceRuntimeProfile L1 admission", func() {
 			defer cleanupIRPVAP()
 
 			irp := validIRPWithMatchingName()
-			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testHCAResourceName: 2}
+			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testRDMAResourceName: 2}
 			Expect(k8sClient.Create(ctx, irp)).To(Succeed())
 			Expect(k8sClient.Delete(ctx, irp)).To(Succeed())
 		})

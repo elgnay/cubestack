@@ -84,7 +84,7 @@ spec:
     message: "extendedResources values must be at least 1"
     reason: Invalid
   - expression: "object.spec.roles.all(r, !has(r.podTemplate.resources) || !has(r.podTemplate.resources.extendedResources) || r.podTemplate.resources.extendedResources.all(k, k.matches('^[a-z0-9]([-a-z0-9]*[a-z0-9])?([.][a-z0-9]([-a-z0-9]*[a-z0-9])?)*[/]([A-Za-z0-9][-A-Za-z0-9_.]{0,61})?[A-Za-z0-9]$') && !k.startsWith('requests.')))"
-    message: "extendedResources keys must be domain-qualified extended resource names, e.g. rdma/hca_shared_devices"
+    message: "extendedResources keys must be domain-qualified extended resource names, e.g. rdma/ib_shared_devices"
     reason: Invalid
   - expression: "object.spec.roles.all(r, !has(r.podTemplate.volumes) || r.podTemplate.volumes.all(a, r.podTemplate.volumes.exists_one(b, b.at == a.at)))"
     message: "podTemplate.volumes must not declare duplicate at mount paths within a role"

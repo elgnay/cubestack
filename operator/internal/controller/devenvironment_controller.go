@@ -103,6 +103,19 @@ type DevEnvironmentControllerConfig struct {
 	// port becomes a listener the environment's own ListenerSet declares on the
 	// shared Gateway, so nothing has to pre-create listeners in this range.
 	L4PortRangeEnd int32
+	// RDMAIBResource is the extended resource an InfiniBand environment requests
+	// from the cluster's shared device plugin. It is a cluster property, not a
+	// platform one: the device plugin declares the name in its own
+	// configuration, so a deployment whose plugin uses another name sets this
+	// rather than waiting for a platform release. Empty falls back to
+	// defaultRDMAIBResource.
+	RDMAIBResource string
+	// RDMARoCEResource is the equivalent for a RoCE environment. The two are
+	// separate flags because the conventional device-plugin configuration
+	// publishes the two fabrics as distinct resources, selected by interface
+	// name; a cluster that advertises a single combined resource points both
+	// flags at it. Empty falls back to defaultRDMARoCEResource.
+	RDMARoCEResource string
 }
 
 // Reason constants for DevEnvironment conditions and status.phase. Several
@@ -137,6 +150,29 @@ const (
 	// defaultGatewayName is the shared Envoy Gateway the routes attach to when
 	// no name is configured.
 	defaultGatewayName = "cubestack-gateway"
+
+	// Default RDMA extended resource names. These are the defaults for the
+	// operator's flags, not constants of the platform: the names are declared by
+	// the cluster's own device-plugin configuration, which the platform does not
+	// own, so a cluster that names them differently points the flags at its own.
+	//
+	// Two choices here are deliberate and easy to mistake for accidents.
+	//
+	// The rdma/ prefix is the device plugin's own default (resourcePrefix, whose
+	// default is literally "rdma"), so leaving it alone means the plugin's
+	// ConfigMap needs no resourcePrefix key to advertise these names.
+	//
+	// The rest of the name is this platform's, because nothing upstream names an
+	// RDMA resource after its fabric. The plugin's own several-pools example
+	// distinguishes them by instance instead ("hca_shared_devices_a" and "_b"),
+	// and neither NVIDIA's network operator ("rdma_shared_device_a") nor
+	// Spiderpool ("hca_shared_devices") encodes a fabric either; no "roce"
+	// resource name ships anywhere. This platform does encode it, because the
+	// fabric — not the pool — is what the user selects, and what decides whether
+	// the environment runs on the host network (::rdmaResource). The pair is
+	// symmetric for the same reason: the two names are read side by side.
+	defaultRDMAIBResource   = "rdma/ib_shared_devices"
+	defaultRDMARoCEResource = "rdma/roce_shared_devices"
 
 	// stsSpecHashAnnotationKey tracks the desired pod template so the
 	// StatefulSet is updated only when the template or replicas change.
@@ -1040,12 +1076,91 @@ func desiredGPU(env *aiv1alpha1.DevEnvironment) (aiv1alpha1.AcceleratorVendor, i
 	return vendor, count, true
 }
 
+// desiredContainerPorts declares the ports the environment's container listens
+// on, in the order desiredService publishes them: the type's main port, ssh
+// when it is exposed and is not already the main port, then each spec.ports
+// entry.
+//
+// The list exists for the host network, and only a host-network environment
+// declares it. Such an environment binds these ports on the node rather than in
+// a namespace of its own, and the scheduler counts a host-network pod's
+// declared container ports as host ports. Declaring them is therefore what
+// keeps a second environment wanting the same fixed port off the node —
+// mainContainerPort is 8888, 8080 or 2222 by type — and turns a runtime bind
+// failure into a pod that stays Pending/NotScheduled. hostPort is set to match,
+// as podspec.go does for InferenceService, though kubelet does not forward it
+// for a host-network pod: the declaration is what the scheduler reads. On the
+// pod network the list would say nothing the Service does not already say, so
+// it is left off rather than added for everyone.
+//
+// The seen set is keyed by port and protocol because the list need not be
+// distinct. The ssh type's main port *is* sshContainerPort, which is why the
+// ssh entry is guarded by type rather than added outright, and spec.ports is
+// free to repeat a port the platform already declared or one it declares twice
+// — the schema bounds a port's range but reserves none of the platform's own
+// numbers.
+func desiredContainerPorts(env *aiv1alpha1.DevEnvironment) []corev1.ContainerPort {
+	var ports []corev1.ContainerPort
+	seen := map[string]bool{}
+	add := func(name string, port int32, protocol corev1.Protocol) {
+		key := fmt.Sprintf("%d/%s", port, protocol)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		ports = append(ports, corev1.ContainerPort{
+			Name: name, ContainerPort: port, Protocol: protocol, HostPort: port,
+		})
+	}
+	add(mainPortName, mainContainerPort(env.Spec.Type), corev1.ProtocolTCP)
+	if sshExposed(env) && env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
+		add(sshPortName, sshContainerPort, corev1.ProtocolTCP)
+	}
+	for _, p := range env.Spec.Ports {
+		add(p.Name, p.ContainerPort, portProtocol(p))
+	}
+	return ports
+}
+
+// rdmaResource resolves the environment's RDMA request: the extended resource
+// to claim, and whether the environment must share the host network namespace
+// to reach it. Both are empty when spec.network asks for no RDMA.
+//
+// The enabled flag alone decides. rdmaType carries an API default of "roce", so
+// it reads "roce" on every environment in the cluster, including the ones that
+// never asked for RDMA — branching on the type without the flag would put every
+// environment on the host network. spec.network is a pointer with no default of
+// its own either, so a spec that omits the block leaves it nil.
+//
+// RoCE needs the host namespace for the fabric itself, not for routing: RoCEv2
+// derives its GIDs from the IPs of the interfaces inside the network namespace,
+// so a pod with a namespace of its own has an empty GID table and can bring up
+// no queue pair at all. InfiniBand addresses from the port GUID and the subnet
+// manager's LID instead, neither of which depends on the namespace.
+func (r *DevEnvironmentReconciler) rdmaResource(env *aiv1alpha1.DevEnvironment) (corev1.ResourceName, bool) {
+	if env.Spec.Network == nil || !env.Spec.Network.RDMAEnabled {
+		return "", false
+	}
+	cfg := r.defaultedConfig()
+	if env.Spec.Network.RDMAType == aiv1alpha1.RDMATypeInfiniBand {
+		return corev1.ResourceName(cfg.RDMAIBResource), false
+	}
+	return corev1.ResourceName(cfg.RDMARoCEResource), true
+}
+
 // desiredResources maps the requested compute to container resources: the GPU
 // is both requested and limited; CPU/memory are limits only (design §3.2.2).
 // An environment that requests no accelerator leaves the vendor resource out
 // entirely rather than requesting zero — a zero request would still pin the
 // pod to a node advertising that resource.
-func desiredResources(env *aiv1alpha1.DevEnvironment) corev1.ResourceRequirements {
+//
+// rdma names the fabric's extended resource, or is empty when the environment
+// asked for none. It takes the GPU's shape for the same reason, and one more
+// the GPU does not have: extended resources cannot be overcommitted, so the
+// API server rejects a request with no matching limit. One device is requested,
+// which is one verbs device — the plugin's rdmaHcaMax caps how many pods may
+// share the HCA set, it is not a per-pod device count.
+func desiredResources(env *aiv1alpha1.DevEnvironment, rdma corev1.ResourceName) corev1.ResourceRequirements {
 	limits := corev1.ResourceList{}
 	requests := corev1.ResourceList{}
 	if vendor, count, ok := desiredGPU(env); ok {
@@ -1054,6 +1169,11 @@ func desiredResources(env *aiv1alpha1.DevEnvironment) corev1.ResourceRequirement
 		limits[gpuName] = *gpu
 		requests[gpuName] = *gpu
 	}
+	if rdma != "" {
+		device := resource.NewQuantity(1, resource.DecimalSI)
+		limits[rdma] = *device
+		requests[rdma] = *device
+	}
 	if env.Spec.Resources.CPU != "" {
 		limits[corev1.ResourceCPU] = resource.MustParse(env.Spec.Resources.CPU)
 	}
@@ -1061,6 +1181,24 @@ func desiredResources(env *aiv1alpha1.DevEnvironment) corev1.ResourceRequirement
 		limits[corev1.ResourceMemory] = resource.MustParse(env.Spec.Resources.Memory)
 	}
 	return corev1.ResourceRequirements{Limits: limits, Requests: requests}
+}
+
+// withRDMACapabilities adds IPC_LOCK to the RDMA-enabled container's security
+// context. Registering an RDMA memory region (ibv_reg_mr) pins pages in memory,
+// which the default capability set does not permit, so the call fails on a
+// container that cannot lock them.
+//
+// It adds and never drops: dropping ALL would strip the runtime's own default
+// set, which the images' entrypoints rely on for setuid and chown — a change
+// with reach well beyond RDMA. The capability does not grant the container
+// access to the device; the device plugin does that through the device cgroup,
+// and a node file crafted by hand opens EPERM regardless.
+func withRDMACapabilities(sc *corev1.SecurityContext) *corev1.SecurityContext {
+	if sc.Capabilities == nil {
+		sc.Capabilities = &corev1.Capabilities{}
+	}
+	sc.Capabilities.Add = append(sc.Capabilities.Add, "IPC_LOCK")
+	return sc
 }
 
 // desiredSecurityContext enforces the non-root default: runAsUser=1000 unless
@@ -1115,6 +1253,9 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 // Standard rejects exactly this — root and any capability beyond
 // NET_BIND_SERVICE — so a namespace hosting DevEnvironments has to be at
 // Baseline, where these three are among the capabilities that remain allowed.
+// An RDMA environment raises that floor to Privileged: IPC_LOCK is outside
+// Baseline's allowed set, and a RoCE one adds hostNetwork, which both Baseline
+// and Restricted forbid outright (spec.network.rdmaEnabled).
 // What the container actually runs is ::permissionInitScript.
 func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Container {
 	// Both pointers are always set by desiredSecurityContext, which defaults them
@@ -1370,11 +1511,16 @@ func desiredWhenDeleted(env *aiv1alpha1.DevEnvironment) appsv1.PersistentVolumeC
 // storage writable (::desiredPermissionInitContainer).
 func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment) corev1.PodSpec {
 	mainPort := mainContainerPort(env.Spec.Type)
+	rdma, hostNetwork := r.rdmaResource(env)
+	securityContext := desiredSecurityContext(env.Spec.Runtime)
+	if rdma != "" {
+		securityContext = withRDMACapabilities(securityContext)
+	}
 	container := corev1.Container{
 		Name:            string(env.Spec.Type),
 		Image:           env.Spec.Image,
-		Resources:       desiredResources(env),
-		SecurityContext: desiredSecurityContext(env.Spec.Runtime),
+		Resources:       desiredResources(env, rdma),
+		SecurityContext: securityContext,
 		ReadinessProbe: &corev1.Probe{
 			ProbeHandler: corev1.ProbeHandler{TCPSocket: &corev1.TCPSocketAction{Port: intstr.FromInt32(mainPort)}},
 		},
@@ -1443,8 +1589,25 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		)
 	}
 
+	if hostNetwork {
+		// A host-network environment binds whatever it listens on on the node
+		// itself, where the scheduler counts the container's declared ports as
+		// host ports (::desiredContainerPorts).
+		container.Ports = desiredContainerPorts(env)
+	}
+
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{container},
+	}
+	if hostNetwork {
+		// RoCE GIDs are derived from the interfaces inside the network
+		// namespace, so the environment runs in the node's rather than one of
+		// its own (see rdmaResource). dnsPolicy moves with it: ClusterFirst
+		// silently falls back to the node's own resolver for a host-network pod,
+		// which stops cluster service names and search domains resolving, so the
+		// environment would lose the Services it can otherwise reach.
+		podSpec.HostNetwork = true
+		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
 	if env.Spec.Storage != nil {
 		// The workspace claim is the platform's storage for this environment; a
@@ -1567,6 +1730,15 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 	// naming any one of them would silently break the rest. The peer is already
 	// narrowed to a single Gateway's proxy pods, and a policy can admit no more
 	// ports than the container binds.
+	//
+	// None of this is enforced for an environment on the host network — a RoCE
+	// one (spec.network.rdmaType) — because a CNI filters the pod's own network
+	// namespace and a host-network pod has none. The policy is created anyway: it
+	// is what an InfiniBand environment needs, it is harmless for a RoCE one, and
+	// it takes effect again the moment the environment is reconciled without
+	// RDMA. Filtering a host-network pod at all is a CNI host-firewall feature
+	// (Cilium's enable-host-firewall, say), which this platform does not
+	// configure; the spec field documents the gap.
 	ingress := []networkingv1.NetworkPolicyIngressRule{}
 	if ns := cfg.GatewayDataplaneNamespace; ns != "" {
 		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{
@@ -1659,7 +1831,7 @@ func (r *DevEnvironmentReconciler) applyNetworkPolicy(ctx context.Context, env *
 // desired template or the replicas change.
 func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
 	sts := r.desiredStatefulSet(env)
-	sts.Annotations = map[string]string{stsSpecHashAnnotationKey: stsSpecHash(env)}
+	sts.Annotations = map[string]string{stsSpecHashAnnotationKey: r.stsSpecHash(env)}
 	if err := ctrl.SetControllerReference(env, sts, r.Scheme); err != nil {
 		return err
 	}
@@ -1702,7 +1874,26 @@ func (r *DevEnvironmentReconciler) applyStatefulSet(ctx context.Context, env *ai
 // template carries (see podTemplateAnnotations), so creating or refilling a
 // managed Secret changes the hash and applyStatefulSet issues an update that
 // rolls the workload.
-func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
+//
+// It is a method because the template depends on the controller's configuration
+// as well as on the spec: the RDMA resource name is an operator flag, so a
+// changed flag has to reach already-created workloads exactly as a changed spec
+// does. Left out, the resource name would be the one input the hash cannot see,
+// and an environment would keep claiming the name it was created with after the
+// flag moved.
+func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
+	// rdmaTemplate is the RDMA contribution, and is nil unless the environment
+	// asks for RDMA. It is a pointer, and its own fields carry omitempty, so the
+	// key is absent from the JSON entirely for everyone else: an environment
+	// that never enabled RDMA — and the defaulted shape the API server writes
+	// for one, rdmaEnabled=false with rdmaType=roce — digests exactly as it did
+	// before this field existed. Hashing spec.network itself would instead
+	// change the digest for every environment in the cluster and roll every
+	// workload once on upgrade, for a feature most of them do not use.
+	type rdmaTemplate struct {
+		HostNetwork bool   `json:"hostNetwork,omitempty"`
+		Resource    string `json:"resource,omitempty"`
+	}
 	type templateInput struct {
 		Type       aiv1alpha1.DevEnvironmentType
 		Image      string
@@ -1733,6 +1924,16 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		// means. The host key's source needs no equivalent: its Secret name is
 		// derived from env.Name, so it cannot vary without a new object.
 		SSHMount string
+		// RDMA is the *resolved* RDMA request (::rdmaResource) — the resource the
+		// container claims and whether the pod runs on the host network — rather
+		// than spec.network as declared. Both follow from the spec and from the
+		// resource-name flags together, so hashing them resolved is what lets the
+		// flags above reach an existing workload.
+		RDMA *rdmaTemplate `json:"rdma,omitempty"`
+	}
+	var rdma *rdmaTemplate
+	if name, hostNetwork := r.rdmaResource(env); name != "" {
+		rdma = &rdmaTemplate{HostNetwork: hostNetwork, Resource: string(name)}
 	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
@@ -1746,6 +1947,7 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
 		SSHKeysRevision:      env.Annotations[sshKeysRevisionAnnotationKey],
 		SSHMount:             sshMountKey(env),
+		RDMA:                 rdma,
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }
@@ -3378,6 +3580,12 @@ func (r *DevEnvironmentReconciler) defaultedConfig() DevEnvironmentControllerCon
 	}
 	if cfg.L4PortRangeEnd == 0 {
 		cfg.L4PortRangeEnd = 20999
+	}
+	if cfg.RDMAIBResource == "" {
+		cfg.RDMAIBResource = defaultRDMAIBResource
+	}
+	if cfg.RDMARoCEResource == "" {
+		cfg.RDMARoCEResource = defaultRDMARoCEResource
 	}
 	return cfg
 }

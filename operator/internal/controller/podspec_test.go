@@ -191,13 +191,13 @@ var _ = Describe("buildPodSpec", func() {
 			Image: testEngineImage,
 			Resources: &aiv1alpha1.PodResources{
 				GPUPerPod:         ptrTo[int64](2),
-				ExtendedResources: map[string]int64{"rdma/hca_shared_devices": 2},
+				ExtendedResources: map[string]int64{"rdma/ib_shared_devices": 2},
 			},
 		}
 		spec := buildPodSpec(pt, "svc", modelHostPath(), aiv1alpha1.AcceleratorVendorMetax)
 		c := spec.Containers[0]
-		Expect(c.Resources.Requests.Name("rdma/hca_shared_devices", resource.DecimalSI).String()).To(Equal("2"))
-		Expect(c.Resources.Limits.Name("rdma/hca_shared_devices", resource.DecimalSI).String()).To(Equal("2"))
+		Expect(c.Resources.Requests.Name("rdma/ib_shared_devices", resource.DecimalSI).String()).To(Equal("2"))
+		Expect(c.Resources.Limits.Name("rdma/ib_shared_devices", resource.DecimalSI).String()).To(Equal("2"))
 		Expect(c.Resources.Limits.Name("metax-tech.com/gpu", resource.DecimalSI).String()).To(Equal("2"))
 	})
 

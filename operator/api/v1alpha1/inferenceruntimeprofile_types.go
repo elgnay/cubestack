@@ -342,9 +342,11 @@ type PodResources struct {
 	GPUPerPod *int64 `json:"gpuPerPod,omitempty"`
 
 	// ExtendedResources lists additional extended resources, e.g.
-	// rdma/hca_shared_devices, written to both requests and limits like
-	// gpuPerPod. Keys must not collide with cpu, memory or the GPU extended
-	// resource of either supported vendor (handled by the fields above; L1 VAP).
+	// rdma/ib_shared_devices (the InfiniBand fabric; rdma/roce_shared_devices is
+	// the RoCE one, and the controller sets it itself for a DevEnvironment),
+	// written to both requests and limits like gpuPerPod. Keys must not collide
+	// with cpu, memory or the GPU extended resource of either supported vendor
+	// (handled by the fields above; L1 VAP).
 	// +optional
 	ExtendedResources map[string]int64 `json:"extendedResources,omitempty"`
 }

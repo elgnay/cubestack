@@ -319,6 +319,67 @@ helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-sy
 The kustomize deployment (`make deploy`) carries the same two args in
 `operator/config/manager/manager.yaml`.
 
+### RDMA (DevEnvironment accelerator fabric)
+
+A DevEnvironment asks for RDMA with `spec.network`. The manager learns which
+extended resources to request from two flags, fed by the `rdma.*` values —
+these always render:
+
+| Key | Manager flag | Default |
+|---|---|---|
+| `rdma.ibResource` | `--rdma-ib-resource` | `rdma/ib_shared_devices` |
+| `rdma.roceResource` | `--rdma-roce-resource` | `rdma/roce_shared_devices` |
+
+The `rdma/` prefix is the device plugin's own default — its `resourcePrefix`,
+which is literally `rdma` when unset — so a ConfigMap that leaves it alone needs
+no change. The rest of each name is this platform's: no convention exists for
+naming an RDMA resource after its fabric, and the plugin's own several-pools
+example distinguishes them by instance instead (`hca_shared_devices_a` and
+`_b`). The pair here is deliberately symmetric, because the fabric is what the
+user selects (via `spec.network.rdmaType`) and what decides whether the
+environment runs on the host network.
+
+The names still have to match what the cluster advertises: the plugin learns
+them from its own ConfigMap, which is a prerequisite and not part of this chart.
+A shared-device plugin instance carries one `resourceName` and one `ifNames`
+selector, so a cluster serving both fabrics runs two instances, and the plugin
+has to be configured with an `rdmaHcaMax` large enough to hand the same HCA to
+every RDMA environment at once: each environment requests one device.
+
+`spec.network.rdmaType` decides what else the environment gets:
+
+- `infiniband` — the device alone. Its GIDs come from the port GUID and its
+  LIDs from the subnet manager, neither of which depends on the pod's network
+  namespace, so a plugin-only pod establishes connections normally.
+- `roce` — the device **and the host network**. RoCEv2 GIDs are derived from
+  the IPs of the interfaces inside the pod's own network namespace; a pod that
+  has no interface on the fabric's subnet has nothing to derive a GID from and
+  cannot bring up a queue pair at all, which is why this case sets
+  `hostNetwork: true`.
+
+Two consequences of the RoCE case are worth planning for:
+
+- **The environment's `NetworkPolicy` no longer applies.** The CNI enforces it
+  in the pod's network namespace, and a host-network pod has none: traffic
+  reaches and leaves it as the node's own. A user who can create a RoCE
+  environment can therefore reach whatever the node can.
+- The scheduled ports are the node's, not the environment's. The ports an
+  environment declares are taken as host ports, so two RoCE environments
+  claiming the same one are not placed on the same node.
+
+Either kind runs with an `IPC_LOCK` capability the manager adds for it, which
+is what pins the memory RDMA registration needs. That is outside both the
+Baseline and the Restricted Pod Security Standard — as is `hostNetwork` — so
+the namespace must enforce `privileged` for these pods to be admitted.
+
+```bash
+helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system \
+  --create-namespace --set rdma.ibResource=example.com/ib
+```
+
+The kustomize deployment (`make deploy`) carries the same two args in
+`operator/config/manager/manager.yaml`.
+
 ## Uninstall
 
 ```bash

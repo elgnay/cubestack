@@ -39,12 +39,12 @@ const (
 	testRefNamespace      = "project-a"
 	testRefServiceName    = "dsv4-flash-pd"
 
-	testVolumeShmName   = "shm"
-	testMemoryMedium    = "Memory"
-	testShmMountPath    = "/dev/shm"
-	testIBHostPath      = "/dev/infiniband"
-	testModelMountPath  = "/workspace/model"
-	testHCAResourceName = "rdma/hca_shared_devices"
+	testVolumeShmName    = "shm"
+	testMemoryMedium     = "Memory"
+	testShmMountPath     = "/dev/shm"
+	testIBHostPath       = "/dev/infiniband"
+	testModelMountPath   = "/workspace/model"
+	testRDMAResourceName = "rdma/ib_shared_devices"
 )
 
 func validInferenceRuntimeProfile(name string) *InferenceRuntimeProfile {
@@ -228,7 +228,7 @@ var _ = Describe("InferenceRuntimeProfile", func() {
 				{Name: "dshm", At: testShmMountPath, EmptyDir: &EmptyDirVolume{Medium: testMemoryMedium, SizeLimit: ptrTo(resource.MustParse("8Gi"))}},
 				{Name: "ib", At: testIBHostPath, HostPath: &HostPathVolume{Path: testIBHostPath}},
 			}
-			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testHCAResourceName: 2}
+			irp.Spec.Roles[1].PodTemplate.Resources.ExtendedResources = map[string]int64{testRDMAResourceName: 2}
 
 			Expect(k8sClient.Create(ctx, irp)).To(Succeed())
 

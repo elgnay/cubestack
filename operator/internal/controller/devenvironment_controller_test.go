@@ -74,6 +74,12 @@ const (
 	// allocates (suite_test.go), so it is the port a fresh environment takes
 	// from an empty pool.
 	testL4PortRangeStart = 20000
+	// testRDMAIBResource and testRDMARoCEResource are the extended resources the
+	// suite's reconciler requests (suite_test.go). Deliberately not the
+	// production defaults: an assertion against those would pass even if the
+	// controller never read the configured names.
+	testRDMAIBResource   = "example.com/ib"
+	testRDMARoCEResource = "example.com/roce"
 	testRuntimeUser      = "jovyan"
 	testUserSSHKey       = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ sample-key alice@example.com"
 	// testUserKeysSecret is the user-supplied authorized-keys Secret the case-2
@@ -880,7 +886,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(2))},
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			key := corev1.ResourceName(testGPUResource)
 			Expect(got.Requests).To(HaveKey(key))
 			Expect(got.Limits).To(HaveKey(key))
@@ -894,7 +900,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorMetax, Count: ptrTo(int32(1))},
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			key := corev1.ResourceName("metax-tech.com/gpu")
 			Expect(got.Requests).To(HaveKey(key))
 			Expect(got.Limits).To(HaveKey(key))
@@ -905,7 +911,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(1))}, CPU: "16", Memory: "32Gi",
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			Expect(got.Limits.Cpu().Cmp(resource.MustParse("16"))).To(Equal(0))
 			Expect(got.Limits.Memory().Cmp(resource.MustParse("32Gi"))).To(Equal(0))
 			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceCPU))
@@ -916,7 +922,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				CPU: "4", Memory: "8Gi",
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			// Neither vendor: a zero request would still pin the pod to a node
 			// advertising that resource.
 			Expect(got.Requests).NotTo(HaveKey(corev1.ResourceName(testGPUResource)))
@@ -931,7 +937,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				GPU: &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia},
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			key := corev1.ResourceName(testGPUResource)
 			Expect(got.Requests).To(HaveKey(key))
 			req := got.Requests[key]
@@ -949,7 +955,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
 				GPU: &aiv1alpha1.GPUSpec{Count: ptrTo(int32(1))},
 			}}}
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			Expect(got.Requests).To(HaveKey(corev1.ResourceName(testGPUResource)))
 		})
 
@@ -966,11 +972,96 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(vendor).To(Equal(aiv1alpha1.AcceleratorVendorNvidia))
 			Expect(count).To(Equal(int32(1)))
 
-			got := desiredResources(env)
+			got := desiredResources(env, "")
 			key := corev1.ResourceName(testGPUResource)
 			Expect(got.Requests).To(HaveKey(key))
 			req := got.Requests[key]
 			Expect(req.Value()).To(Equal(int64(1)))
+		})
+
+		// One device is what the shared plugin advertises per environment; its
+		// rdmaHcaMax is the cap on how many environments may share an HCA, not a
+		// per-pod count, so there is nothing for the spec to vary.
+		//
+		// Requests and limits both carry it: a resource in limits alone would be
+		// counted against the node's allocatable and the scheduler would still
+		// admit the pod to a node without the device.
+		It("requests and limits a single rdma device", func() {
+			key := corev1.ResourceName("rdma/ib_shared_devices")
+			got := desiredResources(&aiv1alpha1.DevEnvironment{}, key)
+			Expect(got.Requests).To(HaveKey(key))
+			Expect(got.Limits).To(HaveKey(key))
+			req := got.Requests[key]
+			lim := got.Limits[key]
+			Expect(req.Value()).To(Equal(int64(1)))
+			Expect(lim.Value()).To(Equal(int64(1)))
+		})
+
+		It("adds no rdma resource when none is requested", func() {
+			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Resources: aiv1alpha1.ResourcesSpec{
+				GPU: &aiv1alpha1.GPUSpec{Count: ptrTo(int32(1))},
+			}}}
+			gpu := corev1.ResourceName(testGPUResource)
+			got := desiredResources(env, "")
+			// The accelerator is all there is: an RDMA entry left at zero would
+			// still pin the pod to a node advertising the device.
+			Expect(got.Requests).To(HaveLen(1))
+			Expect(got.Limits).To(HaveLen(1))
+			req := got.Requests[gpu]
+			lim := got.Limits[gpu]
+			Expect(req.Value()).To(Equal(int64(1)))
+			Expect(lim.Value()).To(Equal(int64(1)))
+		})
+	})
+
+	Describe("rdmaResource", func() {
+		envWith := func(network *aiv1alpha1.NetworkSpec) *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Network: network}}
+		}
+
+		It("resolves the configured names, and hostNetwork only for roce", func() {
+			r := &DevEnvironmentReconciler{Config: DevEnvironmentControllerConfig{
+				RDMAIBResource: testRDMAIBResource, RDMARoCEResource: testRDMARoCEResource,
+			}}
+			name, hostNetwork := r.rdmaResource(envWith(&aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeInfiniBand,
+			}))
+			Expect(name).To(Equal(corev1.ResourceName(testRDMAIBResource)))
+			Expect(hostNetwork).To(BeFalse())
+
+			name, hostNetwork = r.rdmaResource(envWith(&aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+			}))
+			Expect(name).To(Equal(corev1.ResourceName(testRDMARoCEResource)))
+			Expect(hostNetwork).To(BeTrue())
+		})
+
+		It("falls back to the plugin's conventional names when unconfigured", func() {
+			r := &DevEnvironmentReconciler{}
+			name, _ := r.rdmaResource(envWith(&aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeInfiniBand,
+			}))
+			Expect(name).To(Equal(corev1.ResourceName(defaultRDMAIBResource)))
+			name, _ = r.rdmaResource(envWith(&aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+			}))
+			Expect(name).To(Equal(corev1.ResourceName(defaultRDMARoCEResource)))
+		})
+
+		It("requests nothing when network is absent or RDMA is off", func() {
+			r := &DevEnvironmentReconciler{}
+			// spec.network has no CRD default on the parent, so it is nil on an
+			// environment that never mentioned it — which is the common case.
+			name, hostNetwork := r.rdmaResource(envWith(nil))
+			Expect(name).To(BeEmpty())
+			Expect(hostNetwork).To(BeFalse())
+
+			// rdmaType carries a default of roce even here, so the enabled flag is
+			// what has to gate this: branching on the type alone would put every
+			// environment in the cluster on the host network.
+			name, hostNetwork = r.rdmaResource(envWith(&aiv1alpha1.NetworkSpec{RDMAEnabled: false}))
+			Expect(name).To(BeEmpty())
+			Expect(hostNetwork).To(BeFalse())
 		})
 	})
 
@@ -1298,6 +1389,95 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}
 			return (&DevEnvironmentReconciler{}).desiredPodSpec(env)
 		}
+
+		// Host networking is the difference between the two fabrics, not an
+		// independent switch: a RoCE device derives its GID table from the
+		// addresses of the interfaces in the pod's network namespace, and a
+		// pod-only namespace has none of the fabric's.
+		It("keeps an InfiniBand environment on the pod network", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Network = &aiv1alpha1.NetworkSpec{
+					RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeInfiniBand,
+				}
+			})
+			Expect(spec.HostNetwork).To(BeFalse())
+			Expect(spec.DNSPolicy).NotTo(Equal(corev1.DNSClusterFirstWithHostNet))
+			c := spec.Containers[0]
+			Expect(c.Resources.Requests).To(HaveKey(corev1.ResourceName(defaultRDMAIBResource)))
+			Expect(c.Resources.Limits).To(HaveKey(corev1.ResourceName(defaultRDMAIBResource)))
+			Expect(c.Resources.Requests).NotTo(HaveKey(corev1.ResourceName(defaultRDMARoCEResource)))
+			// Nothing is bound on the node, so nothing is declared: the ports
+			// only exist to tell the scheduler what a host-network environment
+			// has taken.
+			Expect(c.Ports).To(BeEmpty())
+			Expect(c.SecurityContext.Capabilities.Add).To(ContainElement(corev1.Capability("IPC_LOCK")))
+		})
+
+		It("runs a RoCE environment on the host network, with its ports declared as host ports", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Network = &aiv1alpha1.NetworkSpec{
+					RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+				}
+			})
+			Expect(spec.HostNetwork).To(BeTrue())
+			// ClusterFirst degrades to the node's own resolver on the host
+			// network, which stops cluster service names resolving.
+			Expect(spec.DNSPolicy).To(Equal(corev1.DNSClusterFirstWithHostNet))
+			c := spec.Containers[0]
+			Expect(c.Resources.Requests).To(HaveKey(corev1.ResourceName(defaultRDMARoCEResource)))
+			Expect(c.Resources.Requests).NotTo(HaveKey(corev1.ResourceName(defaultRDMAIBResource)))
+			// The declaration, not the container's own listen, is what keeps a
+			// second environment wanting 8080 off this node.
+			Expect(c.Ports).To(ConsistOf(corev1.ContainerPort{
+				Name: mainPortName, ContainerPort: 8080, HostPort: 8080, Protocol: corev1.ProtocolTCP,
+			}))
+		})
+
+		// spec.ports is free to name a port the platform already declared — the
+		// schema reserves none of those numbers — and the ssh type's main port
+		// *is* the ssh port. A container port may not be declared twice, so the
+		// list dedupes; the same number in another protocol is a different port
+		// and survives.
+		It("declares each host-network port once, per protocol", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				env.Spec.Network = &aiv1alpha1.NetworkSpec{
+					RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+				}
+				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+				env.Spec.Ports = []aiv1alpha1.PortSpec{
+					{Name: "jupyter-again", Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 8888},
+					{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 8888},
+				}
+			})
+			Expect(spec.Containers[0].Ports).To(Equal([]corev1.ContainerPort{
+				{Name: mainPortName, ContainerPort: 8888, Protocol: corev1.ProtocolTCP, HostPort: 8888},
+				{Name: sshPortName, ContainerPort: sshContainerPort, Protocol: corev1.ProtocolTCP, HostPort: sshContainerPort},
+				{Name: testSyslogPortName, ContainerPort: 8888, Protocol: corev1.ProtocolUDP, HostPort: 8888},
+			}))
+		})
+
+		// rdmaType carries a default of roce, so an environment that never
+		// mentioned RDMA still reads as roce here. Gating on the enabled flag is
+		// what keeps the default from putting the whole cluster on the host
+		// network.
+		It("leaves an environment without RDMA untouched", func() {
+			for _, network := range []*aiv1alpha1.NetworkSpec{
+				nil,
+				{},
+				{RDMAEnabled: false},
+				{RDMAEnabled: false, RDMAType: aiv1alpha1.RDMATypeRoCE},
+			} {
+				spec := render(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Network = network })
+				Expect(spec.HostNetwork).To(BeFalse())
+				Expect(spec.DNSPolicy).NotTo(Equal(corev1.DNSClusterFirstWithHostNet))
+				c := spec.Containers[0]
+				Expect(c.Resources.Requests).NotTo(HaveKey(corev1.ResourceName(defaultRDMAIBResource)))
+				Expect(c.Resources.Requests).NotTo(HaveKey(corev1.ResourceName(defaultRDMARoCEResource)))
+				Expect(c.SecurityContext.Capabilities).To(BeNil())
+				Expect(c.Ports).To(BeEmpty())
+			}
+		})
 
 		It("probes the main port per type", func() {
 			for _, tt := range []struct {
@@ -1935,6 +2115,66 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(sts.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled).To(Equal(appsv1.RetainPersistentVolumeClaimRetentionPolicyType))
 				g.Expect(metav1.GetControllerOf(sts).UID).To(Equal(env.UID))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("requests the configured RDMA resource and shares the host network for roce", func() {
+			env := validDevEnvironment("de-rdma-roce")
+			env.Spec.Network = &aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				tmpl := sts.Spec.Template.Spec
+				g.Expect(tmpl.HostNetwork).To(BeTrue())
+				g.Expect(tmpl.DNSPolicy).To(Equal(corev1.DNSClusterFirstWithHostNet))
+				c := tmpl.Containers[0]
+				key := corev1.ResourceName(testRDMARoCEResource)
+				g.Expect(c.Resources.Limits).To(HaveKey(key))
+				g.Expect(c.Resources.Requests).To(HaveKey(key))
+				requested := c.Resources.Requests[key]
+				g.Expect(requested.Value()).To(Equal(int64(1)))
+				g.Expect(c.Resources.Limits).NotTo(HaveKey(corev1.ResourceName(testRDMAIBResource)))
+				g.Expect(c.SecurityContext.Capabilities.Add).To(ContainElement(corev1.Capability("IPC_LOCK")))
+				g.Expect(c.Ports).To(ContainElement(corev1.ContainerPort{
+					Name: mainPortName, ContainerPort: 8888, HostPort: 8888, Protocol: corev1.ProtocolTCP,
+				}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The pod template is only reapplied when this annotation changes, so a
+		// hash that did not cover spec.network would leave an RDMA environment
+		// running the template it was created with, indefinitely.
+		It("rolls the StatefulSet when RDMA is turned on", func() {
+			env := validDevEnvironment("de-rdma-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+				g.Expect(sts.Spec.Template.Spec.HostNetwork).To(BeFalse())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Network = &aiv1alpha1.NetworkSpec{
+					RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeInfiniBand,
+				}
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.Containers[0].Resources.Requests).
+					To(HaveKey(corev1.ResourceName(testRDMAIBResource)))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3394,7 +3634,7 @@ var _ = Describe("DevEnvironment controller", func() {
 					Namespace: env.Namespace,
 					Labels:    map[string]string{devEnvironmentLabelKey: env.Name},
 					Annotations: map[string]string{
-						stsSpecHashAnnotationKey: stsSpecHash(env),
+						stsSpecHashAnnotationKey: (&DevEnvironmentReconciler{}).stsSpecHash(env),
 					},
 				},
 				Spec: appsv1.StatefulSetSpec{

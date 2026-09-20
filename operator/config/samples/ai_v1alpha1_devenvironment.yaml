@@ -73,9 +73,30 @@ spec:
       name: dev-alice-ssh-keys   # must be labeled ai.cubestack.io/ssh-keys-delegated: "true"
       key: authorized_keys       # Secret.data[authorized_keys] holds the authorized_keys content
 
-  # Network
+  # Network. RDMA is served by the cluster's shared device plugin, not by Multus:
+  # the container receives the device's verbs file and the cgroup permission to
+  # open it, and no interface of its own. The extended resource names are
+  # operator settings (--rdma-ib-resource / --rdma-roce-resource) rather than
+  # spec fields, so nothing here has to name one: the platform's defaults are
+  # rdma/ib_shared_devices and rdma/roce_shared_devices, and a cluster whose
+  # plugin advertises other names points the flags at those.
   network:
     rdmaEnabled: false
+    # rdmaType picks the fabric, and with it what else the environment needs.
+    # infiniband: the device alone suffices — its addressing comes from the port
+    # GUID and the subnet manager, neither of which depends on the pod's network
+    # namespace. roce: the environment additionally runs on the host network,
+    # because RoCEv2 derives its addresses from the IPs of the interfaces inside
+    # that namespace, and a pod's own namespace has none of the fabric's — the
+    # device's GID table is empty and no queue pair can be brought up.
+    #
+    # Either kind needs a namespace enforcing the privileged Pod Security
+    # Standard: the controller adds IPC_LOCK, which registering RDMA memory
+    # needs to pin pages, and that capability is not in the Baseline set. RoCE's
+    # host network is refused by Baseline outright. RoCE also ends the
+    # environment's NetworkPolicy — a CNI filters the pod's own network
+    # namespace and a host-network pod has none — so unlike every other
+    # environment it reaches whatever the node can, with no default-deny floor.
     rdmaType: roce               # infiniband / roce
 
   # Container runtime customization

@@ -43,6 +43,19 @@ l4PortRange:
   start: 20000  # --l4-port-range-start
   end: 20999    # --l4-port-range-end
 
+# Extended resources a DevEnvironment's spec.network requests, as advertised by
+# the cluster's shared RDMA device plugin. The plugin's ConfigMap owns the
+# names, so change these if yours differ — the defaults are the platform's own,
+# not names the plugin ships (it demonstrates distinct pools as
+# hca_shared_devices_a and _b instead, naming the instance rather than the
+# fabric). Each environment claims one, which the plugin's rdmaHcaMax has to be
+# large enough to share. Configuring the plugin itself is a prerequisite, not
+# part of this chart. See the chart README for what spec.network.rdmaType does
+# to an environment.
+rdma:
+  ibResource: rdma/ib_shared_devices    # --rdma-ib-resource
+  roceResource: rdma/roce_shared_devices  # --rdma-roce-resource
+
 replicaCount: 1
 
 resources:
