@@ -116,9 +116,32 @@ HELM_NAMESPACE ?= cubestack-system
 # Pinned because it is v1alpha1 and churns between EG minors; v1.9.1 is the
 # version the chart README verifies ListenerSet reconciliation against.
 ENVOY_GATEWAY_VERSION ?= v1.9.1
+# Where the Envoy Gateway controller — and, with it, the class-level EnvoyProxy
+# the e2e applies — lives. The chart's gateway.dataplaneNamespace defaults to
+# this same namespace, and the manager reads the dataplane Service from there to
+# decide how an endpoint is addressed: it looks for a NodePort dataplane and
+# renumbers every port onto its nodePort. The e2e configures a LoadBalancer one
+# instead, so the manager finds none and publishes each port as itself.
+ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
 HELM_RELEASE ?= cubestack
+# --- DevEnvironment image the e2e environment runs ---
+# coordinates images/Makefile publishes under; TAG there also defaults to the
+# short commit SHA, so the two agree without being wired together.
+DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/jupyter-minimal:$(shell git rev-parse --short HEAD)
+# The platform the kind node runs. A kind node matches the docker daemon's
+# architecture, which on an arm64 laptop is not the amd64 these images publish
+# as — and an image loaded for the wrong one fails at container start with an
+# exec format error, not at load. Override to build for another platform
+# deliberately.
+DEV_ENV_PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/')
+# permissionInitImage in internal/controller/assets.go: the hardcoded busybox the
+# workspace-ownership init container runs. Read out of the source rather than
+# restated, so a change there cannot leave this loading a reference nothing pulls:
+# the init container fails closed, so the environment would never start.
+PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
+BUSYBOX_IMAGE ?= busybox:1.38.0
 # Manager image for the helm e2e flow. Defaults to the same registry image as
 # the top-of-file IMG default; the chart Deployment template bakes
 # imagePullPolicy=IfNotPresent, so the kind-loaded image wins over the
@@ -164,9 +187,40 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 		| $(HELM_E2E_KUBECTL) apply --server-side -f -
 	@echo "Provisioning the upstream LeaderWorkerSet controller (image from the pinned lws go module)..." ; \
 	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KIND="$(KIND)" KUBECTL="$(KUBECTL)" hack/install-lws-controller.sh
+	# The CRDs above are the API surface; this is the controller that programs
+	# the Gateway. Without it the chart's Gateway is accepted by the API server
+	# and never served, so nothing an environment publishes is reachable.
+	# --skip-crds is required: the chart's crds/ also carries the gateway-api
+	# CRDs installed from the pinned go module above, and re-applying those is
+	# denied by gateway-api's own safe-upgrades ValidatingAdmissionPolicy.
+	@echo "Installing the Envoy Gateway controller for the chart's Gateway..." ; \
+	$(HELM) upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+		--version $(ENVOY_GATEWAY_VERSION) \
+		--kube-context kind-$(KIND_CLUSTER_HELM) \
+		--namespace $(ENVOY_GATEWAY_NAMESPACE) --create-namespace \
+		--skip-crds --wait --timeout 5m ; \
+	$(HELM_E2E_KUBECTL) rollout status deployment/envoy-gateway -n $(ENVOY_GATEWAY_NAMESPACE) --timeout=3m
+	# The class that says what the dataplane is. A GatewayClass with no
+	# parametersRef still works, but gets Envoy Gateway's built-in defaults; the
+	# e2e points it at the EnvoyProxy above so the proxy Service is a
+	# LoadBalancer MetalLB can address. Waits for Accepted=True, which is where a
+	# missing or malformed parametersRef surfaces rather than at the first
+	# unreachable endpoint.
+	@echo "Applying the GatewayClass + EnvoyProxy prerequisite..." ; \
+	$(HELM_E2E_KUBECTL) apply -f test/e2e/assets/envoyproxy-gatewayclass.yaml && \
+	$(HELM_E2E_KUBECTL) wait --for=condition=Accepted gatewayclass/eg --timeout=2m
+	# kind ships no cephfs; this gives the name the controller hardcodes to a
+	# provisioner kind already has, configured for the ReadWriteMany the
+	# workspace claim asks for. See the script for why a StorageClass alone is
+	# not enough.
+	@echo "Creating the workspace StorageClass..." ; \
+	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KUBECTL="$(KUBECTL)" \
+		hack/install-workspace-storageclass.sh
+	@echo "Installing MetalLB (the address the Gateway's dataplane is reachable on)..." ; \
+	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KUBECTL="$(KUBECTL)" DOCKER="$(CONTAINER_TOOL)" hack/install-metallb.sh
 
 .PHONY: helm-e2e-images
-helm-e2e-images: ## Build and load manager + echo images into the helm kind cluster
+helm-e2e-images: ## Build and load manager, echo and DevEnvironment base images into the helm kind cluster
 	$(MAKE) docker-build IMG=$(HELM_E2E_IMG)
 	@if [ -f test/e2e/assets/echo/Dockerfile ]; then \
 		docker build -f test/e2e/assets/echo/Dockerfile -t $(ECHO_IMG) test/e2e/assets/echo; \
@@ -175,6 +229,25 @@ helm-e2e-images: ## Build and load manager + echo images into the helm kind clus
 		echo "echo image not present yet (created by a later task) — skipping echo build/load"; \
 	fi
 	$(KIND) load docker-image $(HELM_E2E_IMG) --name $(KIND_CLUSTER_HELM)
+	# The environment under test runs a real image out of images/, so the e2e
+	# exercises the images the platform actually ships rather than a stand-in.
+	# Only jupyter-minimal: the environment is a jupyter one, and that image
+	# serves the ssh endpoint too (its entrypoint starts sshd when the operator
+	# mounts the ssh material), so ssh-ubuntu22.04 has nothing here to run in.
+	@echo "Building the DevEnvironment base image..." ; \
+	$(MAKE) -C ../images build-jupyter PLATFORM=$(DEV_ENV_PLATFORM) IMG_JUPYTER=$(DEV_ENV_IMAGE)
+	$(KIND) load docker-image $(DEV_ENV_IMAGE) --name $(KIND_CLUSTER_HELM)
+	# The init container's image is hardcoded in the controller, so the tag has to
+	# be the one it names — including the platform registry host, which does not
+	# resolve here. Retagging upstream busybox under that name is what keeps the
+	# environment off a registry it cannot reach. No ImagePullPolicy is set on the
+	# container, so a non-:latest tag resolves to IfNotPresent and the loaded
+	# image wins.
+	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
+	echo "Loading $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
+	$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) $(BUSYBOX_IMAGE) && \
+	$(CONTAINER_TOOL) tag $(BUSYBOX_IMAGE) $(PERMISSION_INIT_IMAGE) && \
+	$(KIND) load docker-image $(PERMISSION_INIT_IMAGE) --name $(KIND_CLUSTER_HELM)
 
 .PHONY: helm-e2e-install
 helm-e2e-install: helm-e2e-setup helm-e2e-images manifests helm-crds-sync generate fmt vet ## Install the operator via helm into the dedicated kind cluster
@@ -258,6 +331,15 @@ helm-e2e-verify: helm-e2e-setup helm-e2e-install ## Full gpu-less happy path: IS
 	$(HELM_E2E_KUBECTL) get pod -n demo $$POD -o jsonpath='{range .spec.volumes[*]}{.name}={.hostPath.path}{"\n"}{end}' | grep -q "/mnt/cubestack-e2e-model" || { echo "hostPath volume missing"; exit 1; }; \
 	$(HELM_E2E_KUBECTL) get endpoints -n demo e2e-service-router -o jsonpath='{.subsets[0].addresses}' | grep -q . || { echo "no ready endpoints"; exit 1; }; \
 	echo "helm-e2e-verify: OK"
+
+# Takes no prerequisites, like helm-e2e-crd-check: it asserts against a cluster a
+# previous target built. Depending on helm-e2e-install here would re-run setup,
+# the image builds and the chart install a third time in the one CI job that runs
+# all of them.
+.PHONY: helm-e2e-devenv-verify
+helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and SSH answer through the Gateway's VIP
+	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KUBECTL="$(KUBECTL)" DEV_ENV_IMAGE="$(DEV_ENV_IMAGE)" \
+		hack/verify-devenv.sh
 
 .PHONY: helm-e2e-uninstall
 helm-e2e-uninstall: ## Uninstall the helm release; CRDs intentionally remain

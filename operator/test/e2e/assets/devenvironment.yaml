@@ -1,0 +1,39 @@
+# The environment the helm e2e brings up: one container serving JupyterLab and
+# sshd, published through the platform Gateway.
+#
+# __DEV_ENV_IMAGE__ is substituted by `make helm-e2e-devenv-verify` with the
+# image this run built out of images/ — spec.image is required and has no
+# default, and the reference has to be one the kind nodes hold locally (the
+# platform registry does not resolve on a runner).
+#
+# The two runtime settings are not decoration, they are the documented contract
+# for this image (images/README.md): 'jovyan' is the docker-stacks account, which
+# is what derives the /home/jovyan workspace mount, and gid 100 is the image's
+# native group while the operator's default runAsGroup is 1000. Get either wrong
+# and the container cannot write its own home.
+apiVersion: ai.cubestack.io/v1alpha1
+kind: DevEnvironment
+metadata:
+  name: e2e-devenv
+  namespace: demo
+spec:
+  type: jupyter
+  image: __DEV_ENV_IMAGE__
+  running: true
+  # CPU-only: no gpu block, so the pod carries no accelerator resource and the
+  # image brand is not checked.
+  resources: {}
+  # size is what drives the workspace claim, which the controller always
+  # provisions from the hardcoded cephfs-ephemeral class — hence the StorageClass
+  # `make helm-e2e-setup` creates under that name.
+  storage:
+    size: 10Gi
+  # One endpoint, two protocols: sshd listens on 2222 in the container and the
+  # platform Service publishes it as 22. The controller mints the host key and
+  # the login keypair and reports both through status.
+  ssh:
+    enabled: true
+  runtime:
+    user: jovyan
+    securityContext:
+      runAsGroup: 100

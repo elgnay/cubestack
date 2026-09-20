@@ -1,0 +1,48 @@
+# The GatewayClass the platform's Gateway asks to be served by, and the
+# EnvoyProxy that says what the dataplane behind it looks like. The chart ships
+# neither: it creates only the Gateway, and this is the rest of the prerequisite
+# the chart README documents (Prerequisites, "A GatewayClass that carries an
+# EnvoyProxy").
+#
+# It lives in envoy-gateway-system rather than the release namespace on purpose.
+# The platform owns the dataplane for the whole class, so per the README a
+# chart-shipped EnvoyProxy would replace the class's provider config rather than
+# merge with it; `make helm-e2e-crd-check` asserts the release namespace holds
+# none.
+#
+# What the e2e differs on from the README's example, and why:
+#
+#   * envoyService.type is LoadBalancer, not NodePort. This cluster has MetalLB
+#     (hack/install-metallb.sh), so the Gateway gets a real address in the kind
+#     network — which is what makes a published endpoint address assertable from
+#     the runner at all. It also keeps the L4 port pool honest: the controller
+#     treats a LoadBalancer dataplane as an identity mapping, so a listener on
+#     pool port 20000 is reachable on 20000, whereas a NodePort dataplane
+#     renumbers it into 30000-32767 and only the dataplane Service knows where.
+#   * The proxy image is left unset, so Envoy Gateway uses the envoy build
+#     matching its own version. The README restates it for clusters that can
+#     only pull from a mirror; a CI runner reaches Docker Hub, and a pinned tag
+#     here would silently disagree with the gateway version on any bump.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: cubestack-dataplane
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: cubestack-dataplane
+    namespace: envoy-gateway-system

@@ -31,9 +31,13 @@ jobs:
         uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
+          # images/** is part of the operator filter because the e2e builds the
+          # DevEnvironment base images and brings one up on the cluster, so a
+          # change to them is a change to what this workflow asserts.
           filters: |
             operator:
               - 'operator/**'
+              - 'images/**'
               - 'Makefile'
               - '.github/**'
 
@@ -106,6 +110,9 @@ jobs:
         working-directory: operator
       - name: Run the gpu-less ISVC happy-path verification
         run: make helm-e2e-verify
+        working-directory: operator
+      - name: Run the DevEnvironment happy-path verification
+        run: make helm-e2e-devenv-verify
         working-directory: operator
       - name: Clean up the kind cluster
         if: always()
