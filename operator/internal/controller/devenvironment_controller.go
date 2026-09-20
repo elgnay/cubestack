@@ -1605,15 +1605,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		// its own (see rdmaResource). dnsPolicy moves with it: ClusterFirst
 		// silently falls back to the node's own resolver for a host-network pod,
 		// which stops cluster service names and search domains resolving, so the
-		// environment would lose the Services it can otherwise reach.
-		//
-		// desiredNetworkPolicy still returns a policy, but a CNI enforces one by
-		// filtering the pod's own network namespace and this pod has none, so it
-		// is inert here: a RoCE environment has no default-deny floor and reaches
-		// whatever the node can. The policy stays because it is right for
-		// InfiniBand, and because it is the CNI's enforcement that is absent
-		// rather than the intent — a fabric the platform reaches differently
-		// would be confined by it again.
+		// environment would lose the Services it can otherwise reach. The
+		// NetworkPolicy written for every environment is inert here
+		// (::desiredNetworkPolicy).
 		podSpec.HostNetwork = true
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}
@@ -1746,7 +1740,9 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 	// it takes effect again the moment the environment is reconciled without
 	// RDMA. Filtering a host-network pod at all is a CNI host-firewall feature
 	// (Cilium's enable-host-firewall, say), which this platform does not
-	// configure; the spec field documents the gap.
+	// configure. The chart README carries the gap for operators; the API does not
+	// state it, because which environments are attached this way is not part of
+	// spec.network.
 	ingress := []networkingv1.NetworkPolicyIngressRule{}
 	if ns := cfg.GatewayDataplaneNamespace; ns != "" {
 		ingress = append(ingress, networkingv1.NetworkPolicyIngressRule{
