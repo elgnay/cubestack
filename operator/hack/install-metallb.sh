@@ -50,11 +50,24 @@ fi
 if [ -n "${METALLB_POOL:-}" ]; then
   POOL_RANGE="${METALLB_POOL}"
 else
-  SUBNET="$("${DOCKER}" network inspect "${KIND_NETWORK}" -f '{{(index .IPAM.Config 0).Subnet}}' 2>/dev/null || true)"
-  [ -n "${SUBNET}" ] || { echo "cannot read the '${KIND_NETWORK}' docker network subnet; set METALLB_POOL=<start>-<end>" >&2; exit 1; }
+  # Not `index .IPAM.Config 0`: the kind network is dual-stack, and which family
+  # comes first is not stable. On the CI runner and on Docker Desktop index 0 is
+  # the IPv6 ULA (fc00:f853:ccd:e793::/64) with the IPv4 subnet at index 1, so
+  # indexing [0] reads an address family the pool cannot use. Take the first IPv4
+  # subnet — that is the family both the pool and the ARP-based L2 advertisement
+  # need.
+  SUBNETS="$("${DOCKER}" network inspect "${KIND_NETWORK}" -f '{{range .IPAM.Config}}{{.Subnet}}{{"\n"}}{{end}}' 2>/dev/null || true)"
+  SUBNET=""
+  while IFS= read -r candidate; do
+    case "${candidate}" in
+      "" | *:*) continue ;; # an empty line, or an IPv6 subnet
+      *) SUBNET="${candidate}"; break ;;
+    esac
+  done <<< "${SUBNETS}"
+  [ -n "${SUBNET}" ] || { echo "no IPv4 subnet on the '${KIND_NETWORK}' docker network; set METALLB_POOL=<start>-<end>" >&2; exit 1; }
   case "${SUBNET}" in
     */16) ;;
-    *) echo "kind network ${KIND_NETWORK} is ${SUBNET}, not a /16 — set METALLB_POOL=<start>-<end> inside it" >&2; exit 1 ;;
+    *) echo "kind network ${KIND_NETWORK}'s IPv4 subnet is ${SUBNET}, not a /16 — set METALLB_POOL=<start>-<end> inside it" >&2; exit 1 ;;
   esac
   IFS=. read -r o1 o2 _ <<< "${SUBNET%%/*}"
   POOL_RANGE="${o1}.${o2}.255.200-${o1}.${o2}.255.250"
