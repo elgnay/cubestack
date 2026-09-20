@@ -336,8 +336,7 @@ no change. The rest of each name is this platform's: no convention exists for
 naming an RDMA resource after its fabric, and the plugin's own several-pools
 example distinguishes them by instance instead (`hca_shared_devices_a` and
 `_b`). The pair here is deliberately symmetric, because the fabric is what the
-user selects (via `spec.network.rdmaType`) and what decides whether the
-environment runs on the host network.
+user selects (via `spec.network.rdmaType`), and two fabrics are two pools.
 
 The names still have to match what the cluster advertises: the plugin learns
 them from its own ConfigMap, which is a prerequisite and not part of this chart.
@@ -346,31 +345,29 @@ selector, so a cluster serving both fabrics runs two instances, and the plugin
 has to be configured with an `rdmaHcaMax` large enough to hand the same HCA to
 every RDMA environment at once: each environment requests one device.
 
-`spec.network.rdmaType` decides what else the environment gets:
+`spec.network.rdmaType` names the fabric. What the platform does to attach an
+environment to it differs by fabric, and is worth planning for before offering
+RDMA to tenants:
 
-- `infiniband` — the device alone. Its GIDs come from the port GUID and its
-  LIDs from the subnet manager, neither of which depends on the pod's network
-  namespace, so a plugin-only pod establishes connections normally.
-- `roce` — the device **and the host network**. RoCEv2 GIDs are derived from
-  the IPs of the interfaces inside the pod's own network namespace; a pod that
-  has no interface on the fabric's subnet has nothing to derive a GID from and
-  cannot bring up a queue pair at all, which is why this case sets
-  `hostNetwork: true`.
-
-Two consequences of the RoCE case are worth planning for:
-
-- **The environment's `NetworkPolicy` no longer applies.** The CNI enforces it
-  in the pod's network namespace, and a host-network pod has none: traffic
-  reaches and leaves it as the node's own. A user who can create a RoCE
-  environment can therefore reach whatever the node can.
-- The scheduled ports are the node's, not the environment's. The ports an
-  environment declares are taken as host ports, so two RoCE environments
-  claiming the same one are not placed on the same node.
+- An `infiniband` environment is confined by the `NetworkPolicy` the manager
+  gives every environment.
+- A `roce` environment is not. The manager writes the policy for it too, but it
+  cannot apply to the way a RoCE environment is attached, so traffic reaches and
+  leaves it as the node's own: a user who can create a RoCE environment can
+  reach whatever the node can. Its ports are counted against the node rather
+  than the environment, so two RoCE environments claiming the same one are not
+  placed together.
 
 Either kind runs with an `IPC_LOCK` capability the manager adds for it, which
 is what pins the memory RDMA registration needs. That is outside both the
-Baseline and the Restricted Pod Security Standard — as is `hostNetwork` — so
-the namespace must enforce `privileged` for these pods to be admitted.
+Baseline and the Restricted Pod Security Standard, so the namespace must
+enforce `privileged` for these pods to be admitted.
+
+That split belongs to this build rather than to the API: a later release could
+attach RoCE environments another way — Multus with SR-IOV virtual functions,
+say — without `spec.network` or this chart's values changing. Read `rdmaType`
+as the fabric a user asks for, and this section as what the current
+implementation does about it.
 
 ```bash
 helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system \

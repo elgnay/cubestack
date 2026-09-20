@@ -94,15 +94,13 @@ func main() {
 			"each spec.ports[].type: tcp exposure takes one port from it.")
 	flag.StringVar(&rdmaIBResource, "rdma-ib-resource", "rdma/ib_shared_devices",
 		"Extended resource an InfiniBand DevEnvironment requests. It is advertised by the cluster's "+
-			"shared RDMA device plugin, whose ConfigMap owns the name; RDMA over InfiniBand needs nothing "+
-			"else, because its GIDs come from the port GUID and its LIDs from the subnet manager. The "+
-			"rdma/ prefix is the plugin's own default, so leaving it alone needs no resourcePrefix.")
+			"shared RDMA device plugin, whose ConfigMap owns the name. The rdma/ prefix is the plugin's "+
+			"own resourcePrefix default, so leaving it alone needs no change to that ConfigMap.")
 	flag.StringVar(&rdmaRoCEResource, "rdma-roce-resource", "rdma/roce_shared_devices",
-		"Extended resource a RoCE DevEnvironment requests, from the same device plugin. A RoCE "+
-			"environment additionally runs on the host network, since its GIDs are derived from the "+
-			"addresses of the interfaces inside its network namespace. The two names are this platform's "+
-			"own: no convention exists for naming an RDMA resource after its fabric, so the pair is "+
-			"deliberately symmetric rather than copied from the plugin's own examples.")
+		"Extended resource a RoCE DevEnvironment requests, from the same device plugin. The two names "+
+			"are this platform's own: no convention exists for naming an RDMA resource after its fabric, "+
+			"so the pair is deliberately symmetric rather than copied from the plugin's own examples, "+
+			"which distinguish pools by instance (hca_shared_devices_a and _b).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+

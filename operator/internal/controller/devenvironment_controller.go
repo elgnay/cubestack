@@ -1606,6 +1606,14 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		// silently falls back to the node's own resolver for a host-network pod,
 		// which stops cluster service names and search domains resolving, so the
 		// environment would lose the Services it can otherwise reach.
+		//
+		// desiredNetworkPolicy still returns a policy, but a CNI enforces one by
+		// filtering the pod's own network namespace and this pod has none, so it
+		// is inert here: a RoCE environment has no default-deny floor and reaches
+		// whatever the node can. The policy stays because it is right for
+		// InfiniBand, and because it is the CNI's enforcement that is absent
+		// rather than the intent — a fabric the platform reaches differently
+		// would be confined by it again.
 		podSpec.HostNetwork = true
 		podSpec.DNSPolicy = corev1.DNSClusterFirstWithHostNet
 	}

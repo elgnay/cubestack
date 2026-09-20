@@ -226,55 +226,33 @@ type SSHSpec struct {
 
 // NetworkSpec configures the network.
 //
-// RDMA is served by a shared device plugin, not by Multus: the container
-// receives the device's verbs file (/dev/infiniband/uverbsN) plus the cgroup
-// permission to open it, and no interface of its own — a RoCE environment
-// shares the node's instead, which is what RDMAType selects between.
+// RDMA access is granted per fabric: an environment is given a device the
+// cluster advertises for the fabric it names. How that device is attached to
+// the environment, and what else it takes, is the platform's to arrange — it
+// is deliberately not part of this API, so the arrangement can change without
+// the environment changing with it.
 type NetworkSpec struct {
-	// RDMAEnabled gives the environment access to an RDMA device advertised by
-	// the cluster's shared device plugin. The resource name is an operator
-	// setting rather than a spec field, since it is fixed by the cluster's
-	// device-plugin configuration. The controller adds IPC_LOCK: registering a
-	// memory region locks pages, which the default capability set does not
-	// permit.
+	// RDMAEnabled gives the environment access to an RDMA device on the node it
+	// runs on.
 	//
-	// What the device additionally needs depends on the fabric. InfiniBand
-	// devices carry their own addressing — a port GUID and a subnet-manager LID
-	// — both independent of the network namespace, so the device alone
-	// suffices. RoCEv2 instead derives its addresses from the IPs of the
-	// interfaces inside that namespace; in a pod's own namespace there are none
-	// to derive from, the device's GID table is empty, and no queue pair can be
-	// brought up. A RoCE environment therefore also runs on the host network —
-	// see RDMAType.
+	// The device is advertised by the cluster, so which one an environment
+	// requests is cluster configuration rather than a field here; an
+	// environment whose requested device no node advertises stays Pending.
 	//
-	// Two consequences follow, and both apply before the environment starts. A
-	// namespace hosting an RDMA environment must enforce the privileged Pod
-	// Security Standard: RoCE is refused by Baseline outright for hostNetwork,
-	// and IPC_LOCK is not among the capabilities Baseline allows, so InfiniBand
-	// needs privileged as well. And a RoCE environment's NetworkPolicy stops
-	// applying, because a CNI filters the pod's own network namespace and a
-	// host-network pod has none — the default-deny floor and the DNS-only egress
-	// rule are then unenforced.
+	// Registering a memory region locks pages, and the capability that permits
+	// it is outside the set the Baseline Pod Security Standard allows, so the
+	// namespace has to admit the privileged standard. That holds whichever
+	// fabric is selected.
 	// +kubebuilder:default=false
 	// +optional
 	RDMAEnabled bool `json:"rdmaEnabled,omitempty"`
 
-	// RDMAType selects the fabric, and with it how the device is reached;
-	// effective when rdmaEnabled=true.
+	// RDMAType names the fabric the environment joins; effective when
+	// rdmaEnabled=true.
 	//
-	// infiniband uses the device plugin alone.
-	//
-	// roce additionally runs the environment on the host network
-	// (hostNetwork=true, with dnsPolicy=ClusterFirstWithHostNet), which is the
-	// only way a RoCE device acquires the interface addresses its GID table is
-	// built from. The environment then binds its ports on the node itself rather
-	// than in a pod namespace: the ports it declares are declared as host ports
-	// — the main port above all, which is one of a few fixed numbers per type,
-	// so the scheduler keeps a second environment wanting it off that node — and
-	// whatever the environment listens on becomes reachable on every node
-	// interface, outside the Gateway's path prefix. dnsPolicy is set together
-	// with hostNetwork because ClusterFirst degrades to the node's own resolver
-	// there, which stops cluster service names resolving.
+	// The fabric is what addresses the peers: an InfiniBand fabric assigns the
+	// addresses a device uses, a RoCE fabric derives them from the host's own
+	// networking, so an environment is reachable only on the fabric it names.
 	// +kubebuilder:validation:Enum=infiniband;roce
 	// +kubebuilder:default=roce
 	// +optional
