@@ -2082,6 +2082,23 @@ var _ = Describe("DevEnvironment apply is idempotent", func() {
 		// write here means the server's own defaults read as drift.
 		apply()
 		Expect(counter.updates).To(BeZero())
+
+		// The deferred delete at the top only reaches the controller's cleanup
+		// once the controller has adopted the environment, and adoption is the
+		// finalizer its first reconcile patches on. Until then the API server
+		// deletes the object outright: the reconciler is handed a name that is
+		// already gone, runs no cleanup, and the objects this spec wrote itself —
+		// Service, NetworkPolicy and routes above — outlive the environment that
+		// owns them. envtest runs no garbage collector, so nothing reclaims them
+		// on the ownerReference either, and a leaked TCPRoute keeps claiming its
+		// pool port against every later spec that starts from an empty pool.
+		// This is the only spec that creates controller-owned objects outside the
+		// controller, which is why it is the only one that has to wait.
+		Eventually(func(g Gomega) {
+			got := &aiv1alpha1.DevEnvironment{}
+			g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+			g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
+		}, "15s", "200ms").Should(Succeed())
 	})
 })
 
