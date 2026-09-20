@@ -86,7 +86,8 @@ const (
 	// (DevEnvironment)
 	ConditionPodScheduled ConditionType = "PodScheduled"
 
-	// ConditionBrandMatchValid indicates that gpuType matches the image brand
-	// (nvidia<->base-cuda, metax<->base-maca). (DevEnvironment)
+	// ConditionBrandMatchValid indicates that the requested GPU vendor matches
+	// the image brand (nvidia<->base-cuda, metax<->base-maca), or that no GPU was
+	// requested and there is no brand to match. (DevEnvironment)
 	ConditionBrandMatchValid ConditionType = "BrandMatchValid"
 )

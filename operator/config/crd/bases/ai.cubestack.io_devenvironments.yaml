@@ -144,24 +144,33 @@ spec:
                   cpu:
                     description: CPU is the CPU limit in cores.
                     type: string
-                  gpuCount:
-                    default: 1
+                  gpu:
                     description: |-
-                      GPUCount is the number of GPU cards. 0 requests no accelerator: the pod
-                      carries no vendor GPU resource and the image brand is not checked. Omit
-                      it for the default of 1.
-                    format: int32
-                    minimum: 0
-                    type: integer
-                  gpuType:
-                    default: nvidia
-                    description: |-
-                      GPUType is the GPU vendor: nvidia / metax. It decides the GPU extended
-                      resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
-                    enum:
-                    - nvidia
-                    - metax
-                    type: string
+                      GPU requests accelerators. Absent asks for none: no vendor is named, no
+                      vendor GPU resource goes into the pod, and the image brand is not checked,
+                      which is what makes the CPU images usable. It is deliberately not defaulted
+                      into existence — defaulting it would put an accelerator on every
+                      environment and leave "no accelerator" with no way to be expressed.
+                    properties:
+                      count:
+                        default: 1
+                        description: |-
+                          Count is the number of GPU cards to request. Omit it for the default of 1.
+                          There is no zero: omitting the whole gpu block is how an environment asks
+                          for no accelerator.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      vendor:
+                        default: nvidia
+                        description: |-
+                          Vendor is the GPU vendor: nvidia / metax. It decides the GPU extended
+                          resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
+                        enum:
+                        - metax
+                        - nvidia
+                        type: string
+                    type: object
                   memory:
                     description: Memory is the memory limit.
                     type: string

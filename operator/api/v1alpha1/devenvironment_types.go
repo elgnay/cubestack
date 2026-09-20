@@ -96,30 +96,15 @@ type DevEnvironmentSpec struct {
 	Ports []PortSpec `json:"ports,omitempty"`
 }
 
-// GPUType is the GPU vendor.
-type GPUType string
-
-const (
-	GPUTypeNVIDIA GPUType = "nvidia"
-	GPUTypeMetaX  GPUType = "metax"
-)
-
 // ResourcesSpec is the compute / resource configuration.
 type ResourcesSpec struct {
-	// GPUType is the GPU vendor: nvidia / metax. It decides the GPU extended
-	// resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
-	// +kubebuilder:validation:Enum=nvidia;metax
-	// +kubebuilder:default=nvidia
+	// GPU requests accelerators. Absent asks for none: no vendor is named, no
+	// vendor GPU resource goes into the pod, and the image brand is not checked,
+	// which is what makes the CPU images usable. It is deliberately not defaulted
+	// into existence — defaulting it would put an accelerator on every
+	// environment and leave "no accelerator" with no way to be expressed.
 	// +optional
-	GPUType GPUType `json:"gpuType,omitempty"`
-
-	// GPUCount is the number of GPU cards. 0 requests no accelerator: the pod
-	// carries no vendor GPU resource and the image brand is not checked. Omit
-	// it for the default of 1.
-	// +kubebuilder:default=1
-	// +kubebuilder:validation:Minimum=0
-	// +optional
-	GPUCount *int32 `json:"gpuCount,omitempty"`
+	GPU *GPUSpec `json:"gpu,omitempty"`
 
 	// CPU is the CPU limit in cores.
 	// +optional
@@ -128,6 +113,25 @@ type ResourcesSpec struct {
 	// Memory is the memory limit.
 	// +optional
 	Memory string `json:"memory,omitempty"`
+}
+
+// GPUSpec requests accelerators: how many, and of which vendor. It exists only
+// when the environment asks for at least one, so a vendor can never describe a
+// device that is not there.
+type GPUSpec struct {
+	// Vendor is the GPU vendor: nvidia / metax. It decides the GPU extended
+	// resource (nvidia.com/gpu / metax-tech.com/gpu) and image brand matching.
+	// +kubebuilder:default=nvidia
+	// +optional
+	Vendor AcceleratorVendor `json:"vendor,omitempty"`
+
+	// Count is the number of GPU cards to request. Omit it for the default of 1.
+	// There is no zero: omitting the whole gpu block is how an environment asks
+	// for no accelerator.
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	// +optional
+	Count *int32 `json:"count,omitempty"`
 }
 
 // StorageSpec is the workspace storage configuration.
