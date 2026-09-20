@@ -322,9 +322,16 @@ func main() {
 // selects (gpuResource in internal/controller), so the two names that field can
 // produce are rejected here to keep one from silently replacing the other.
 func validateRDMAResource(flagName, value string) error {
-	// Qualified name is the format the API server requires of an extended
-	// resource; it is what permits the domain prefix that separates a device
-	// plugin's resource from a native one.
+	// The domain prefix is what makes the name an extended resource. IsLabelKey
+	// alone lets through both halves of what that excludes: a bare "example",
+	// which pod admission refuses as a non-native resource without a qualifier,
+	// and a native "ephemeral-storage" or "hugepages-2Mi", which is accepted and
+	// asks the node for storage or huge pages where a device was meant. Neither
+	// failure names its cause — the first strands the environment, the second
+	// hands it a resource it cannot use — so the slash is required outright.
+	if !strings.Contains(value, "/") {
+		return fmt.Errorf("--%s must be a domain-qualified extended resource name, e.g. rdma/ib_shared_devices", flagName)
+	}
 	if errs := content.IsLabelKey(value); len(errs) > 0 {
 		return fmt.Errorf("--%s must be a qualified resource name, e.g. rdma/ib_shared_devices: %s",
 			flagName, strings.Join(errs, "; "))

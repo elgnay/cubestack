@@ -31,6 +31,13 @@ func TestValidateRDMAResource(t *testing.T) {
 		{"/hca", false},
 		{"rdma/hca/extra", false},
 		{"rdma/hca shared", false},
+		// Unqualified: a label key and a qualified name, but not an extended
+		// resource — pod admission rejects it, so the environment never starts.
+		{"example", false},
+		// Unqualified and native: accepted everywhere, and understood as a
+		// request for storage rather than for a device.
+		{"ephemeral-storage", false},
+		{"hugepages-2Mi", false},
 		{"cpu", false},
 		{"memory", false},
 		{"nvidia.com/gpu", false},

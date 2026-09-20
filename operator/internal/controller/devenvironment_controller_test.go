@@ -2195,6 +2195,43 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		// A host-network environment's ports are host ports, so spec.ports
+		// reaches the pod template rather than only the Service. The Service and
+		// the routes are reconciled on their own, which is what makes a stale
+		// template easy to miss: the port would be published end to end and
+		// bound by nothing.
+		It("rolls a host-network environment when its ports change", func() {
+			env := validDevEnvironment("de-rdma-port-roll")
+			env.Spec.Network = &aiv1alpha1.NetworkSpec{
+				RDMAEnabled: true, RDMAType: aiv1alpha1.RDMATypeRoCE,
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Ports = []aiv1alpha1.PortSpec{
+					{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 9090},
+				}
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.Containers[0].Ports).To(ContainElement(corev1.ContainerPort{
+					Name: testMetricsPortName, ContainerPort: 9090, HostPort: 9090, Protocol: corev1.ProtocolTCP,
+				}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		It("admits the platform Gateway's dataplane into the environment", func() {
 			env := validDevEnvironment("de-netpol")
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())

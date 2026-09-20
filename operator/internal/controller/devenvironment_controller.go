@@ -1897,6 +1897,15 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	type rdmaTemplate struct {
 		HostNetwork bool   `json:"hostNetwork,omitempty"`
 		Resource    string `json:"resource,omitempty"`
+		// Ports are the host ports the pod template declares, which a
+		// host-network environment has only because it takes them from the node.
+		// They are derived from spec.ports, so a hash that covered RDMA but not
+		// them would keep the declarations the template was built with: editing
+		// spec.ports republishes the Service and the routes without ever rolling
+		// the pod behind them, leaving a port published everywhere and bound
+		// nowhere. An InfiniBand environment declares none (::desiredPodSpec),
+		// so it contributes nothing here either.
+		Ports []corev1.ContainerPort `json:"ports,omitempty"`
 	}
 	type templateInput struct {
 		Type       aiv1alpha1.DevEnvironmentType
@@ -1938,6 +1947,9 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	var rdma *rdmaTemplate
 	if name, hostNetwork := r.rdmaResource(env); name != "" {
 		rdma = &rdmaTemplate{HostNetwork: hostNetwork, Resource: string(name)}
+		if hostNetwork {
+			rdma.Ports = desiredContainerPorts(env)
+		}
 	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
