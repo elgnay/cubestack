@@ -88,6 +88,26 @@ fi
 [ "${DIGEST}" = "${METALLB_MANIFEST_SHA256}" ] \
   || { echo "MetalLB manifest checksum mismatch — ${METALLB_VERSION} was re-tagged, or the download is wrong" >&2; exit 1; }
 
+# The bundle's own image refs point at quay.io. Repoint them at the platform
+# registry, which holds the same tags (hack/mirror-e2e-images.sh): the runner
+# reaches harbor.isuanova.com on the internal network, and quay.io is both slow
+# from it and one rate limit away from failing the job. Only the repository is
+# rewritten, so the tag — and with it the version — stays whatever
+# METALLB_VERSION pinned above. The checksum pin is what makes this safe to do
+# blind: the rewrite is applied to exactly the manifest those refs were read
+# from. Set METALLB_REGISTRY= (explicitly empty) to keep the upstream refs.
+METALLB_REGISTRY="${METALLB_REGISTRY-harbor.isuanova.com/suanova}"
+if [ -n "${METALLB_REGISTRY}" ]; then
+  sed -e "s#quay.io/metallb/controller:#${METALLB_REGISTRY}/metallb-controller:#g" \
+      -e "s#quay.io/metallb/speaker:#${METALLB_REGISTRY}/metallb-speaker:#g" \
+      "${OUT}" > "${OUT}.registry" && mv "${OUT}.registry" "${OUT}"
+  # Fail loudly if the bundle stops carrying the refs this rewrote. Silently
+  # falling back to quay.io would still pass on a runner that can reach it, so
+  # the mirror would rot unnoticed until the day it mattered.
+  grep -q 'quay.io/metallb/' "${OUT}" \
+    && { echo "MetalLB manifest still references quay.io after the registry rewrite — its image refs changed shape; update this script" >&2; exit 1; }
+fi
+
 # --server-side: the CRDs in this bundle (bgppeers, ipaddresspools, ...) carry
 # schemas too large for client-side apply's last-applied-configuration annotation.
 echo "applying MetalLB to ${CTX}"

@@ -123,6 +123,27 @@ ENVOY_GATEWAY_VERSION ?= v1.9.1
 # renumbers every port onto its nodePort. The e2e configures a LoadBalancer one
 # instead, so the manager finds none and publishes each port as itself.
 ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
+# Envoy Gateway's chart, controller image, and the proxy image its dataplane
+# runs — served from the platform registry rather than Docker Hub. The runner
+# reaches harbor.isuanova.com on the internal network, and Docker Hub's
+# anonymous pull limits are a CI failure this stays clear of. Repos follow the
+# naming already in that project, <upstream-org>-<image>.
+#
+# The controller's tag is ENVOY_GATEWAY_VERSION itself, so chart and controller
+# cannot disagree. The proxy's is NOT derivable from it: Envoy Gateway compiles
+# the envoy build it ships with into its binary and publishes the pairing only
+# in its release compatibility matrix, so it is pinned here next to the version
+# it belongs to and has to be re-checked whenever that moves.
+#
+# All three are set to a mirrored copy, so moving ENVOY_GATEWAY_VERSION means
+# running hack/mirror-e2e-images.sh before the e2e can pass.
+ENVOY_GATEWAY_CHART ?= oci://harbor.isuanova.com/suanova/envoyproxy-gateway-helm-chart
+ENVOY_GATEWAY_IMAGE ?= harbor.isuanova.com/suanova/envoyproxy-gateway:$(ENVOY_GATEWAY_VERSION)
+ENVOY_PROXY_IMAGE ?= harbor.isuanova.com/suanova/envoyproxy-envoy:distroless-v1.39.1
+# Split on the LAST colon so registries with a port (reg:5000/img:tag) work, as
+# HELM_E2E_IMAGE_REPO/TAG below do.
+ENVOY_GATEWAY_IMAGE_REPO = $(shell echo '$(ENVOY_GATEWAY_IMAGE)' | sed -E 's/:[^:]*$$//')
+ENVOY_GATEWAY_IMAGE_TAG = $(shell echo '$(ENVOY_GATEWAY_IMAGE)' | sed -E 's/^.*://')
 HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
 HELM_RELEASE ?= cubestack
@@ -180,7 +201,7 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# securitypolicies CRDs are too big for client-side apply's 256KB
 	# last-applied-configuration annotation.
 	@echo "Installing Envoy Gateway CRDs (the platform prerequisite's API surface)..." ; \
-	$(HELM) show crds oci://docker.io/envoyproxy/gateway-helm --version $(ENVOY_GATEWAY_VERSION) \
+	$(HELM) show crds $(ENVOY_GATEWAY_CHART) --version $(ENVOY_GATEWAY_VERSION) \
 		| awk 'BEGIN { buf = "---\n" } /^---[[:space:]]*$$/ { if (keep) printf "%s", buf; buf = "---\n"; keep = 0; next } \
 			{ buf = buf $$0 "\n"; if ($$0 == "  group: gateway.envoyproxy.io") keep = 1 } \
 			END { if (keep) printf "%s", buf }' \
@@ -194,8 +215,10 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# CRDs installed from the pinned go module above, and re-applying those is
 	# denied by gateway-api's own safe-upgrades ValidatingAdmissionPolicy.
 	@echo "Installing the Envoy Gateway controller for the chart's Gateway..." ; \
-	$(HELM) upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
+	$(HELM) upgrade --install eg $(ENVOY_GATEWAY_CHART) \
 		--version $(ENVOY_GATEWAY_VERSION) \
+		--set deployment.envoyGateway.image.repository=$(ENVOY_GATEWAY_IMAGE_REPO) \
+		--set deployment.envoyGateway.image.tag=$(ENVOY_GATEWAY_IMAGE_TAG) \
 		--kube-context kind-$(KIND_CLUSTER_HELM) \
 		--namespace $(ENVOY_GATEWAY_NAMESPACE) --create-namespace \
 		--skip-crds --wait --timeout 5m ; \
@@ -207,7 +230,8 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# missing or malformed parametersRef surfaces rather than at the first
 	# unreachable endpoint.
 	@echo "Applying the GatewayClass + EnvoyProxy prerequisite..." ; \
-	$(HELM_E2E_KUBECTL) apply -f test/e2e/assets/envoyproxy-gatewayclass.yaml && \
+	sed "s#__ENVOY_PROXY_IMAGE__#$(ENVOY_PROXY_IMAGE)#" test/e2e/assets/envoyproxy-gatewayclass.yaml \
+		| $(HELM_E2E_KUBECTL) apply -f - && \
 	$(HELM_E2E_KUBECTL) wait --for=condition=Accepted gatewayclass/eg --timeout=2m
 	# kind ships no cephfs; this gives the name the controller hardcodes to a
 	# provisioner kind already has, configured for the ReadWriteMany the
