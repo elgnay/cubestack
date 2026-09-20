@@ -162,7 +162,15 @@ DEV_ENV_PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarc
 # restated, so a change there cannot leave this loading a reference nothing pulls:
 # the init container fails closed, so the environment would never start.
 PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
-BUSYBOX_IMAGE ?= busybox:1.38.0
+# What the images below are built FROM, as the platform registry's mirrored copy
+# and the name the Dockerfile asks for. They are pulled from the mirror and
+# re-tagged under that second name, so `docker build` resolves the base from the
+# local store instead of Docker Hub and GCR — verified: with a tag present
+# locally the build never contacts a registry, and without one it fails trying.
+# Re-tagging rather than threading a --build-arg through the Dockerfiles keeps
+# product files out of a CI concern. A base bumped in a Dockerfile but not here
+# still builds correctly; it just pulls upstream again.
+BUILD_BASE_MIRRORS = harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07=quay.io/jupyter/minimal-notebook:2026-09-07 harbor.isuanova.com/suanova/golang:1.26=golang:1.26 harbor.isuanova.com/suanova/distroless-static:nonroot=gcr.io/distroless/static:nonroot harbor.isuanova.com/suanova/python:3.12-alpine=python:3.12-alpine
 # Manager image for the helm e2e flow. Defaults to the same registry image as
 # the top-of-file IMG default; the chart Deployment template bakes
 # imagePullPolicy=IfNotPresent, so the kind-loaded image wins over the
@@ -245,6 +253,17 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 
 .PHONY: helm-e2e-images
 helm-e2e-images: ## Build and load manager, echo and DevEnvironment base images into the helm kind cluster
+	# Has to run before the first build: these are what those builds are FROM.
+	@for pair in $(BUILD_BASE_MIRRORS); do \
+		src="$${pair%%=*}"; dst="$${pair#*=}"; \
+		if $(CONTAINER_TOOL) image inspect "$${dst}" >/dev/null 2>&1; then \
+			echo "$${dst} is already present locally — not pulling $${src}"; \
+			continue; \
+		fi; \
+		echo "Pulling $${src} and re-tagging it as $${dst}..."; \
+		$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) "$${src}" && \
+		$(CONTAINER_TOOL) tag "$${src}" "$${dst}" || exit 1; \
+	done
 	$(MAKE) docker-build IMG=$(HELM_E2E_IMG)
 	@if [ -f test/e2e/assets/echo/Dockerfile ]; then \
 		docker build -f test/e2e/assets/echo/Dockerfile -t $(ECHO_IMG) test/e2e/assets/echo; \
@@ -263,14 +282,14 @@ helm-e2e-images: ## Build and load manager, echo and DevEnvironment base images 
 	$(KIND) load docker-image $(DEV_ENV_IMAGE) --name $(KIND_CLUSTER_HELM)
 	# The init container's image is hardcoded in the controller, so the tag has to
 	# be the one it names — including the platform registry host, which does not
-	# resolve here. Retagging upstream busybox under that name is what keeps the
-	# environment off a registry it cannot reach. No ImagePullPolicy is set on the
-	# container, so a non-:latest tag resolves to IfNotPresent and the loaded
-	# image wins.
+	# resolve on the cluster. Pulling that name straight from the mirror is what
+	# keeps the environment off a registry it cannot reach; upstream busybox
+	# carries the same tag, so no re-tagging is needed. No ImagePullPolicy is set
+	# on the container, so a non-:latest tag resolves to IfNotPresent and the
+	# loaded image wins.
 	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
 	echo "Loading $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
-	$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) $(BUSYBOX_IMAGE) && \
-	$(CONTAINER_TOOL) tag $(BUSYBOX_IMAGE) $(PERMISSION_INIT_IMAGE) && \
+	$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) $(PERMISSION_INIT_IMAGE) && \
 	$(KIND) load docker-image $(PERMISSION_INIT_IMAGE) --name $(KIND_CLUSTER_HELM)
 
 .PHONY: helm-e2e-install

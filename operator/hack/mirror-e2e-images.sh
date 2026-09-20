@@ -39,6 +39,20 @@ done
 # upstream manifest to, and they have to match it for the node to find them.
 METALLB_REGISTRY="${METALLB_REGISTRY:-harbor.isuanova.com/suanova}"
 
+# The bases the images themselves are built FROM. The Makefile holds the map of
+# mirror to Dockerfile name, because helm-e2e-images re-tags each one so
+# `docker build` resolves it locally; mirroring the same map is what keeps the
+# two from naming different images. Read as <mirror>=<dockerfile-name>.
+BUILD_BASE_MIRRORS="$(sed -n 's/^BUILD_BASE_MIRRORS *= *//p' Makefile)"
+
+# The init container's busybox, read out of the controller's own constant the
+# way the Makefile reads it. Upstream carries it under the same tag.
+BUSYBOX_IMAGE="$(sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' internal/controller/assets.go)"
+
+for v in "${BUILD_BASE_MIRRORS}" "${BUSYBOX_IMAGE}"; do
+  [ -n "${v}" ] || { echo "could not read BUILD_BASE_MIRRORS from the Makefile or permissionInitImage from internal/controller/assets.go — one of them changed shape" >&2; exit 1; }
+done
+
 # upstream -> platform. Each upstream tag is the one the e2e actually resolves:
 # MetalLB's from the sha256-pinned native manifest, Envoy Gateway's from
 # ENVOY_GATEWAY_VERSION, the proxy's from the compatibility matrix published
@@ -49,11 +63,24 @@ MIRRORS=(
   "docker.io/envoyproxy/gateway:${ENVOY_GATEWAY_VERSION}=${ENVOY_GATEWAY_IMAGE}:${ENVOY_GATEWAY_VERSION}"
   "docker.io/envoyproxy/envoy:${ENVOY_PROXY_IMAGE##*:}=${ENVOY_PROXY_IMAGE}"
   "docker.io/envoyproxy/gateway-helm:${ENVOY_GATEWAY_VERSION}=${ENVOY_GATEWAY_CHART}:${ENVOY_GATEWAY_VERSION}"
+  "docker.io/library/busybox:${BUSYBOX_IMAGE##*:}=${BUSYBOX_IMAGE}"
 )
+# The Makefile's map is platform=Dockerfile-name; the copy goes the other way.
+for pair in ${BUILD_BASE_MIRRORS}; do
+  MIRRORS+=("${pair#*=}=${pair%%=*}")
+done
 
 # Multi-arch throughout: a copied index costs a node only its own platform's
 # manifest and layers, and keeps the e2e runnable on an arm64 laptop as well as
-# on the amd64 runner.
+# on the amd64 runner. It also keeps each mirrored tag digest-identical to its
+# upstream one, which a per-platform copy would not: crane's --platform is a
+# single-valued global flag, so it can name one platform at a time and produces
+# a single-architecture image. Copy everything and the node picks its own.
+#
+# That is not free — upstream indices carry platforms this e2e cannot run, and
+# golang:1.26 is 7.1 GB over 89 layers, 4.9 GB of it Windows. This script runs
+# by hand when a version moves, so the cost is paid once per bump, not per CI
+# run; that is the trade for a faithful, digest-preserving mirror.
 ok=0
 failed=0
 for pair in "${MIRRORS[@]}"; do
