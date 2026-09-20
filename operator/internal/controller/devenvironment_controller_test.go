@@ -1299,7 +1299,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			return (&DevEnvironmentReconciler{}).desiredPodSpec(env)
 		}
 
-		It("pins the pod to the compute pool and probes the main port per type", func() {
+		It("probes the main port per type", func() {
 			for _, tt := range []struct {
 				typ  aiv1alpha1.DevEnvironmentType
 				port int32
@@ -1309,7 +1309,6 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				{typ: aiv1alpha1.DevEnvironmentTypeVSCode, port: 8080},
 			} {
 				spec := render(func(env *aiv1alpha1.DevEnvironment) { env.Spec.Type = tt.typ })
-				Expect(spec.NodeSelector).To(Equal(map[string]string{computeNodePoolLabelKey: computeNodePoolValue}))
 				Expect(spec.Containers).To(HaveLen(1))
 				c := spec.Containers[0]
 				Expect(c.Name).To(Equal(string(tt.typ)))
@@ -1919,7 +1918,6 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.Replicas).To(Equal(ptrTo(int32(1))))
 				g.Expect(sts.Spec.ServiceName).To(Equal(env.Name))
 				g.Expect(sts.Spec.Selector.MatchLabels).To(HaveKeyWithValue(devEnvironmentLabelKey, env.Name))
-				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(HaveKeyWithValue(computeNodePoolLabelKey, computeNodePoolValue))
 				g.Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
 				c := sts.Spec.Template.Spec.Containers[0]
 				g.Expect(c.Image).To(Equal(testDevImage))

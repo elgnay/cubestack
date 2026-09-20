@@ -258,11 +258,6 @@ const (
 	// stsSpecHash) change when it does.
 	sshKeysRevisionAnnotationKey = "ai.cubestack.io/ssh-keys-revision"
 
-	// compute node pool labels: development pods are pinned to the compute
-	// pool, isolated from the inference pool (design §8.1).
-	computeNodePoolLabelKey = "cubestack.io/node-pool"
-	computeNodePoolValue    = "compute"
-
 	sshEd25519Algorithm = "ssh-ed25519"
 	sshHostKeyPEMType   = "OPENSSH PRIVATE KEY"
 
@@ -1449,8 +1444,7 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 
 	podSpec := corev1.PodSpec{
-		NodeSelector: map[string]string{computeNodePoolLabelKey: computeNodePoolValue},
-		Containers:   []corev1.Container{container},
+		Containers: []corev1.Container{container},
 	}
 	if env.Spec.Storage != nil {
 		// The workspace claim is the platform's storage for this environment; a
