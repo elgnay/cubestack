@@ -227,7 +227,7 @@ const (
 	// (::resolveMountPath).
 	homeEnv = "HOME"
 
-	// Jupyter token: the managed Secret <env>-auth holds the random token under
+	// Jupyter token: the managed Secret <env>-jupyter-token holds the random token under
 	// the data key jupyterTokenKey, and the workload reads it through the
 	// JUPYTER_TOKEN env var (design §6.3). The token guards the web path; only
 	// the owner (via the Secret) and the pod know it.
@@ -407,7 +407,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		desired.Status.SSHKeysSecret = keysSecret
+		desired.Status.SSHClientKeySecret = keysSecret
 		// Carry the key revision to applyStatefulSet below, like the jupyter
 		// token: the host key is a subPath mount, so only a roll picks up changed
 		// Secret bytes. env is re-fetched every reconcile and only its status is
@@ -419,7 +419,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		env.Annotations[sshKeysRevisionAnnotationKey] = digest
 	} else {
-		desired.Status.SSHKeysSecret = nil
+		desired.Status.SSHClientKeySecret = nil
 	}
 
 	// 2b. Jupyter token secret: a random per-environment token guarding the web
@@ -427,13 +427,13 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// reconciled before the core resources so a pod never references a missing
 	// Secret.
 	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
-		digest, err := r.reconcileJupyterAuthSecret(ctx, &env)
+		digest, err := r.reconcileJupyterTokenSecret(ctx, &env)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
 		// Named through the same helper the workload's SecretKeyRef uses, so the
 		// status and the injected JUPYTER_TOKEN cannot point at different Secrets.
-		desired.Status.JupyterAuthSecret = &corev1.SecretReference{Name: authSecretName(&env), Namespace: env.Namespace}
+		desired.Status.JupyterTokenSecret = &corev1.SecretReference{Name: jupyterTokenSecretName(&env), Namespace: env.Namespace}
 		// Carry the token revision to applyStatefulSet below. env is re-fetched
 		// every reconcile and only its status is persisted, so this in-memory
 		// annotation never lands on the DevEnvironment object; it only drives the
@@ -443,7 +443,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		}
 		env.Annotations[jupyterTokenRevisionAnnotationKey] = digest
 	} else {
-		desired.Status.JupyterAuthSecret = nil
+		desired.Status.JupyterTokenSecret = nil
 	}
 
 	// 3. Core resources.
@@ -529,11 +529,11 @@ func (r *DevEnvironmentReconciler) cleanup(ctx context.Context, env *aiv1alpha1.
 		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&networkingv1.NetworkPolicy{ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshHostKeySecretName(env), Namespace: env.Namespace}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshAuthorizedKeysSecretName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshClientKeySecretName(env), Namespace: env.Namespace}},
 		// The pre-split bundled Secret: nothing creates it any more, but an
 		// environment created before the split still has one.
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: sshLegacySecretName(env), Namespace: env.Namespace}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: authSecretName(env), Namespace: env.Namespace}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: jupyterTokenSecretName(env), Namespace: env.Namespace}},
 	} {
 		if err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj); err != nil {
 			if apierrors.IsNotFound(err) {
@@ -734,7 +734,7 @@ func (r *DevEnvironmentReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&networkingv1.NetworkPolicy{}).
 		Owns(&corev1.Secret{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnv)).
-		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvKeysSecret)).
+		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDevEnvAuthorizedKeysSecret)).
 		Watches(&corev1.Service{}, handler.EnqueueRequestsFromMapFunc(r.enqueueForDataplaneService)).
 		Watches(&aiv1alpha1.DevEnvironment{}, handler.EnqueueRequestsFromMapFunc(r.enqueueAllDevEnvironments))
 	// Each Gateway API kind is probed for itself before it is watched: they
@@ -799,14 +799,15 @@ func (r *DevEnvironmentReconciler) enqueueAllDevEnvironments(ctx context.Context
 	return reqs
 }
 
-// enqueueForDevEnvKeysSecret maps a Secret to the DevEnvironments that reference
-// it as their authorized_keys source (spec.ssh.keysSecret), so editing it
-// re-reconciles them: the pod's volume is an ordinary Secret mount and kubelet
-// delivers the new bytes on its own, but the reconcile is what re-checks the
-// reference (the Secret may have been undelegated or had the entry removed since)
-// and reports it. The reference is same-namespace (corev1.SecretKeySelector), so
-// Secrets in other namespaces short-circuit cheaply.
-func (r *DevEnvironmentReconciler) enqueueForDevEnvKeysSecret(ctx context.Context, obj client.Object) []reconcile.Request {
+// enqueueForDevEnvAuthorizedKeysSecret maps a Secret to the DevEnvironments that
+// reference it as their authorized_keys source (spec.ssh.authorizedKeysSecret),
+// so editing it re-reconciles them: the pod's volume is an ordinary Secret mount
+// and kubelet delivers the new bytes on its own, but the reconcile is what
+// re-checks the reference (the Secret may have been undelegated or had the entry
+// removed since) and reports it. The reference is same-namespace
+// (corev1.SecretKeySelector), so Secrets in other namespaces short-circuit
+// cheaply.
+func (r *DevEnvironmentReconciler) enqueueForDevEnvAuthorizedKeysSecret(ctx context.Context, obj client.Object) []reconcile.Request {
 	secret := obj.(*corev1.Secret)
 	list := &aiv1alpha1.DevEnvironmentList{}
 	if err := r.List(ctx, list, client.InNamespace(secret.Namespace)); err != nil {
@@ -815,7 +816,7 @@ func (r *DevEnvironmentReconciler) enqueueForDevEnvKeysSecret(ctx context.Contex
 	reqs := make([]reconcile.Request, 0)
 	for i := range list.Items {
 		env := &list.Items[i]
-		if env.Spec.SSH == nil || env.Spec.SSH.KeysSecret == nil || env.Spec.SSH.KeysSecret.Name != secret.Name {
+		if env.Spec.SSH == nil || env.Spec.SSH.AuthorizedKeysSecret == nil || env.Spec.SSH.AuthorizedKeysSecret.Name != secret.Name {
 			continue
 		}
 		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: env.Namespace, Name: env.Name}})
@@ -969,14 +970,14 @@ func sshUserKeysRef(env *aiv1alpha1.DevEnvironment) *corev1.SecretKeySelector {
 	if env.Spec.SSH == nil {
 		return nil
 	}
-	return env.Spec.SSH.KeysSecret
+	return env.Spec.SSH.AuthorizedKeysSecret
 }
 
 // sshAuthorizedKeysSource is the name and data key of the Secret the pod mounts
 // as /run/ssh/authorized_keys: the user's delegated Secret when the spec names
 // one, at the data key its selector names, else the controller-generated
-// <env>-ssh-authorized-keys at sshClientPubKeyKey — the login keypair's public
-// half, which is the key that actually logs in.
+// <env>-ssh-client-key at sshClientPubKeyKey — the client keypair's public half,
+// which is the key that actually logs in.
 //
 // The delegated key is always non-empty: the CRD requires the field and rejects
 // an empty one, so there is nothing here to fall back to — substituting an entry
@@ -988,7 +989,7 @@ func sshAuthorizedKeysSource(env *aiv1alpha1.DevEnvironment) (name, key string) 
 	if ks := sshUserKeysRef(env); ks != nil {
 		return ks.Name, ks.Key
 	}
-	return sshAuthorizedKeysSecretName(env), sshClientPubKeyKey
+	return sshClientKeySecretName(env), sshClientPubKeyKey
 }
 
 // sshMountKey renders the ssh mount contract for the pod-template hash: the
@@ -1152,7 +1153,7 @@ func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Conta
 
 // jupyterTokenPodAnnotations returns the pod-template annotations derived from
 // env for a jupyter environment: a non-sensitive sha256 digest of the managed
-// token carried from reconcileJupyterAuthSecret via env.Annotations (in-memory
+// token carried from reconcileJupyterTokenSecret via env.Annotations (in-memory
 // only, never persisted on the DevEnvironment). Because JUPYTER_TOKEN is read
 // from the Secret at container start, putting the digest on the pod template
 // changes the template (and stsSpecHash) when the token is created or refilled,
@@ -1393,7 +1394,7 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	}
 	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
 		// JUPYTER_TOKEN is controller-managed: the random token lives in the
-		// <env>-auth Secret surfaced to the owner, so a user-supplied entry is
+		// <env>-jupyter-token Secret surfaced to the owner, so a user-supplied entry is
 		// dropped and the injected secretKeyRef always wins (a user override
 		// would bypass the token the owner is told about).
 		envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == jupyterTokenEnv })
@@ -1401,7 +1402,7 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 			Name: jupyterTokenEnv,
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: authSecretName(env)},
+					LocalObjectReference: corev1.LocalObjectReference{Name: jupyterTokenSecretName(env)},
 					Key:                  jupyterTokenKey,
 				},
 			},
@@ -1756,13 +1757,14 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 }
 
 // reconcileSSHSecrets ensures both halves of the environment's ssh material
-// exist and returns the status ref alongside the host key's digest.
+// exist and returns the status ref alongside the host key's digest. The ref is
+// nil when the spec delegates: status names only a Secret the controller minted.
 //
 // The material is two Secrets because it is two things with different owners:
 // the host identity, which is the platform's and never leaves the cluster, and
-// the authorized keys, which are the user's credential. When the spec names a
-// delegated keys Secret the controller mints the host key only and that Secret
-// is mounted as-is; otherwise it mints a login keypair too, so the environment's
+// the client key, which is the user's credential. When the spec names a delegated
+// authorized-keys Secret the controller mints the host key only and that Secret
+// is mounted as-is; otherwise it mints a client keypair too, so the environment's
 // owner has a key that actually logs in (design §6.3).
 //
 // The user's Secret is read first, before anything is created: a reference that
@@ -1775,7 +1777,8 @@ func stsSpecHash(env *aiv1alpha1.DevEnvironment) string {
 // keys are a directory mount kubelet keeps in sync, so rotating them deliberately
 // does not roll anything.
 func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env *aiv1alpha1.DevEnvironment) (*corev1.SecretReference, string, error) {
-	if sshUserKeysRef(env) != nil {
+	userKeys := sshUserKeysRef(env)
+	if userKeys != nil {
 		if err := r.checkUserAuthorizedKeys(ctx, env); err != nil {
 			return nil, "", err
 		}
@@ -1784,16 +1787,18 @@ func (r *DevEnvironmentReconciler) reconcileSSHSecrets(ctx context.Context, env 
 	if err != nil {
 		return nil, "", err
 	}
-	if sshUserKeysRef(env) == nil {
-		if err := r.reconcileSSHAuthorizedKeysSecret(ctx, env); err != nil {
-			return nil, "", err
-		}
+	if userKeys != nil {
+		// The user's own Secret. Its name is already in the spec, and it holds the
+		// public keys that authorize the login rather than a client key, so there is
+		// no generated Secret for status to name.
+		return nil, sshHostKeyDigest(hostKey), nil
 	}
-	// Only the Secret is recorded: status names it, and the field's own doc says
-	// which entries either case puts in it. Going through the same source the pod
-	// does is what keeps the two from naming different Secrets.
-	name, _ := sshAuthorizedKeysSource(env)
-	ref := &corev1.SecretReference{Name: name, Namespace: env.Namespace}
+	if err := r.reconcileSSHClientKeySecret(ctx, env); err != nil {
+		return nil, "", err
+	}
+	// Named through the same helper the Secret is created under, so status and the
+	// workload cannot point at different Secrets.
+	ref := &corev1.SecretReference{Name: sshClientKeySecretName(env), Namespace: env.Namespace}
 	return ref, sshHostKeyDigest(hostKey), nil
 }
 
@@ -1853,7 +1858,7 @@ func (r *DevEnvironmentReconciler) reconcileSSHHostKeySecret(ctx context.Context
 	}
 	// A managed Secret can exist without carrying any data — created by hand, or
 	// emptied by hand — and the repair below writes into its map, so an empty map
-	// has to be in place first. reconcileJupyterAuthSecret needs the same guard
+	// has to be in place first. reconcileJupyterTokenSecret needs the same guard
 	// for its token.
 	if secret.Data == nil {
 		secret.Data = map[string][]byte{}
@@ -1898,20 +1903,20 @@ func (r *DevEnvironmentReconciler) legacyHostKeySecret(ctx context.Context, env 
 	return legacy, nil
 }
 
-// reconcileSSHAuthorizedKeysSecret ensures the generated
-// <env>-ssh-authorized-keys Secret carries a login keypair: the private half the
-// environment's owner retrieves from status.sshKeysSecret, and the public half
-// the workload mounts as authorized_keys. Like the host key the keypair is minted
-// once and kept, so a key its owner has already downloaded keeps working; only
-// one sshd could not read sends it back to generation.
+// reconcileSSHClientKeySecret ensures the generated <env>-ssh-client-key Secret
+// carries a client keypair: the private half the environment's owner retrieves
+// from status.sshClientKeySecret, and the public half the workload mounts as
+// authorized_keys. Like the host key the keypair is minted once and kept, so a
+// key its owner has already downloaded keeps working; only one sshd could not
+// read sends it back to generation.
 //
 // The public half is mounted from here rather than from a copy of it under
 // another name, so the entry the user reads and the entry that authorizes them
 // cannot drift apart, and there is no second entry that looks editable and is
 // not. A change here needs no revision: the pod's volume is an ordinary Secret
 // mount, which kubelet updates in place.
-func (r *DevEnvironmentReconciler) reconcileSSHAuthorizedKeysSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
-	name := sshAuthorizedKeysSecretName(env)
+func (r *DevEnvironmentReconciler) reconcileSSHClientKeySecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
+	name := sshClientKeySecretName(env)
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
 	if apierrors.IsNotFound(err) {
@@ -1981,11 +1986,13 @@ func sshHostKeySecretName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-ssh-host-key"
 }
 
-// sshAuthorizedKeysSecretName is the managed Secret <env>-ssh-authorized-keys,
-// created only when the environment supplies no keys of its own: it carries the
-// generated login keypair and the authorized_keys entry the workload mounts.
-func sshAuthorizedKeysSecretName(env *aiv1alpha1.DevEnvironment) string {
-	return env.Name + "-ssh-authorized-keys"
+// sshClientKeySecretName is the managed Secret <env>-ssh-client-key, created only
+// when the environment supplies no keys of its own: it carries the generated
+// client keypair and the authorized_keys entry the workload mounts. It is named
+// for the key it holds rather than for the mount, which is the job
+// spec.ssh.authorizedKeysSecret names in the delegated case.
+func sshClientKeySecretName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + "-ssh-client-key"
 }
 
 // sshLegacySecretName is the pre-split Secret <env>-ssh-keys, which bundled the
@@ -1996,13 +2003,13 @@ func sshLegacySecretName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + "-ssh-keys"
 }
 
-// authSecretName is the name of the managed Jupyter token Secret <env>-auth.
-func authSecretName(env *aiv1alpha1.DevEnvironment) string {
-	return env.Name + "-auth"
+// jupyterTokenSecretName is the name of the managed Jupyter token Secret <env>-jupyter-token.
+func jupyterTokenSecretName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + "-jupyter-token"
 }
 
-// reconcileJupyterAuthSecret creates or updates the managed Jupyter token Secret
-// <env>-auth (design §6.3): a random token generated once under the data key
+// reconcileJupyterTokenSecret creates or updates the managed Jupyter token Secret
+// <env>-jupyter-token (design §6.3): a random token generated once under the data key
 // jupyterTokenKey. The token is never rotated — an existing non-empty token is
 // kept so the surfaced token stays valid — but a missing or emptied key is
 // refilled so the workload's JUPYTER_TOKEN env var always resolves. The Secret
@@ -2012,8 +2019,8 @@ func authSecretName(env *aiv1alpha1.DevEnvironment) string {
 // or already present) so the caller can record a token revision on the pod
 // template: JUPYTER_TOKEN is read at container start, so a refill must roll the
 // workload for the new token to take effect (see stsSpecHash).
-func (r *DevEnvironmentReconciler) reconcileJupyterAuthSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (string, error) {
-	name := authSecretName(env)
+func (r *DevEnvironmentReconciler) reconcileJupyterTokenSecret(ctx context.Context, env *aiv1alpha1.DevEnvironment) (string, error) {
+	name := jupyterTokenSecretName(env)
 	secret := &corev1.Secret{}
 	err := r.Get(ctx, types.NamespacedName{Namespace: env.Namespace, Name: name}, secret)
 	if apierrors.IsNotFound(err) {

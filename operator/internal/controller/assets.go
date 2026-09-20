@@ -76,7 +76,7 @@ const (
 
 	// The generated login keypair, written only into the controller-generated
 	// authorized-keys Secret: the private key its owner can retrieve through
-	// status.sshKeysSecret, and the public half the workload mounts. Only
+	// status.sshClientKeySecret, and the public half the workload mounts. Only
 	// sshClientPubKeyKey is ever mounted, so the private key never reaches the
 	// container.
 	sshClientKeyKey    = "id_ed25519"

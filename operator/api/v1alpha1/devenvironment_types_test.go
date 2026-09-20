@@ -79,7 +79,7 @@ func validDevEnvironment(name string) *DevEnvironment {
 			},
 			SSH: &SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: "dev-alice-ssh-keys"},
 					Key:                  "keys",
 				},
@@ -259,19 +259,19 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-runtime-user-long",
 				func(s *DevEnvironmentSpec) { s.Runtime.User = strings.Repeat("a", 33) },
 				"spec.runtime.user"),
-			Entry("empty keysSecret data key",
+			Entry("empty authorizedKeysSecret data key",
 				"de-invalid-ssh-key-empty",
 				func(s *DevEnvironmentSpec) {
-					s.SSH = &SSHSpec{Enabled: true, KeysSecret: &corev1.SecretKeySelector{
+					s.SSH = &SSHSpec{Enabled: true, AuthorizedKeysSecret: &corev1.SecretKeySelector{
 						LocalObjectReference: corev1.LocalObjectReference{Name: "dev-alice-ssh-keys"},
 					}}
 				},
-				"spec.ssh.keysSecret"),
+				"spec.ssh.authorizedKeysSecret"),
 		)
 
 		// Required fields are enforced as "the key must be present", so an empty
 		// string is still accepted by the schema — except where a field carries its
-		// own non-empty rule, as spec.ssh.keysSecret.key does above. These cases are
+		// own non-empty rule, as spec.ssh.authorizedKeysSecret.key does above. These cases are
 		// created as raw objects to omit the keys entirely.
 		DescribeTable("rejects objects with missing required fields",
 			func(name string, mutate func(map[string]any), wantMessage string) {

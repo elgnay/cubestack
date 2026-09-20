@@ -1433,7 +1433,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				{
 					Name: sshAuthorizedKeysVolumeName,
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-						SecretName:  sshAuthorizedKeysSecretName(env),
+						SecretName:  sshClientKeySecretName(env),
 						DefaultMode: ptrTo(int32(0o644)),
 						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
 					}},
@@ -1447,7 +1447,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("mounts the referenced keys Secret under the selector's data key", func() {
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
-				e.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true, KeysSecret: &corev1.SecretKeySelector{
+				e.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true, AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: testUserKeysSecret},
 					Key:                  testUserKeysKey,
 				}}
@@ -1493,7 +1493,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				{
 					Name: sshAuthorizedKeysVolumeName,
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-						SecretName:  sshAuthorizedKeysSecretName(env),
+						SecretName:  sshClientKeySecretName(env),
 						DefaultMode: ptrTo(int32(0o644)),
 						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
 					}},
@@ -1530,7 +1530,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(c.Env).To(Equal([]corev1.EnvVar{
 				{Name: "KEEP", Value: "me"},
 				{Name: jupyterTokenEnv, ValueFrom: &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: authSecretName(env)},
+					LocalObjectReference: corev1.LocalObjectReference{Name: jupyterTokenSecretName(env)},
 					Key:                  jupyterTokenKey,
 				}}},
 				{Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env)},
@@ -2391,10 +2391,10 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				// status names the authorized-keys Secret: the one carrying the key
-				// its owner logs in with, not the platform's host identity.
-				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretReference{
-					Name:      sshAuthorizedKeysSecretName(env),
+				// status names the generated client key Secret: the one carrying
+				// the key its owner logs in with, not the platform's host identity.
+				g.Expect(got.Status.SSHClientKeySecret).To(Equal(&corev1.SecretReference{
+					Name:      sshClientKeySecretName(env),
 					Namespace: testNamespace,
 				}))
 
@@ -2409,7 +2409,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(host.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
 
 				login := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), login)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), login)).To(Succeed())
 				g.Expect(sshKeyPairMatches(login.Data[sshClientKeyKey], login.Data[sshClientPubKeyKey])).To(BeTrue())
 				// The public half is what the mount takes, so a login works without
 				// the controller keeping a second copy of it under another name — and
@@ -2439,7 +2439,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
 					Key:                  testUserKeysKey,
 				},
@@ -2450,10 +2450,10 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).To(Equal(&corev1.SecretReference{
-					Name:      keys.Name,
-					Namespace: testNamespace,
-				}))
+				// Status records nothing: the user's own Secret is already named in
+				// the spec, and it holds public keys rather than a generated client
+				// key, so there is none for status to point at.
+				g.Expect(got.Status.SSHClientKeySecret).To(BeNil())
 
 				host := &corev1.Secret{}
 				g.Expect(k8sClient.Get(ctx, envKey(sshHostKeySecretName(env)), host)).To(Succeed())
@@ -2461,7 +2461,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 				// The user supplied the keys, so there is nothing else to mint.
 				generated := &corev1.Secret{}
-				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), generated))).To(BeTrue())
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), generated))).To(BeTrue())
 
 				// And their Secret is left exactly as it was: the controller mounts
 				// it, it does not copy out of it.
@@ -2492,7 +2492,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
 					Key:                  testUserKeysKey,
 				},
@@ -2580,7 +2580,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: first.Name},
 					Key:                  testUserKeysKey,
 				},
@@ -2609,7 +2609,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			fresh := &aiv1alpha1.DevEnvironment{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), fresh)).To(Succeed())
-			fresh.Spec.SSH.KeysSecret.Name = second.Name
+			fresh.Spec.SSH.AuthorizedKeysSecret.Name = second.Name
 			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
 
 			Eventually(func(g Gomega) {
@@ -2701,14 +2701,14 @@ var _ = Describe("DevEnvironment controller", func() {
 			// downloaded would stop logging in — and with that keypair alone.
 			emptied := &corev1.Secret{}
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), emptied)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), emptied)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 			emptied.Data = nil
 			Expect(k8sClient.Update(ctx, emptied)).To(Succeed())
 
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), s)).To(Succeed())
 				g.Expect(sshKeyPairMatches(s.Data[sshClientKeyKey], s.Data[sshClientPubKeyKey])).To(BeTrue())
 				g.Expect(s.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
 			}, "15s", "200ms").Should(Succeed())
@@ -2725,7 +2725,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			keys := &corev1.Secret{}
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), keys)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), keys)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 
 			keys.Data[sshAuthorizedKeysKey] = append([]byte(nil), keys.Data[sshClientPubKeyKey]...)
@@ -2733,7 +2733,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(env)), s)).To(Succeed())
 				g.Expect(s.Data).NotTo(HaveKey(sshAuthorizedKeysKey))
 				g.Expect(sshKeyPairMatches(s.Data[sshClientKeyKey], s.Data[sshClientPubKeyKey])).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
@@ -2755,7 +2755,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: leaked.Name},
 					Key:                  testUserKeysKey,
 				},
@@ -2769,8 +2769,8 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
-				for _, name := range []string{sshHostKeySecretName(env), sshAuthorizedKeysSecretName(env)} {
+				g.Expect(got.Status.SSHClientKeySecret).To(BeNil())
+				for _, name := range []string{sshHostKeySecretName(env), sshClientKeySecretName(env)} {
 					s := &corev1.Secret{}
 					g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(name), s))).To(BeTrue())
 				}
@@ -2797,7 +2797,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: wrong.Name},
 					Key:                  testUserKeysKey,
 				},
@@ -2808,7 +2808,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
+				g.Expect(got.Status.SSHClientKeySecret).To(BeNil())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -2824,7 +2824,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			generated := &corev1.Secret{}
 			Eventually(func(g Gomega) {
-				g.Expect(k8sClient.Get(ctx, envKey(sshAuthorizedKeysSecretName(peer)), generated)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(sshClientKeySecretName(peer)), generated)).To(Succeed())
 			}, "15s", "200ms").Should(Succeed())
 			Expect(generated.Labels).NotTo(HaveKey(devEnvSSHKeysDelegatedLabel))
 
@@ -2832,8 +2832,8 @@ var _ = Describe("DevEnvironment controller", func() {
 			thief.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 			thief.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
-					LocalObjectReference: corev1.LocalObjectReference{Name: sshAuthorizedKeysSecretName(peer)},
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: sshClientKeySecretName(peer)},
 					Key:                  sshClientKeyKey,
 				},
 			}
@@ -2843,11 +2843,11 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(thief.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).To(BeNil())
+				g.Expect(got.Status.SSHClientKeySecret).To(BeNil())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		It("follows spec.ssh.keysSecret as it is added and removed", func() {
+		It("follows spec.ssh.authorizedKeysSecret as it is added and removed", func() {
 			keys := &corev1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:      "dev-alice-switch-keys",
@@ -2864,41 +2864,46 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
+			// refName is the Secret status records, or "" when it records none.
 			refName := func(g Gomega) string {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.SSHKeysSecret).NotTo(BeNil())
-				return got.Status.SSHKeysSecret.Name
+				if got.Status.SSHClientKeySecret == nil {
+					return ""
+				}
+				return got.Status.SSHClientKeySecret.Name
 			}
 
-			// Case 1 to start: no keysSecret, so the controller generates both.
+			// Case 1 to start: no delegated keys, so the controller generates both.
 			Eventually(func(g Gomega) {
-				g.Expect(refName(g)).To(Equal(sshAuthorizedKeysSecretName(env)))
+				g.Expect(refName(g)).To(Equal(sshClientKeySecretName(env)))
 			}, "15s", "200ms").Should(Succeed())
 
-			// Add the reference: the status ref — and so the mount — follows it.
+			// Add the reference: there is no longer a generated key, so status
+			// records none. The mount still follows the spec; the name of the Secret
+			// it takes is the one the user wrote.
 			spec := &aiv1alpha1.DevEnvironment{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), spec)).To(Succeed())
 			spec.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
 					Key:                  testUserKeysKey,
 				},
 			}
 			Expect(k8sClient.Update(ctx, spec)).To(Succeed())
 			Eventually(func(g Gomega) {
-				g.Expect(refName(g)).To(Equal(keys.Name))
+				g.Expect(refName(g)).To(BeEmpty())
 			}, "15s", "200ms").Should(Succeed())
 
 			// Remove it again: the environment falls back to generated keys, and
 			// because the generated Secret from before was left in place it is
 			// reused — so a login key already downloaded keeps working.
 			Expect(k8sClient.Get(ctx, envKey(env.Name), spec)).To(Succeed())
-			spec.Spec.SSH.KeysSecret = nil
+			spec.Spec.SSH.AuthorizedKeysSecret = nil
 			Expect(k8sClient.Update(ctx, spec)).To(Succeed())
 			Eventually(func(g Gomega) {
-				g.Expect(refName(g)).To(Equal(sshAuthorizedKeysSecretName(env)))
+				g.Expect(refName(g)).To(Equal(sshClientKeySecretName(env)))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3009,14 +3014,14 @@ var _ = Describe("DevEnvironment controller", func() {
 	})
 
 	Context("jupyter token", func() {
-		It("creates the <env>-auth Secret and injects JUPYTER_TOKEN into the workload", func() {
+		It("creates the <env>-jupyter-token Secret and injects JUPYTER_TOKEN into the workload", func() {
 			env := validDevEnvironment("de-token")
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), s)).To(Succeed())
 				g.Expect(string(s.Data[jupyterTokenKey])).To(HaveLen(32))
 				g.Expect(metav1.GetControllerOf(s).UID).To(Equal(env.UID))
 				g.Expect(s.Labels).To(HaveKeyWithValue(devEnvironmentLabelKey, env.Name))
@@ -3025,8 +3030,8 @@ var _ = Describe("DevEnvironment controller", func() {
 				// the API instead of from a naming convention.
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.JupyterAuthSecret).To(Equal(&corev1.SecretReference{
-					Name:      authSecretName(env),
+				g.Expect(got.Status.JupyterTokenSecret).To(Equal(&corev1.SecretReference{
+					Name:      jupyterTokenSecretName(env),
 					Namespace: testNamespace,
 				}))
 
@@ -3040,7 +3045,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				}
 				g.Expect(injected).NotTo(BeNil())
 				g.Expect(injected.ValueFrom).NotTo(BeNil())
-				g.Expect(injected.ValueFrom.SecretKeyRef.Name).To(Equal(authSecretName(env)))
+				g.Expect(injected.ValueFrom.SecretKeyRef.Name).To(Equal(jupyterTokenSecretName(env)))
 				g.Expect(injected.ValueFrom.SecretKeyRef.Key).To(Equal(jupyterTokenKey))
 			}, "15s", "200ms").Should(Succeed())
 		})
@@ -3053,7 +3058,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			var original string
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), s)).To(Succeed())
 				original = string(s.Data[jupyterTokenKey])
 				g.Expect(original).To(HaveLen(32))
 			}, "15s", "200ms").Should(Succeed())
@@ -3066,7 +3071,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
 			Consistently(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), s)).To(Succeed())
 				g.Expect(string(s.Data[jupyterTokenKey])).To(Equal(original))
 			}, "2s", "200ms").Should(Succeed())
 
@@ -3087,13 +3092,13 @@ var _ = Describe("DevEnvironment controller", func() {
 			// An emptied key is refilled with a fresh token rather than left
 			// empty, so the workload's JUPYTER_TOKEN env always resolves.
 			s := &corev1.Secret{}
-			Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+			Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), s)).To(Succeed())
 			s.Data[jupyterTokenKey] = []byte("")
 			Expect(k8sClient.Update(ctx, s)).To(Succeed())
 
 			Eventually(func(g Gomega) {
 				freshSecret := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), freshSecret)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), freshSecret)).To(Succeed())
 				val := string(freshSecret.Data[jupyterTokenKey])
 				g.Expect(val).To(HaveLen(32))
 				g.Expect(val).NotTo(Equal(original))
@@ -3107,7 +3112,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				gotSTS := &appsv1.StatefulSet{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), gotSTS)).To(Succeed())
 				freshSecret := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), freshSecret)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), freshSecret)).To(Succeed())
 				g.Expect(gotSTS.Spec.Template.Annotations[jupyterTokenRevisionAnnotationKey]).To(Equal(jupyterTokenDigest(string(freshSecret.Data[jupyterTokenKey]))))
 				g.Expect(gotSTS.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(hashBefore))
 			}, "15s", "200ms").Should(Succeed())
@@ -3127,7 +3132,7 @@ var _ = Describe("DevEnvironment controller", func() {
 						g.Expect(v.Name).NotTo(Equal(jupyterTokenEnv))
 					}
 				}
-				err := k8sClient.Get(ctx, envKey(authSecretName(env)), &corev1.Secret{})
+				err := k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), &corev1.Secret{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 
 				// The status field is jupyter-only and stays unset here, rather
@@ -3135,7 +3140,7 @@ var _ = Describe("DevEnvironment controller", func() {
 				// above proves the reconcile got past the branch that would set it.
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Status.JupyterAuthSecret).To(BeNil())
+				g.Expect(got.Status.JupyterTokenSecret).To(BeNil())
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3145,7 +3150,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			Eventually(func(g Gomega) {
 				s := &corev1.Secret{}
-				g.Expect(k8sClient.Get(ctx, envKey(authSecretName(env)), s)).To(Succeed())
+				g.Expect(k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), s)).To(Succeed())
 				g.Expect(s.Data[jupyterTokenKey]).NotTo(BeEmpty())
 			}, "15s", "200ms").Should(Succeed())
 
@@ -3154,7 +3159,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				err := k8sClient.Get(ctx, envKey(env.Name), &aiv1alpha1.DevEnvironment{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
-				err = k8sClient.Get(ctx, envKey(authSecretName(env)), &corev1.Secret{})
+				err = k8sClient.Get(ctx, envKey(jupyterTokenSecretName(env)), &corev1.Secret{})
 				g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
@@ -3461,7 +3466,7 @@ var _ = Describe("DevEnvironment controller", func() {
 			env := validDevEnvironment("de-routes")
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{
 				Enabled: true,
-				KeysSecret: &corev1.SecretKeySelector{
+				AuthorizedKeysSecret: &corev1.SecretKeySelector{
 					LocalObjectReference: corev1.LocalObjectReference{Name: keys.Name},
 					Key:                  testUserKeysKey,
 				},
