@@ -9,10 +9,6 @@ on:
 
 permissions: {}
 
-concurrency:
-  group: ci-images-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   changes:
     permissions:
@@ -43,6 +39,13 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # Scoped to the job, not the workflow. A run whose commit does not change
+    # images/ skips this job, and a skipped job never enters the group — so it
+    # cannot cancel the publish of the images/ commit before it. At workflow scope
+    # it could, and that commit's image would be the one that never got published.
+    concurrency:
+      group: ci-images-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -68,26 +71,27 @@ jobs:
         # the assertions the platform depends on.
         run: make -C images smoke
       - name: Build and push the images
-        env:
-          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -euo pipefail
           TAG="$(git rev-parse --short HEAD)"
 
           # PUSH_LATEST=0: the mutable tag is moved below, and only if this run's
-          # commit is still the head of main.
+          # image is still the newest image content on main.
           make -C images push PUSH_LATEST=0 TAG="${TAG}"
 
-          # An older run can finish after a newer main commit; putting its image on
-          # `latest` would mislabel which commit is newest.
-          CURRENT_MAIN="$(
-            curl -fsSL \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/main" \
-              | jq -r .commit.sha
-          )"
-          if [ "${CURRENT_MAIN}" != "${GITHUB_SHA}" ]; then
-            echo "Skipping 'latest': ${GITHUB_SHA} is no longer the head of main (current: ${CURRENT_MAIN})"
+          # "Is this commit still the head of main" is the wrong question. A later
+          # commit that touches nothing under images/ does not make any image
+          # newer, and skipping on it would strand :latest on an older build until
+          # some future images/ change happened along to move it. The question is
+          # whether main's images/ tree still matches this commit's: if it does,
+          # this image is the newest there is and :latest is its to take.
+          #
+          # Fetched rather than asked of the API so the answer is the trees
+          # themselves, with no cap on how many changed files a comparison will
+          # report. The repository is public, so this needs no credentials.
+          git fetch --no-tags --depth=1 origin main
+          if ! git diff --quiet "${GITHUB_SHA}" FETCH_HEAD -- images/; then
+            echo "Skipping 'latest': a later commit changed images/, whose own run owns the tag"
             exit 0
           fi
 
