@@ -135,8 +135,7 @@ if [ -z "${METALLB_READY}" ]; then
   "${KUBECTL}" --context "${CTX}" rollout status deployment/controller -n "${NS}" --timeout=300s
   "${KUBECTL}" --context "${CTX}" rollout status daemonset/speaker -n "${NS}" --timeout=300s
 
-  # The webhook has to answer before an IPAddressPool can be admitted; the rollout
-  # above covers the pods, not the Service behind the webhook.
+  # The common case. Not the whole of it — see the probe below.
   "${KUBECTL}" --context "${CTX}" wait --for=condition=Ready pod -n "${NS}" \
     -l app=metallb,component=controller --timeout=120s
 fi
@@ -146,7 +145,7 @@ fi
 # classic silent failure: the address is allocated and assigned to the Service's
 # status, so `kubectl get svc` looks correct, but nothing ever advertises it and
 # every connection to it times out.
-"${KUBECTL}" --context "${CTX}" apply -f - <<YAML
+POOL_AND_ADVERTISEMENT="$(cat <<YAML
 apiVersion: metallb.io/v1beta1
 kind: IPAddressPool
 metadata:
@@ -165,5 +164,34 @@ spec:
   ipAddressPools:
     - cubestack-e2e
 YAML
+)"
+
+# A Ready controller pod is not a webhook that answers. The webhook is reached
+# through a Service, and until its endpoints are published and the node's rules for
+# them are programmed, the ClusterIP is rejected — which reaches the API server as
+# "connection refused", failing the apply of an object nothing is wrong with. That
+# trails readiness by seconds and has no fixed length, so ask the webhook directly,
+# until it answers. Server-side dry run is that question with nothing to create, so
+# retrying it cannot leave a half-applied pool behind and the apply below stays a
+# single call whose failure means what it says.
+POOL_WEBHOOK_ERROR=""
+for attempt in $(seq 1 15); do
+  if POOL_WEBHOOK_ERROR="$(printf '%s\n' "${POOL_AND_ADVERTISEMENT}" |
+      "${KUBECTL}" --context "${CTX}" apply --dry-run=server -f - 2>&1 >/dev/null)"; then
+    # Cleared explicitly: a dry run that succeeds but writes a warning to stderr
+    # would otherwise read as the failure below.
+    POOL_WEBHOOK_ERROR=""
+    break
+  fi
+  echo "MetalLB's webhook is not answering yet (attempt ${attempt}/15); retrying"
+  sleep 2
+done
+[ -z "${POOL_WEBHOOK_ERROR}" ] || {
+  echo "MetalLB's webhook did not admit an IPAddressPool after 15 attempts:" >&2
+  echo "${POOL_WEBHOOK_ERROR}" >&2
+  exit 1
+}
+
+printf '%s\n' "${POOL_AND_ADVERTISEMENT}" | "${KUBECTL}" --context "${CTX}" apply -f -
 
 echo "metallb installed in ${NS}; pool ${POOL_RANGE}"
