@@ -2,9 +2,10 @@
 # sshd, published through the platform Gateway.
 #
 # __DEV_ENV_IMAGE__ is substituted by `make helm-e2e-devenv-verify` with the
-# image this run built out of images/ — spec.image is required and has no
-# default, and the reference has to be one the kind nodes hold locally (the
-# platform registry does not resolve on a runner).
+# published jupyter-minimal:latest reference. The pod pulls it from the platform
+# registry itself — nothing pre-loads it on the node — so the reference is the
+# one a deployment would write, and reaching the registry is part of what the
+# test asserts.
 #
 # The two runtime settings are not decoration, they are the documented contract
 # for this image (images/README.md): 'jovyan' is the docker-stacks account, which

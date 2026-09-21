@@ -144,13 +144,29 @@ ENVOY_PROXY_IMAGE ?= harbor.isuanova.com/suanova/envoyproxy-envoy:distroless-v1.
 # HELM_E2E_IMAGE_REPO/TAG below do.
 ENVOY_GATEWAY_IMAGE_REPO = $(shell echo '$(ENVOY_GATEWAY_IMAGE)' | sed -E 's/:[^:]*$$//')
 ENVOY_GATEWAY_IMAGE_TAG = $(shell echo '$(ENVOY_GATEWAY_IMAGE)' | sed -E 's/^.*://')
+# The chart archive, fetched once and read by both phases below. `helm show crds` and
+# `helm upgrade` each resolve the OCI reference on their own, and the second one is not
+# free even with Helm's cache warm — measured 64.6s then 21.7s for the same digest on the
+# e2e runner. The version is in the filename so a bump cannot silently reuse the previous
+# chart, and the file is kept between runs, which also makes the re-install that
+# `helm-e2e-verify` triggers a no-op here.
+ENVOY_GATEWAY_CHART_TGZ ?= $(LOCALBIN)/envoy-gateway-chart-$(ENVOY_GATEWAY_VERSION).tgz
 HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
 HELM_RELEASE ?= cubestack
 # --- DevEnvironment image the e2e environment runs ---
-# coordinates images/Makefile publishes under; TAG there also defaults to the
-# short commit SHA, so the two agree without being wired together.
-DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/jupyter-minimal:$(shell git rev-parse --short HEAD)
+# The published image, which the pod pulls itself: nothing in this flow pulls,
+# re-tags or loads it. So the e2e exercises the artifact a deployment gets — the
+# same reference, over the same pull path, with no pre-staged copy standing in
+# for it and no build from this tree that could drift from what ships.
+#
+# The container carries no ImagePullPolicy and the CRD has no field for one, so
+# Kubernetes applies the default — Always for a :latest tag — and every container
+# start re-resolves the tag against the registry. That is what makes this work
+# without a pre-load, and it is why the kind node has to reach the platform
+# registry: it does so over the runner's docker network, the same route the
+# mirrored bases in helm-e2e-images are already pulled over.
+DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/jupyter-minimal:latest
 # The platform the kind node runs. A kind node matches the docker daemon's
 # architecture, which on an arm64 laptop is not the amd64 these images publish
 # as — and an image loaded for the wrong one fails at container start with an
@@ -162,15 +178,35 @@ DEV_ENV_PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarc
 # restated, so a change there cannot leave this loading a reference nothing pulls:
 # the init container fails closed, so the environment would never start.
 PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
-# What the images below are built FROM, as the platform registry's mirrored copy
-# and the name the Dockerfile asks for. They are pulled from the mirror and
-# re-tagged under that second name, so `docker build` resolves the base from the
-# local store instead of Docker Hub and GCR — verified: with a tag present
-# locally the build never contacts a registry, and without one it fails trying.
-# Re-tagging rather than threading a --build-arg through the Dockerfiles keeps
-# product files out of a CI concern. A base bumped in a Dockerfile but not here
-# still builds correctly; it just pulls upstream again.
-BUILD_BASE_MIRRORS = harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07=quay.io/jupyter/minimal-notebook:2026-09-07 harbor.isuanova.com/suanova/golang:1.26=golang:1.26 harbor.isuanova.com/suanova/distroless-static:nonroot=gcr.io/distroless/static:nonroot harbor.isuanova.com/suanova/python:3.12-alpine=python:3.12-alpine
+# What the images below are built FROM: `<the Dockerfile's build arg>=<the
+# platform registry's copy>=<the upstream reference that copy mirrors>`.
+#
+# Every Dockerfile defaults its base to upstream and takes it as a --build-arg,
+# the way APT_MIRROR and PIP_INDEX_URL already work in images/ — a laptop build,
+# and the offline deployment in docs/design/devenv-images/decision.md §5, must
+# not be made to need harbor. It is this middle field the e2e substitutes, so the
+# pulls come from the registry the runner reaches instead of Docker Hub and GCR.
+# The third field is what hack/mirror-e2e-images.sh copies to it.
+#
+# The build arg's name is not derivable from the reference, so it is stated
+# rather than inferred. A base bumped in a Dockerfile but not here still builds;
+# it just resolves upstream again, which is why hack/mirror-e2e-images.sh checks
+# this list's shape rather than trusting it.
+#
+# One whole-line assignment on purpose: hack/mirror-e2e-images.sh reads it with a
+# single-line sed, so a backslash continuation would silently truncate the map.
+#
+# UBUNTU_BASE and JUPYTER_BASE feed no e2e build — the environment under test runs
+# the published jupyter image, and the ssh image only serves the 'ssh' type — but
+# they are listed so the mirror stays the single account of what an offline build
+# needs. Without them `make -C images build` reaches Docker Hub, which no e2e run
+# would catch.
+BASE_MIRRORS = JUPYTER_BASE=harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07=quay.io/jupyter/minimal-notebook:2026-09-07 GOLANG_BASE=harbor.isuanova.com/suanova/golang:1.26=golang:1.26 DISTROLESS_BASE=harbor.isuanova.com/suanova/distroless-static:nonroot=gcr.io/distroless/static:nonroot PYTHON_BASE=harbor.isuanova.com/suanova/python:3.12-alpine=python:3.12-alpine UBUNTU_BASE=harbor.isuanova.com/suanova/ubuntu:22.04=ubuntu:22.04
+
+# $(1) = a Dockerfile's build arg name -> the --build-arg flag that points it at
+# the mirror. An image reference never contains '=', so splitting on it yields
+# the three fields unambiguously.
+base_arg = $(foreach m,$(filter $(1)=%,$(BASE_MIRRORS)),--build-arg $(firstword $(subst =, ,$(m)))=$(word 2,$(subst =, ,$(m))))
 # Manager image for the helm e2e flow. Defaults to the same registry image as
 # the top-of-file IMG default; the chart Deployment template bakes
 # imagePullPolicy=IfNotPresent, so the kind-loaded image wins over the
@@ -201,6 +237,14 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	GW_CRD_DIR="$$(go env GOMODCACHE)/sigs.k8s.io/gateway-api@$${GW_VER}/config/crd/standard"; \
 	[ -d "$$GW_CRD_DIR" ] || { echo "gateway-api CRD dir not found: $${GW_CRD_DIR}"; exit 1; }; \
 	$(HELM_E2E_KUBECTL) apply -f "$${GW_CRD_DIR}"
+	@mkdir -p "$(LOCALBIN)" ; \
+	[ -f "$(ENVOY_GATEWAY_CHART_TGZ)" ] || { \
+		echo "Fetching the Envoy Gateway chart $(ENVOY_GATEWAY_VERSION) once for both phases below..." ; \
+		TMP="$$(mktemp -d)" ; \
+		$(HELM) pull $(ENVOY_GATEWAY_CHART) --version $(ENVOY_GATEWAY_VERSION) -d "$$TMP" >/dev/null ; \
+		mv "$$TMP"/*.tgz "$(ENVOY_GATEWAY_CHART_TGZ)" ; \
+		rmdir "$$TMP" ; \
+	}
 	# The Envoy Gateway bundle also carries the gateway-api CRDs, and installing
 	# those here is denied by gateway-api's own safe-upgrades VAP: the step above
 	# already installed the standard channel from the pinned go module. Keep only
@@ -209,7 +253,7 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# securitypolicies CRDs are too big for client-side apply's 256KB
 	# last-applied-configuration annotation.
 	@echo "Installing Envoy Gateway CRDs (the platform prerequisite's API surface)..." ; \
-	$(HELM) show crds $(ENVOY_GATEWAY_CHART) --version $(ENVOY_GATEWAY_VERSION) \
+	$(HELM) show crds "$(ENVOY_GATEWAY_CHART_TGZ)" \
 		| awk 'BEGIN { buf = "---\n" } /^---[[:space:]]*$$/ { if (keep) printf "%s", buf; buf = "---\n"; keep = 0; next } \
 			{ buf = buf $$0 "\n"; if ($$0 == "  group: gateway.envoyproxy.io") keep = 1 } \
 			END { if (keep) printf "%s", buf }' \
@@ -223,8 +267,7 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	# CRDs installed from the pinned go module above, and re-applying those is
 	# denied by gateway-api's own safe-upgrades ValidatingAdmissionPolicy.
 	@echo "Installing the Envoy Gateway controller for the chart's Gateway..." ; \
-	$(HELM) upgrade --install eg $(ENVOY_GATEWAY_CHART) \
-		--version $(ENVOY_GATEWAY_VERSION) \
+	$(HELM) upgrade --install eg "$(ENVOY_GATEWAY_CHART_TGZ)" \
 		--set deployment.envoyGateway.image.repository=$(ENVOY_GATEWAY_IMAGE_REPO) \
 		--set deployment.envoyGateway.image.tag=$(ENVOY_GATEWAY_IMAGE_TAG) \
 		--kube-context kind-$(KIND_CLUSTER_HELM) \
@@ -251,45 +294,49 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 	@echo "Installing MetalLB (the address the Gateway's dataplane is reachable on)..." ; \
 	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KUBECTL="$(KUBECTL)" DOCKER="$(CONTAINER_TOOL)" hack/install-metallb.sh
 
+# Split in two: everything below needs a docker daemon and nothing needs a cluster, so this
+# target can run while helm-e2e-setup is still building one. The loads are the only part
+# that needs the cluster and they live in helm-e2e-images-load, which waits for both halves
+# — which is what lets CI overlap the ~160s here with the cluster bootstrap by running
+# `helm-e2e-install -j2`. Serially the pair is still correct: this is an ordering that
+# permits overlap, not one that requires it.
 .PHONY: helm-e2e-images
-helm-e2e-images: ## Build and load manager, echo and DevEnvironment base images into the helm kind cluster
-	# Has to run before the first build: these are what those builds are FROM.
-	@for pair in $(BUILD_BASE_MIRRORS); do \
-		src="$${pair%%=*}"; dst="$${pair#*=}"; \
-		if $(CONTAINER_TOOL) image inspect "$${dst}" >/dev/null 2>&1; then \
-			echo "$${dst} is already present locally — not pulling $${src}"; \
-			continue; \
-		fi; \
-		echo "Pulling $${src} and re-tagging it as $${dst}..."; \
-		$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) "$${src}" && \
-		$(CONTAINER_TOOL) tag "$${src}" "$${dst}" || exit 1; \
-	done
-	$(MAKE) docker-build IMG=$(HELM_E2E_IMG)
+helm-e2e-images: ## Build the manager and echo images and pull the init container's image (needs a docker daemon, no cluster)
+	$(MAKE) docker-build IMG=$(HELM_E2E_IMG) \
+		BASE_ARGS="$(call base_arg,GOLANG_BASE) $(call base_arg,DISTROLESS_BASE)"
 	@if [ -f test/e2e/assets/echo/Dockerfile ]; then \
-		docker build -f test/e2e/assets/echo/Dockerfile -t $(ECHO_IMG) test/e2e/assets/echo; \
-		$(KIND) load docker-image $(ECHO_IMG) --name $(KIND_CLUSTER_HELM); \
+		docker build --platform $(DEV_ENV_PLATFORM) $(call base_arg,PYTHON_BASE) \
+			-f test/e2e/assets/echo/Dockerfile -t $(ECHO_IMG) test/e2e/assets/echo; \
 	else \
-		echo "echo image not present yet (created by a later task) — skipping echo build/load"; \
+		echo "echo image not present yet (created by a later task) — skipping echo build"; \
+	fi
+	# The init container's image is hardcoded in the controller, so the tag has to
+	# be the one it names; upstream busybox carries the same tag, so pulling the
+	# platform registry's copy needs no re-tagging. Unlike the environment's image
+	# this one is loaded, and that works because its tag is an immutable version
+	# rather than :latest: the default IfNotPresent policy then takes the local
+	# copy, so the init container starts with no registry round trip.
+	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
+	echo "Pulling $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
+	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)"
+	# What is deliberately absent above is the environment's image: the pod pulls
+	# it from the platform registry at start (see DEV_ENV_IMAGE). Only
+	# jupyter-minimal is involved — the environment is a jupyter one, and that
+	# image serves the ssh endpoint too, since its entrypoint starts sshd when the
+	# operator mounts the ssh material; ssh-ubuntu22.04 is neither built nor pulled.
+	#
+	# A change under images/ is therefore no longer validated by this e2e; it is
+	# covered by `make -C images smoke`, which builds both families and asserts
+	# against them.
+
+.PHONY: helm-e2e-images-load
+helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulled images into the kind cluster
+	# The echo image only exists from a later task onward and its build is skipped when the
+	# Dockerfile is absent, so the load skips on the same condition.
+	@if [ -f test/e2e/assets/echo/Dockerfile ]; then \
+		$(KIND) load docker-image $(ECHO_IMG) --name $(KIND_CLUSTER_HELM); \
 	fi
 	$(KIND) load docker-image $(HELM_E2E_IMG) --name $(KIND_CLUSTER_HELM)
-	# The environment under test runs a real image out of images/, so the e2e
-	# exercises the images the platform actually ships rather than a stand-in.
-	# Only jupyter-minimal: the environment is a jupyter one, and that image
-	# serves the ssh endpoint too (its entrypoint starts sshd when the operator
-	# mounts the ssh material), so ssh-ubuntu22.04 has nothing here to run in.
-	@echo "Building the DevEnvironment base image..." ; \
-	$(MAKE) -C ../images build-jupyter PLATFORM=$(DEV_ENV_PLATFORM) IMG_JUPYTER=$(DEV_ENV_IMAGE)
-	$(KIND) load docker-image $(DEV_ENV_IMAGE) --name $(KIND_CLUSTER_HELM)
-	# The init container's image is hardcoded in the controller, so the tag has to
-	# be the one it names — including the platform registry host, which does not
-	# resolve on the cluster. Pulling that name straight from the mirror is what
-	# keeps the environment off a registry it cannot reach; upstream busybox
-	# carries the same tag, so no re-tagging is needed. No ImagePullPolicy is set
-	# on the container, so a non-:latest tag resolves to IfNotPresent and the
-	# loaded image wins.
-	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
-	echo "Loading $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
-	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)" && \
 	$(KIND) load docker-image $(PERMISSION_INIT_IMAGE) --name $(KIND_CLUSTER_HELM)
 
 # The codegen prerequisites below are for someone running this target against a
@@ -307,7 +354,10 @@ HELM_E2E_CODEGEN_TARGETS := manifests generate fmt vet
 endif
 
 .PHONY: helm-e2e-install
-helm-e2e-install: helm-e2e-setup helm-e2e-images $(HELM_E2E_CODEGEN_TARGETS) helm-crds-sync ## Install the operator via helm into the dedicated kind cluster
+# helm-e2e-images-load is the join point: it needs the cluster (helm-e2e-setup) and the
+# images (helm-e2e-images), and loads only once both exist — so under -j those two run
+# together and nothing loads into a cluster that is still being created.
+helm-e2e-install: helm-e2e-setup helm-e2e-images-load $(HELM_E2E_CODEGEN_TARGETS) helm-crds-sync ## Install the operator via helm into the dedicated kind cluster
 	$(HELM_E2E_HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
 		--namespace $(HELM_NAMESPACE) --create-namespace \
 		--set image.repository=$(HELM_E2E_IMAGE_REPO) \
@@ -391,7 +441,7 @@ helm-e2e-verify: helm-e2e-setup helm-e2e-install ## Full gpu-less happy path: IS
 
 # Takes no prerequisites, like helm-e2e-crd-check: it asserts against a cluster a
 # previous target built. Depending on helm-e2e-install here would re-run setup,
-# the image builds and the chart install a third time in the one CI job that runs
+# the image pulls and the chart install a third time in the one CI job that runs
 # all of them.
 .PHONY: helm-e2e-devenv-verify
 helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and SSH answer through the Gateway's VIP
@@ -454,7 +504,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	$(CONTAINER_TOOL) build $(BASE_ARGS) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.

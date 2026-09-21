@@ -45,18 +45,18 @@ done
 # upstream manifest to, and they have to match it for the node to find them.
 METALLB_REGISTRY="${METALLB_REGISTRY:-harbor.isuanova.com/suanova}"
 
-# The bases the images themselves are built FROM. The Makefile holds the map of
-# mirror to Dockerfile name, because helm-e2e-images re-tags each one so
-# `docker build` resolves it locally; mirroring the same map is what keeps the
-# two from naming different images. Read as <mirror>=<dockerfile-name>.
-BUILD_BASE_MIRRORS="$(sed -n 's/^BUILD_BASE_MIRRORS *= *//p' Makefile)"
+# The bases the images themselves are built FROM. The Makefile holds the map,
+# because helm-e2e-images is what hands each Dockerfile its base as a
+# --build-arg; mirroring the same map is what keeps the two from naming
+# different images. Read as <build arg>=<mirror>=<upstream>.
+BASE_MIRRORS="$(sed -n 's/^BASE_MIRRORS *= *//p' Makefile)"
 
 # The init container's busybox, read out of the controller's own constant the
 # way the Makefile reads it. Upstream carries it under the same tag.
 BUSYBOX_IMAGE="$(sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$/\1/p' internal/controller/assets.go)"
 
-for v in "${BUILD_BASE_MIRRORS}" "${BUSYBOX_IMAGE}"; do
-  [ -n "${v}" ] || { echo "could not read BUILD_BASE_MIRRORS from the Makefile or permissionInitImage from internal/controller/assets.go — one of them changed shape" >&2; exit 1; }
+for v in "${BASE_MIRRORS}" "${BUSYBOX_IMAGE}"; do
+  [ -n "${v}" ] || { echo "could not read BASE_MIRRORS from the Makefile or permissionInitImage from internal/controller/assets.go — one of them changed shape" >&2; exit 1; }
 done
 
 # upstream -> platform. Each upstream tag is the one the e2e actually resolves:
@@ -75,9 +75,15 @@ MIRRORS=(
   # is the version go.mod pins; see hack/install-lws-controller.sh for why.
   "registry.k8s.io/lws/lws:${LWS_VER#v}=${LWS_IMAGE_REPO}:${LWS_VER}"
 )
-# The Makefile's map is platform=Dockerfile-name; the copy goes the other way.
-for pair in ${BUILD_BASE_MIRRORS}; do
-  MIRRORS+=("${pair#*=}=${pair%%=*}")
+# The Makefile's map carries the build arg first; the copy goes upstream->mirror.
+for pair in ${BASE_MIRRORS}; do
+  rest="${pair#*=}"                       # <mirror>=<upstream>
+  arg="${pair%%=*}"
+  src="${rest#*=}"                        # upstream
+  dst="${rest%%=*}"                       # mirror
+  [ -n "${arg}" ] && [ -n "${src}" ] && [ -n "${dst}" ] && [ "${src}" != "${dst}" ] \
+    || { echo "BASE_MIRRORS entry '${pair}' is not <build arg>=<mirror>=<upstream> — the Makefile's map changed shape" >&2; exit 1; }
+  MIRRORS+=("${src}=${dst}")
 done
 
 # Multi-arch throughout: a copied index costs a node only its own platform's
