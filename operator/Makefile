@@ -339,9 +339,9 @@ helm-e2e-images: ## Build the manager and echo images and pull the init containe
 	# image serves the ssh endpoint too, since its entrypoint starts sshd when the
 	# operator mounts the ssh material; ssh-ubuntu22.04 is neither built nor pulled.
 	#
-	# A change under images/ is therefore no longer validated by this e2e; it is
-	# covered by `make -C images smoke`, which builds both families and asserts
-	# against them.
+	# A change under images/ is therefore not validated here; it is covered by
+	# `make -C images smoke` — the images-smoke job in ci-operator.yml — which builds
+	# both families and asserts the same contract against them.
 
 .PHONY: helm-e2e-images-load
 helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulled images into the kind cluster

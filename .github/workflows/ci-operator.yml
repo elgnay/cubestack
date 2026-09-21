@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       operator: ${{ steps.filter.outputs.operator }}
+      images: ${{ steps.filter.outputs.images }}
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -31,16 +32,19 @@ jobs:
         uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
-          # images/** is part of the operator filter because the e2e pulls the
-          # published DevEnvironment image and brings one up on the cluster, so a
-          # change to them — once published — is a change to what this workflow
-          # asserts.
+          # images/** has its own filter rather than riding on the operator one. The
+          # e2e pulls the *published* DevEnvironment image, so an edit under images/
+          # changes nothing its cluster assertions can see until that commit is
+          # published — running the whole operator suite for it would buy nothing.
+          # What does validate the images is images-smoke below, which builds both
+          # and asserts the operator contract against them.
           filters: |
             operator:
               - 'operator/**'
-              - 'images/**'
               - 'Makefile'
               - '.github/**'
+            images:
+              - 'images/**'
 
   lint:
     needs: changes
@@ -79,6 +83,25 @@ jobs:
           go-version-file: operator/go.mod
       - name: Running Tests
         run: make test
+
+  images-smoke:
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build and smoke the DevEnvironment base images
+        # Both images are built for linux/amd64 and started as throwaway containers on
+        # 127.0.0.1, so this needs neither a cluster nor registry credentials. Both
+        # families are built: the e2e exercises jupyter-minimal alone and leaves
+        # ssh-ubuntu22.04 neither built nor pulled (operator/Makefile), so this is the
+        # only job that covers it.
+        run: make -C images smoke
 
   test-e2e:
     needs: changes
@@ -173,7 +196,7 @@ jobs:
         working-directory: operator
 
   result:
-    needs: [lint, test, test-e2e, helm-drift, generate-drift]
+    needs: [lint, test, images-smoke, test-e2e, helm-drift, generate-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
