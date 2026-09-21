@@ -98,5 +98,8 @@ platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU
 push the image the local smoke ran — buildx cannot load a multi-platform result and push it in one
 invocation, so it builds a fresh one from the same source.
 
-There is no cluster and no CI wiring yet; `make -C images smoke` is the acceptance gate. When this
-workspace gains CI, it must add a build + smoke job like the other sub-projects.
+`make -C images smoke` is the acceptance gate, and CI runs it on both sides of a merge:
+`ci-operator.yml`'s `images-smoke` job on any change under `images/**`, and `ci-images.yml` on a push
+to main, which smokes again and then publishes — withholding `:latest` unless this commit's `images/`
+tree is still main's. The smoke itself needs no cluster and no registry credentials: both families are
+built for linux/amd64 and run as throwaway containers on 127.0.0.1.

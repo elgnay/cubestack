@@ -58,11 +58,23 @@ PIP_INDEX_URL ?=
 # both together.
 BASE_ARGS ?= \
 	--build-arg JUPYTER_BASE=$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810 \
-	--build-arg UBUNTU_BASE=$(REGISTRY)/$(PROJECT)/ubuntu:$(UBUNTU_VERSION)@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
+	--build-arg UBUNTU_BASE=$(UBUNTU_BASE)
 
 # Base release of the self-authored ssh image. It selects the build base AND names the
-# published repository (decision doc §5), so the name cannot outlive the base.
+# published repository (decision doc §5), so the name cannot outlive the base. The release is
+# one axis for both: it is looked up in UBUNTU_BASE_DIGESTS below, and nothing else selects
+# the base, so a release and its digest can never be chosen apart.
 UBUNTU_VERSION ?= 22.04
+
+# The pinned base, one entry per supported Ubuntu release, as <version>=<digest of the
+# platform registry's copy>. A release with no entry has no base to build from: its tag would
+# carry another release's digest, which the build resolves — so it would either fail the pull
+# or build a release the published name does not claim. `make build-ssh UBUNTU_VERSION=24.04`
+# stops in check-ubuntu-base instead, until 24.04 is mirrored and pinned here.
+UBUNTU_BASE_DIGESTS = 22.04=sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
+
+UBUNTU_BASE_DIGEST = $(patsubst $(UBUNTU_VERSION)=%,%,$(filter $(UBUNTU_VERSION)=%,$(UBUNTU_BASE_DIGESTS)))
+UBUNTU_BASE = $(REGISTRY)/$(PROJECT)/ubuntu:$(UBUNTU_VERSION)@$(UBUNTU_BASE_DIGEST)
 
 APT_MIRROR_ARG    = $(if $(APT_MIRROR),--build-arg APT_MIRROR=$(APT_MIRROR))
 PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL))
@@ -107,7 +119,7 @@ PUSH_LATEST ?= 1
 LATEST_ARG_SSH     = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH))
 LATEST_ARG_JUPYTER = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_JUPYTER))
 
-.PHONY: help check-tag check-platform check-platforms check-push-latest build build-ssh build-jupyter \
+.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base build build-ssh build-jupyter \
 	smoke smoke-ssh smoke-jupyter push push-ssh push-jupyter retag-latest
 
 .DEFAULT_GOAL := help
@@ -155,9 +167,22 @@ check-push-latest:
 		   exit 1;; \
 	esac
 
+# UBUNTU_VERSION reaches this repository's name *and* the base it is built from, so a release
+# misspelled or not yet pinned would be published under a name claiming a release it does not
+# contain. Only the defaulted BASE_ARGS is guarded — that one is this file's own pin, and the
+# lookup is what has to answer. A caller-supplied BASE_ARGS is the caller's own base, pinned or
+# upstream (`BASE_ARGS=`) as they chose, and this file has nothing to check it against.
+check-ubuntu-base:
+	@test "$(origin BASE_ARGS)" != file || test -n "$(UBUNTU_BASE_DIGEST)" || { \
+		echo "make -C images: UBUNTU_VERSION=$(UBUNTU_VERSION) has no pinned base in UBUNTU_BASE_DIGESTS." >&2; \
+		echo "                Add '<version>=sha256:<digest>' for the mirror's copy of that release, and" >&2; \
+		echo "                re-run operator/hack/mirror-e2e-images.sh if it is not mirrored yet." >&2; \
+		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
+		exit 1; }
+
 build: build-ssh build-jupyter ## Build both images
 
-build-ssh: check-tag check-platform ## Build the self-authored ssh image
+build-ssh: check-tag check-platform check-ubuntu-base ## Build the self-authored ssh image
 	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) .
 
@@ -176,7 +201,7 @@ smoke-jupyter: build-jupyter ## Build and smoke only the jupyter image
 
 push: push-ssh push-jupyter ## Publish both images as multi-arch indexes (TAG + :latest)
 
-push-ssh: check-tag check-platforms check-push-latest ## Publish the ssh image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
+push-ssh: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the ssh image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
 		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
 		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) $(LATEST_ARG_SSH) --push .
