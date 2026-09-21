@@ -214,7 +214,7 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 			{ buf = buf $$0 "\n"; if ($$0 == "  group: gateway.envoyproxy.io") keep = 1 } \
 			END { if (keep) printf "%s", buf }' \
 		| $(HELM_E2E_KUBECTL) apply --server-side -f -
-	@echo "Provisioning the upstream LeaderWorkerSet controller (image from the pinned lws go module)..." ; \
+	@echo "Provisioning the upstream LeaderWorkerSet controller (image from the platform registry, manifests from the pinned lws go module)..." ; \
 	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KIND="$(KIND)" KUBECTL="$(KUBECTL)" hack/install-lws-controller.sh
 	# The CRDs above are the API surface; this is the controller that programs
 	# the Gateway. Without it the chart's Gateway is accepted by the API server

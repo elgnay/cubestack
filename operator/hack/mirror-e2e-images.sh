@@ -30,9 +30,15 @@ ENVOY_GATEWAY_VERSION="$(sed -n 's/^ENVOY_GATEWAY_VERSION ?= \(.*\)$/\1/p' Makef
 ENVOY_GATEWAY_IMAGE="$(sed -n 's/^ENVOY_GATEWAY_IMAGE ?= \(.*\)$/\1/p' Makefile | sed -E 's/:[^:]*$//')"
 ENVOY_PROXY_IMAGE="$(sed -n 's/^ENVOY_PROXY_IMAGE ?= \(.*\)$/\1/p' Makefile)"
 ENVOY_GATEWAY_CHART="$(sed -n 's/^ENVOY_GATEWAY_CHART ?= oci:\/\/\(.*\)$/\1/p' Makefile)"
+# The lws controller: the version from go.mod, the repository from the script
+# that pulls it — so a name change there cannot leave this mirroring a ref
+# nothing asks for, the same way BUSYBOX_IMAGE is read out of the controller's
+# source.
+LWS_VER="$(awk '$1=="sigs.k8s.io/lws" {print $2}' go.mod)"
+LWS_IMAGE_REPO="$(sed -n 's/^LWS_IMAGE_REPO="\${LWS_IMAGE_REPO:-\(.*\)}"$/\1/p' hack/install-lws-controller.sh)"
 for v in "${METALLB_VERSION}" "${ENVOY_GATEWAY_VERSION}" "${ENVOY_GATEWAY_IMAGE}" \
-         "${ENVOY_PROXY_IMAGE}" "${ENVOY_GATEWAY_CHART}"; do
-  [ -n "${v}" ] || { echo "could not read a pinned version out of hack/install-metallb.sh or Makefile — one of their assignments changed shape" >&2; exit 1; }
+         "${ENVOY_PROXY_IMAGE}" "${ENVOY_GATEWAY_CHART}" "${LWS_VER}" "${LWS_IMAGE_REPO}"; do
+  [ -n "${v}" ] || { echo "could not read a pinned version out of hack/install-metallb.sh, hack/install-lws-controller.sh, go.mod or the Makefile — one of their assignments changed shape" >&2; exit 1; }
 done
 
 # The MetalLB refs are the two repositories hack/install-metallb.sh rewrites the
@@ -64,6 +70,10 @@ MIRRORS=(
   "docker.io/envoyproxy/envoy:${ENVOY_PROXY_IMAGE##*:}=${ENVOY_PROXY_IMAGE}"
   "docker.io/envoyproxy/gateway-helm:${ENVOY_GATEWAY_VERSION}=${ENVOY_GATEWAY_CHART}:${ENVOY_GATEWAY_VERSION}"
   "docker.io/library/busybox:${BUSYBOX_IMAGE##*:}=${BUSYBOX_IMAGE}"
+  # The promoted release tag, not the module's `main`. Upstream drops the `v`
+  # the go module version carries, and the mirror adds it back so the tag here
+  # is the version go.mod pins; see hack/install-lws-controller.sh for why.
+  "registry.k8s.io/lws/lws:${LWS_VER#v}=${LWS_IMAGE_REPO}:${LWS_VER}"
 )
 # The Makefile's map is platform=Dockerfile-name; the copy goes the other way.
 for pair in ${BUILD_BASE_MIRRORS}; do
