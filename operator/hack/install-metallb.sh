@@ -44,11 +44,20 @@ cd "$(dirname "$0")/.." # operator/
 # before the pool was applied leaves every later run reporting success with no
 # IPAddressPool, and the Gateway's Service sitting EXTERNAL-IP <pending> for a
 # reason nothing in the log names.
+#
+# Available is not sufficient on its own: it says a controller answers, not which
+# one. A cluster reused across a METALLB_VERSION bump would otherwise keep the old
+# controller, never apply the checksum-validated manifest for the new version, and
+# report success — the same silent skip, one field over. The installed image's
+# tag is the version, because the manifest carries METALLB_VERSION as exactly that
+# tag (the rewrite further down changes only the repository, not the tag). Not
+# matching means apply the manifest again, which is idempotent.
 METALLB_READY=""
-if [ "$("${KUBECTL}" --context "${CTX}" get deployment -n "${NS}" controller \
-  -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)" = "True" ]; then
+CONTROLLER="$("${KUBECTL}" --context "${CTX}" get deployment -n "${NS}" controller \
+  -o jsonpath='{.status.conditions[?(@.type=="Available")].status}{" "}{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+if [ "${CONTROLLER% *}" = "True" ] && [ "${CONTROLLER##*:}" = "${METALLB_VERSION}" ]; then
   METALLB_READY=1
-  echo "metallb controller already Available in ${NS} on ${CTX} — reconciling the pool"
+  echo "metallb ${METALLB_VERSION} already Available in ${NS} on ${CTX} — reconciling the pool"
 fi
 
 # --- address pool ---
