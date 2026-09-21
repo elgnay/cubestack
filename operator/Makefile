@@ -360,18 +360,39 @@ helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulle
 # can be skipped when this one runs. Running them here as well only moves their
 # cost onto the job that is already the critical path: ~107s, mostly `go vet ./...`
 # compiling every package with a cold build cache. Set to 0 to skip them.
-# helm-crds-sync is not in this list and stays either way: the chart's crds/ is
-# not committed, so nothing else produces it.
+# The CRD sync is not in this list and runs either way: the chart's crds/ is not
+# committed, so nothing else produces it.
 HELM_E2E_CODEGEN ?= 1
 ifeq ($(HELM_E2E_CODEGEN),1)
-HELM_E2E_CODEGEN_TARGETS := manifests generate fmt vet
+HELM_E2E_CODEGEN_TARGETS := helm-e2e-codegen
+
+# One step, not four prerequisites. `manifests` writes config/crd/bases and `generate`
+# writes zz_generated.*.go; this run has two readers of what they wrote — the CRD sync,
+# which copies that directory into the chart, and fmt/vet, which compile the package.
+# Nothing in a flat prerequisite list orders a reader after its writer: under -j make
+# starts whichever of them a free slot reaches first, so `manifests` can be halfway
+# through rewriting a CRD at the moment the sync copies it. One serial step removes the
+# question. -j1 rather than a plain `$(MAKE)`: a sub-make joins the parent's jobserver
+# and would stay parallel.
+.PHONY: helm-e2e-codegen
+helm-e2e-codegen:
+	$(MAKE) -j1 manifests generate fmt vet
 endif
+
+.PHONY: helm-e2e-crds-sync
+# The CRD sync as helm-e2e-install needs it: after the codegen, never beside it. It is a
+# target of its own rather than an edge on helm-crds-sync because helm-package needs that
+# one, and packaging a chart has no business regenerating Go code — least of all on a knob
+# named HELM_E2E_*. Expressing the ordering as an edge is what makes it hold under -j;
+# listing both as prerequisites of one target would not.
+helm-e2e-crds-sync: $(HELM_E2E_CODEGEN_TARGETS)
+	$(MAKE) helm-crds-sync
 
 .PHONY: helm-e2e-install
 # helm-e2e-images-load is the join point: it needs the cluster (helm-e2e-setup) and the
 # images (helm-e2e-images), and loads only once both exist — so under -j those two run
 # together and nothing loads into a cluster that is still being created.
-helm-e2e-install: helm-e2e-setup helm-e2e-images-load $(HELM_E2E_CODEGEN_TARGETS) helm-crds-sync ## Install the operator via helm into the dedicated kind cluster
+helm-e2e-install: helm-e2e-setup helm-e2e-images-load helm-e2e-crds-sync ## Install the operator via helm into the dedicated kind cluster
 	$(HELM_E2E_HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
 		--namespace $(HELM_NAMESPACE) --create-namespace \
 		--set image.repository=$(HELM_E2E_IMAGE_REPO) \

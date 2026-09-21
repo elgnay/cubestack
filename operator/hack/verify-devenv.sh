@@ -112,9 +112,14 @@ echo "== DevEnvironment e2e: ${NS}/${ENV_NAME} on ${CTX} =="
 kubectl_e2e create ns "${NS}" --dry-run=client -o yaml | kubectl_e2e apply -f - >/dev/null
 kubectl_e2e label ns "${NS}" pod-security.kubernetes.io/enforce=baseline --overwrite >/dev/null
 
-# spec.image is required with no default, so the reference is substituted here.
-echo "  applying ${MANIFEST} (image ${DEV_ENV_IMAGE})"
-sed "s#__DEV_ENV_IMAGE__#${DEV_ENV_IMAGE}#" "${MANIFEST}" | kubectl_e2e apply -f - >/dev/null
+# The manifest's identity is substituted too, not just its image: the three knobs above
+# name the resource everywhere else in this script — the namespace is created and labelled
+# under ${NS}, and every read is for ${ENV_NAME} — so a manifest left naming its own pair
+# would apply to a resource this script never looks at again.
+echo "  applying ${MANIFEST} (image ${DEV_ENV_IMAGE}, as ${NS}/${ENV_NAME})"
+sed -e "s#__DEV_ENV_IMAGE__#${DEV_ENV_IMAGE}#" \
+    -e "s#__DEV_ENV_NAME__#${ENV_NAME}#" \
+    -e "s#__DEV_ENV_NAMESPACE__#${NS}#" "${MANIFEST}" | kubectl_e2e apply -f - >/dev/null
 
 # Poll rather than `kubectl wait`: a spec that never comes up is the interesting
 # case, and its diagnostics are worth more than a timeout message.

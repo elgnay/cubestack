@@ -7,6 +7,12 @@
 # one a deployment would write, and reaching the registry is part of what the
 # test asserts.
 #
+# __DEV_ENV_NAME__ and __DEV_ENV_NAMESPACE__ come from the same script's DEV_ENV_NAME and
+# DEV_ENV_NAMESPACE, which it also uses to create the namespace and to read the environment
+# back. They are placeholders rather than literals so those two knobs reach the resource
+# they name: applied as literals, an overridden run would create its own namespace, install
+# this manifest into demo/e2e-devenv, and then poll the name it asked for until it timed out.
+#
 # The two runtime settings are not decoration, they are the documented contract
 # for this image (images/README.md): 'jovyan' is the docker-stacks account, which
 # is what derives the /home/jovyan workspace mount, and gid 100 is the image's
@@ -15,8 +21,8 @@
 apiVersion: ai.cubestack.io/v1alpha1
 kind: DevEnvironment
 metadata:
-  name: e2e-devenv
-  namespace: demo
+  name: __DEV_ENV_NAME__
+  namespace: __DEV_ENV_NAMESPACE__
 spec:
   type: jupyter
   image: __DEV_ENV_IMAGE__

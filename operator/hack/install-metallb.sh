@@ -101,7 +101,12 @@ if [ -z "${METALLB_READY}" ]; then
   OUT="$(mktemp)"
   trap 'rm -f "${OUT}"' EXIT
   echo "fetching MetalLB ${METALLB_VERSION} native manifest"
-  curl -fsSL "${METALLB_MANIFEST_URL}" -o "${OUT}"
+  # Bounded for the same reason as the kubectl calls above: a remote that accepts the
+  # connection and then stops sending would otherwise hold this step open until the job's
+  # own timeout, and nothing here can tell that apart from a slow download. This is the
+  # one network call in the script that is not a kubectl request, so it takes the
+  # equivalent curl flags instead of a --request-timeout.
+  curl --connect-timeout 15 --max-time 120 -fsSL "${METALLB_MANIFEST_URL}" -o "${OUT}"
   # sha256sum on the Linux CI runner, shasum on the macOS dev machines.
   if command -v sha256sum >/dev/null 2>&1; then
     DIGEST="$(sha256sum "${OUT}" | awk '{print $1}')"
