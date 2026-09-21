@@ -22,8 +22,15 @@
 # re-resolved at build time so a rebuild picks up Ubuntu security updates; a pinned
 # digest would freeze those out until someone remembered to bump it. Offline
 # installs record the digest of what was actually shipped (decision doc §3.D, §5).
+#
+# UBUNTU_BASE exists because UBUNTU_VERSION cannot carry a registry host: it also
+# names the published repository (ssh-ubuntu$(UBUNTU_VERSION), images/Makefile), so
+# writing a host into it would rename the image. The base is therefore a separate
+# arg defaulting to upstream through that same version, and the platform registry's
+# copy is substituted for offline builds — see BASE_MIRRORS in the operator Makefile.
 ARG UBUNTU_VERSION=22.04
-FROM ubuntu:${UBUNTU_VERSION}
+ARG UBUNTU_BASE=ubuntu:${UBUNTU_VERSION}
+FROM ${UBUNTU_BASE}
 
 # Optional apt mirror override (e.g. a Tsinghua/Aliyun mirror in CN); empty = upstream.
 ARG APT_MIRROR=""

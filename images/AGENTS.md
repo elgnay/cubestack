@@ -63,8 +63,11 @@ Every image:
 - **Never commit secrets, private keys, or tokens.** Smoke-generated keys live only under `hack/` at
   runtime (`mktemp -d`) and are cleaned up.
 - **English** code comments, commit messages, and docs.
-- Reproducible base tags only; no floating tags. Mirror hooks are explicit build args
-  (`APT_MIRROR`, `PIP_INDEX_URL`); nothing is baked that assumes a mirror.
+- Reproducible base tags only; no floating tags. Every build resolves `FROM` this platform's
+  mirrored copies of the upstream bases by default (`BASE_ARGS`), because a frozen mirror is
+  reproducible where upstream `ubuntu:22.04` is refreshed monthly. Override with `BASE_ARGS=`.
+  `APT_MIRROR` / `PIP_INDEX_URL` stay explicit build args, and nothing baked into the running
+  image assumes a mirror.
 
 ## Build & smoke
 
@@ -72,14 +75,21 @@ Every image:
 make -C images build    # builds both images ($(PLATFORM), default linux/amd64), tagged
                         # $(REGISTRY)/$(PROJECT)/<image>:$(TAG)
 make -C images smoke    # local Docker smoke (ssh key-auth login; jupyter + optional sshd)
-make -C images push TAG=<tag>   # build, then add :latest to that image and push both refs to
-                                # $(REGISTRY)/$(PROJECT); TAG defaults to the commit SHA
+make -C images push TAG=<tag>   # builds each image for every $(PLATFORMS) (default
+                                # linux/amd64 linux/arm64) and pushes it as one multi-arch
+                                # index carrying :TAG and :latest
 make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt-in)
 ```
 
 `PLATFORM` takes a single value; a list fails in `check-platform` with that reason. On a host of a
 different architecture the build (and the smoke's throwaway containers) run emulated — slower, but
 they exercise the artifact that is actually published.
+
+`PLATFORMS` is the publish list for the same reason, and `make push PLATFORMS=linux/amd64` narrows it
+back to one. `push` is a `buildx build --push`, so it needs a builder that can do more than one
+platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU). It does **not**
+push the image the local smoke ran — buildx cannot load a multi-platform result and push it in one
+invocation, so it builds a fresh one from the same source.
 
 There is no cluster and no CI wiring yet; `make -C images smoke` is the acceptance gate. When this
 workspace gains CI, it must add a build + smoke job like the other sub-projects.
