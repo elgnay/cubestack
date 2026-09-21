@@ -289,11 +289,25 @@ helm-e2e-images: ## Build and load manager, echo and DevEnvironment base images 
 	# loaded image wins.
 	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
 	echo "Loading $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
-	$(CONTAINER_TOOL) pull --platform $(DEV_ENV_PLATFORM) $(PERMISSION_INIT_IMAGE) && \
+	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)" && \
 	$(KIND) load docker-image $(PERMISSION_INIT_IMAGE) --name $(KIND_CLUSTER_HELM)
 
+# The codegen prerequisites below are for someone running this target against a
+# tree they just edited. CI already runs the same three targets — `generate-check`
+# in the generate-drift job — and the same govet, since golangci-lint enables it,
+# in the lint job; both are gated by the identical `changes` filter, so neither
+# can be skipped when this one runs. Running them here as well only moves their
+# cost onto the job that is already the critical path: ~107s, mostly `go vet ./...`
+# compiling every package with a cold build cache. Set to 0 to skip them.
+# helm-crds-sync is not in this list and stays either way: the chart's crds/ is
+# not committed, so nothing else produces it.
+HELM_E2E_CODEGEN ?= 1
+ifeq ($(HELM_E2E_CODEGEN),1)
+HELM_E2E_CODEGEN_TARGETS := manifests generate fmt vet
+endif
+
 .PHONY: helm-e2e-install
-helm-e2e-install: helm-e2e-setup helm-e2e-images manifests helm-crds-sync generate fmt vet ## Install the operator via helm into the dedicated kind cluster
+helm-e2e-install: helm-e2e-setup helm-e2e-images $(HELM_E2E_CODEGEN_TARGETS) helm-crds-sync ## Install the operator via helm into the dedicated kind cluster
 	$(HELM_E2E_HELM) upgrade --install $(HELM_RELEASE) $(HELM_CHART_DIR) \
 		--namespace $(HELM_NAMESPACE) --create-namespace \
 		--set image.repository=$(HELM_E2E_IMAGE_REPO) \

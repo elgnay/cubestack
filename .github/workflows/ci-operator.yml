@@ -85,6 +85,12 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    env:
+      # The install target runs codegen locally so an edited tree is reflected
+      # in the cluster. That is redundant here: generate-drift runs the same
+      # targets and lint runs the same govet, under the same `changes` filter,
+      # in parallel with this job — and this job is the critical path.
+      HELM_E2E_CODEGEN: "0"
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
