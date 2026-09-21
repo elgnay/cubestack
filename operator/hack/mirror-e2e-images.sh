@@ -76,14 +76,29 @@ MIRRORS=(
   "registry.k8s.io/lws/lws:${LWS_VER#v}=${LWS_IMAGE_REPO}:${LWS_VER}"
 )
 # The Makefile's map carries the build arg first; the copy goes upstream->mirror.
+#
+# The mirror field carries the digest the build resolves as well as the tag, and
+# the two are split here: the copy target is the tag, because a copy repoints a
+# tag at whatever upstream is serving rather than at a digest, and the digest is
+# checked against that tag below. A base with no digest is refused outright — the
+# build would then be resolved by a tag this script moves, which is the drift the
+# digest is there to stop.
+PINNED=()
 for pair in ${BASE_MIRRORS}; do
-  rest="${pair#*=}"                       # <mirror>=<upstream>
+  rest="${pair#*=}"                       # <mirror>[@<digest>]=<upstream>
   arg="${pair%%=*}"
   src="${rest#*=}"                        # upstream
-  dst="${rest%%=*}"                       # mirror
+  dst="${rest%%=*}"                       # mirror, carrying the pin
   [ -n "${arg}" ] && [ -n "${src}" ] && [ -n "${dst}" ] && [ "${src}" != "${dst}" ] \
     || { echo "BASE_MIRRORS entry '${pair}' is not <build arg>=<mirror>=<upstream> — the Makefile's map changed shape" >&2; exit 1; }
-  MIRRORS+=("${src}=${dst}")
+  case "${dst}" in
+    *@sha256:*) ;;
+    *) echo "BASE_MIRRORS entry '${arg}' names its mirror by tag alone ('${dst}'); the build would resolve" >&2
+       echo "whatever this script last copied there. Append @sha256:<digest>." >&2
+       exit 1 ;;
+  esac
+  PINNED+=("${dst%%@*}=${dst##*@}")
+  MIRRORS+=("${src}=${dst%%@*}")
 done
 
 # Multi-arch throughout: a copied index costs a node only its own platform's
@@ -121,5 +136,29 @@ for pair in "${MIRRORS[@]}"; do
 done
 
 echo
-echo "mirrored: ${ok}, failed: ${failed}, missing: ${missing}"
-[ "${failed}" -eq 0 ] && [ "${missing}" -eq 0 ]
+echo "=== verifying the mirrored tags hash to the digests that pin them ==="
+stale=0
+for pin in "${PINNED[@]}"; do
+  ref="${pin%%=*}"
+  want="${pin##*=}"
+  got="$("${CRANE}" digest "${ref}" 2>/dev/null || true)"
+  if [ "${got}" = "${want}" ]; then
+    echo "  OK     ${ref} ${want}"
+  else
+    echo "  STALE  ${ref}" >&2
+    if [ -n "${got}" ]; then
+      echo "         the mirrored tag is now ${got}; the build resolves the pinned ${want}." >&2
+      echo "         Upstream moved. Update BASE_MIRRORS (operator/Makefile) — and images/Makefile's" >&2
+      echo "         BASE_ARGS, for the bases it names too — to ${ref}@${got}, then re-run this script." >&2
+    else
+      echo "         the mirrored tag does not resolve, but the build pins ${want}." >&2
+      echo "         Re-mirror it, or set BASE_MIRRORS (operator/Makefile) and images/Makefile's" >&2
+      echo "         BASE_ARGS to the digest the mirror should hold." >&2
+    fi
+    stale=$((stale + 1))
+  fi
+done
+
+echo
+echo "mirrored: ${ok}, failed: ${failed}, missing: ${missing}, stale pins: ${stale}"
+[ "${failed}" -eq 0 ] && [ "${missing}" -eq 0 ] && [ "${stale}" -eq 0 ]

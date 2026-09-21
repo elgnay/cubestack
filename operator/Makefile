@@ -179,7 +179,8 @@ DEV_ENV_PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarc
 # the init container fails closed, so the environment would never start.
 PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
 # What the images below are built FROM: `<the Dockerfile's build arg>=<the
-# platform registry's copy>=<the upstream reference that copy mirrors>`.
+# platform registry's copy, pinned by digest>=<the upstream reference that copy
+# mirrors>`.
 #
 # Every Dockerfile defaults its base to upstream and takes it as a --build-arg,
 # the way APT_MIRROR and PIP_INDEX_URL already work in images/ — a laptop build,
@@ -187,6 +188,19 @@ PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:sp
 # not be made to need harbor. It is this middle field the e2e substitutes, so the
 # pulls come from the registry the runner reaches instead of Docker Hub and GCR.
 # The third field is what hack/mirror-e2e-images.sh copies to it.
+#
+# The middle field names its base by tag *and* digest, and the digest is what the
+# build resolves. A mirrored tag is movable — re-mirroring repoints it — so on the
+# tag alone one revision could build different base layers on two days under one
+# published tag, which is the reproducibility that tag is supposed to carry. The
+# digest is the mirror's index digest, so a node still resolves its own platform's
+# manifest and nothing here narrows what PLATFORMS can publish.
+#
+# Bumping a base is therefore a decision rather than a side effect: read the new
+# digest, update it here and in images/Makefile's BASE_ARGS — the mirror script and
+# the e2e's builds read this map, publish reads that one, and they must name the
+# same bases — then re-run hack/mirror-e2e-images.sh, which fails if a mirrored tag
+# no longer hashes to the digest it is listed under.
 #
 # The build arg's name is not derivable from the reference, so it is stated
 # rather than inferred. A base bumped in a Dockerfile but not here still builds;
@@ -201,7 +215,7 @@ PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:sp
 # they are listed so the mirror stays the single account of what an offline build
 # needs. Without them `make -C images build` reaches Docker Hub, which no e2e run
 # would catch.
-BASE_MIRRORS = JUPYTER_BASE=harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07=quay.io/jupyter/minimal-notebook:2026-09-07 GOLANG_BASE=harbor.isuanova.com/suanova/golang:1.26=golang:1.26 DISTROLESS_BASE=harbor.isuanova.com/suanova/distroless-static:nonroot=gcr.io/distroless/static:nonroot PYTHON_BASE=harbor.isuanova.com/suanova/python:3.12-alpine=python:3.12-alpine UBUNTU_BASE=harbor.isuanova.com/suanova/ubuntu:22.04=ubuntu:22.04
+BASE_MIRRORS = JUPYTER_BASE=harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810=quay.io/jupyter/minimal-notebook:2026-09-07 GOLANG_BASE=harbor.isuanova.com/suanova/golang:1.26@sha256:6c2a5538f964f1c82f97ad14988bf05de100d922d159d0e398b54c7b0ca0c6c9=golang:1.26 DISTROLESS_BASE=harbor.isuanova.com/suanova/distroless-static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3=gcr.io/distroless/static:nonroot PYTHON_BASE=harbor.isuanova.com/suanova/python:3.12-alpine@sha256:c4634f578a412db396771b61b064c6e546c9d6414c7fb5b1b05d5871f1885f7b=python:3.12-alpine UBUNTU_BASE=harbor.isuanova.com/suanova/ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02=ubuntu:22.04
 
 # $(1) = a Dockerfile's build arg name -> the --build-arg flag that points it at
 # the mirror. An image reference never contains '=', so splitting on it yields

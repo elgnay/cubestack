@@ -42,15 +42,22 @@ APT_MIRROR    ?=
 PIP_INDEX_URL ?=
 
 # Base-image build args, defaulting to this registry's own mirrored copies of the upstream
-# bases. A frozen mirror is what makes a build reproducible: `ubuntu:22.04` is refreshed
-# upstream monthly, so resolving FROM it directly can yield a different base than the one
-# the platform serves — and only works where upstream is reachable. Both mirrors are
-# multi-arch, so naming them does not narrow what PLATFORMS can build. Pass `BASE_ARGS=`
-# to resolve FROM upstream instead. The jupyter date tracks the pin in jupyter/Dockerfile;
-# bump both together.
+# bases. Building from the platform's copy is what keeps the published image descended from
+# the base the platform serves, and it is the only copy that resolves where upstream is
+# unreachable. Each is named by tag *and* digest, and the digest is what the build resolves:
+# the mirrored tag is movable — operator/hack/mirror-e2e-images.sh repoints it when someone
+# here re-mirrors — so on the tag alone one commit could publish different base layers on two
+# days under the same TAG, which is the reproducibility that TAG is supposed to carry. The
+# digest is the mirror's index digest, so each platform still resolves its own manifest and
+# PLATFORMS is not narrowed. Bumping a base is deliberate: read the new digest, update it here
+# and in operator/Makefile's BASE_MIRRORS (the map the e2e's own builds and the mirror script
+# read — the two must name the same bases), then re-run the mirror script, which fails if a
+# mirrored tag no longer hashes to the digest it is listed under. Pass `BASE_ARGS=` to resolve
+# FROM upstream instead, unpinned. The jupyter date tracks the base in jupyter/Dockerfile; bump
+# both together.
 BASE_ARGS ?= \
-	--build-arg JUPYTER_BASE=$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:2026-09-07 \
-	--build-arg UBUNTU_BASE=$(REGISTRY)/$(PROJECT)/ubuntu:$(UBUNTU_VERSION)
+	--build-arg JUPYTER_BASE=$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810 \
+	--build-arg UBUNTU_BASE=$(REGISTRY)/$(PROJECT)/ubuntu:$(UBUNTU_VERSION)@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
 
 # Base release of the self-authored ssh image. It selects the build base AND names the
 # published repository (decision doc §5), so the name cannot outlive the base.

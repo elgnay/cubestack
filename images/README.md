@@ -257,11 +257,16 @@ docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/ssh-ubuntu22.
 
 Every build resolves `FROM` this registry's mirrored copies of the upstream bases —
 `$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:<base-date>` and `…/ubuntu:$(UBUNTU_VERSION)`,
-passed through `BASE_ARGS`. The mirror is what makes a build reproducible: `ubuntu:22.04` is
-refreshed upstream monthly, so `FROM ubuntu:22.04` can silently give a different base than the one
-the platform serves, and it only builds where upstream is reachable. `BASE_ARGS=` (empty) resolves
-from upstream instead. The jupyter mirror's date tracks the pin in `jupyter/Dockerfile` — bump both
-together.
+passed through `BASE_ARGS`. Building from the mirror keeps the published image descended from the
+base the platform serves, where `FROM ubuntu:22.04` would silently give whatever upstream has
+retagged it to — and it is the only copy that resolves where upstream is unreachable. Each is
+pinned by the digest of the mirror's index, and the digest is what the build resolves:
+`operator/hack/mirror-e2e-images.sh` repoints those tags, so on the tag alone the same commit
+could publish different base layers under one `TAG`. Bumping a base is therefore deliberate —
+read the new digest, update `images/Makefile` and `BASE_MIRRORS` in `operator/Makefile`, then
+re-run the mirror script, which fails if a mirrored tag no longer hashes to the digest it is
+listed under. `BASE_ARGS=` (empty) resolves from upstream instead, unpinned. The jupyter mirror's
+date tracks the base in `jupyter/Dockerfile` — bump both together.
 
 APT and pip still go upstream unless asked otherwise:
 

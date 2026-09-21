@@ -63,9 +63,16 @@ Every image:
 - **Never commit secrets, private keys, or tokens.** Smoke-generated keys live only under `hack/` at
   runtime (`mktemp -d`) and are cleaned up.
 - **English** code comments, commit messages, and docs.
-- Reproducible base tags only; no floating tags. Every build resolves `FROM` this platform's
-  mirrored copies of the upstream bases by default (`BASE_ARGS`), because a frozen mirror is
-  reproducible where upstream `ubuntu:22.04` is refreshed monthly. Override with `BASE_ARGS=`.
+- Reproducible bases only; no floating tags, and every base the build resolves is pinned by digest.
+  Every build resolves `FROM` this platform's mirrored copies of the upstream bases by default
+  (`BASE_ARGS`), so the published image descends from the base the platform serves. The tag names
+  that base; the digest is what the build resolves, because
+  `operator/hack/mirror-e2e-images.sh` repoints those tags when someone here re-mirrors — on the
+  tag alone the same revision could publish different base layers. Bumping a base is therefore a
+  deliberate step: read the new digest, update `images/Makefile` and `BASE_MIRRORS` in
+  `operator/Makefile` together, then re-run the mirror script, which fails if a mirrored tag no
+  longer hashes to the digest it is listed under. Override with `BASE_ARGS=` to resolve `FROM`
+  upstream instead, unpinned.
   `APT_MIRROR` / `PIP_INDEX_URL` stay explicit build args, and nothing baked into the running
   image assumes a mirror.
 
