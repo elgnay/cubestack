@@ -62,17 +62,28 @@ url_port() {
   printf '%s\n' "${a##*:}"
 }
 
-# http_code_until <url> <expected> — poll until the status matches, up to ~60s.
-# Published address and programmed dataplane are not the same instant: the
-# controller treats a LoadBalancer dataplane as an identity mapping without
-# reading the Service back (externalPorts), so status.endpoints can name a port
-# Envoy has not opened yet. A code that never settles is a real failure.
+# http_code_until <url> <expected> — poll until the status matches, within a
+# wall-clock budget. Published address and programmed dataplane are not the same
+# instant: the controller treats a LoadBalancer dataplane as an identity mapping
+# without reading the Service back (externalPorts), so status.endpoints can name
+# a port Envoy has not opened yet. A code that never settles is a real failure.
+#
+# The budget bounds the loop, not one request. Twenty attempts of `--max-time 20`
+# three seconds apart is 460s, which is what an address that is being dropped
+# rather than refused — the case this exists to fail on — actually costs. Each
+# request and each sleep is capped at what is left, so a blackholed address gives
+# up in ~60s while a merely slow one still gets its retries.
 http_code_until() {
-  local url=$1 want=$2 i code=""
-  for i in $(seq 1 20); do
-    code="$(curl -s --max-time 20 -o /dev/null -w '%{http_code}' "${url}" || true)"
+  local url=$1 want=$2 code="" deadline=$((SECONDS + 60)) remaining
+  while :; do
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    code="$(curl -s --max-time $((remaining < 5 ? remaining : 5)) \
+      -o /dev/null -w '%{http_code}' "${url}" || true)"
     [ "${code}" = "${want}" ] && break
-    sleep 3
+    remaining=$((deadline - SECONDS))
+    ((remaining > 0)) || break
+    sleep $((remaining < 3 ? remaining : 3))
   done
   printf '%s\n' "${code:-000}"
 }
