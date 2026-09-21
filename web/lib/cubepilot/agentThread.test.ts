@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyAgentEvent,
+  approvalExpiring,
+  approvalSecondsLeft,
   attachToolResult,
   fmtToolArgs,
   historyToMsgs,
@@ -15,7 +17,7 @@ import {
   turnStatus,
   waitingOnUser,
 } from "./agentThread";
-import type { AgentBlock, AgentMsg, AgentQuestion, ThreadMsg } from "./agentThread";
+import type { AgentApproval, AgentBlock, AgentMsg, AgentQuestion, ThreadMsg } from "./agentThread";
 import type { AgentSseEvent } from "./types";
 
 const T0 = 1_700_000_000_000;
@@ -165,6 +167,41 @@ describe("applyAgentEvent — approvals", () => {
     expect(m.approvals).toEqual([
       { callId: "a1", name: "exec", command: "kubectl delete pod x", level: "write", message: undefined, state: "pending" },
     ]);
+  });
+
+  it("holds several at once, each keeping the gateway's stamps", () => {
+    // One turn can have two writes held back. They are two cards, not one: the
+    // platform used to keep only the newest, so a decision aimed at either of
+    // them settled that one.
+    const m = fold([
+      { ...pending, callId: "a1", createdAtMs: 1000, expiresAtMs: 60000 },
+      { ...pending, callId: "a2", command: "kubectl rollout restart deploy/y", createdAtMs: 2000 },
+    ]);
+    expect(m.approvals.map((a) => a.callId)).toEqual(["a1", "a2"]);
+    expect(m.approvals[0].createdAtMs).toBe(1000);
+    expect(m.approvals[0].expiresAtMs).toBe(60000);
+    expect(m.approvals[1].createdAtMs).toBe(2000);
+  });
+
+  it("does not double an approval the turn already carries", () => {
+    // The stream pushes it and a reload reads the pending list; two accounts of
+    // one approval are two cards unless the id is the key.
+    const m = fold([pending, pending]);
+    expect(m.approvals).toHaveLength(1);
+  });
+
+  it("keeps the state a card already has when the same approval arrives again", () => {
+    // Skipping rather than replacing: the copy already there is the one the
+    // user's own click moved.
+    const m = fold([
+      pending,
+      { type: "approval_resolved", sessionId: "s", callId: "a1", approved: true },
+      { ...pending, createdAtMs: 5000 },
+    ]);
+    expect(m.approvals).toHaveLength(1);
+    expect(m.approvals[0].state).toBe("approved");
+    // ...and the late copy did not overwrite the record either.
+    expect(m.approvals[0].createdAtMs).toBeUndefined();
   });
 
   it("resolves to approved on an explicit true", () => {
@@ -368,6 +405,33 @@ describe("applyAgentEvent — phaseAt", () => {
     expect(b.phaseAt).toBe(T0 + 5_000);
     const c = applyAgentEvent(b, { type: "message_delta", sessionId: "s", delta: "y" }, T0 + 9_000);
     expect(c.phaseAt).toBe(T0 + 5_000);
+  });
+});
+
+describe("approval expiry", () => {
+  // The gateway drops a held write thirty minutes after it was raised, and the
+  // run it was gating dies with it. The stamp rides on both wire shapes; the
+  // reference draws no timer at all, so these are the rules for ours.
+
+  const at = (expiresAtMs?: number): AgentApproval => ({ callId: "a1", state: "pending", ...(expiresAtMs !== undefined ? { expiresAtMs } : {}) });
+
+  it("counts down to the stamp the gateway gave it", () => {
+    expect(approvalSecondsLeft(at(1_000_000 + 90_000), 1_000_000)).toBe(90);
+    expect(approvalSecondsLeft(at(1_000_000), 1_000_000)).toBe(0);
+  });
+
+  it("says nothing when the approval carries no stamp", () => {
+    expect(approvalSecondsLeft(at(), 1_000_000)).toBeUndefined();
+  });
+
+  it("is expiring once the stamp passes, and only while it is open", () => {
+    expect(approvalExpiring(at(999), 1_000_000)).toBe(true);
+    // Two seconds out, and the countdown rounds to whole seconds the way the
+    // question's does — so the boundary is sub-second, not "any time in the
+    // future".
+    expect(approvalExpiring(at(1_002_000), 1_000_000)).toBe(false);
+    // A decided card has no countdown to run out of, whatever the stamp says.
+    expect(approvalExpiring({ ...at(999), state: "approved" }, 1_000_000)).toBe(false);
   });
 });
 

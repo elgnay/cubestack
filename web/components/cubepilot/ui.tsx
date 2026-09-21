@@ -208,7 +208,7 @@ export function CardHead({
   );
 }
 
-type PillVariant = "ok" | "warn" | "danger" | "neutral" | "accent";
+type PillVariant = "ok" | "warn" | "danger" | "neutral" | "accent" | "violet";
 
 const PILL_COLORS: Record<PillVariant, string> = {
   ok: STATUS_OK,
@@ -216,6 +216,9 @@ const PILL_COLORS: Record<PillVariant, string> = {
   danger: STATUS_ERR,
   neutral: "var(--muted)",
   accent: "var(--accent)",
+  // The agent's own hue: the card that asks on its behalf is violet, so its
+  // status chip is too (the approval card's is amber for the same reason).
+  violet: "var(--violet)",
 };
 
 export function Pill({
@@ -224,16 +227,18 @@ export function Pill({
   dot = false,
   pulse = false,
   sx,
+  ...rest
 }: {
   variant?: PillVariant;
   children: ReactNode;
   dot?: boolean;
   pulse?: boolean;
   sx?: SxProps<Theme>;
-}) {
+} & HTMLAttributes<HTMLSpanElement>) {
   const c = PILL_COLORS[variant];
   return (
     <Box
+      {...rest}
       component="span"
       sx={{
         display: "inline-flex",
@@ -269,7 +274,7 @@ export function Pill({
   );
 }
 
-type BtnVariant = "primary" | "secondary" | "ghost";
+type BtnVariant = "primary" | "secondary" | "ghost" | "ok";
 
 export function Btn({
   variant = "secondary",
@@ -321,6 +326,18 @@ export function Btn({
       color: "text.primary",
       borderColor: "divider",
       "&:hover:not([data-disabled])": { borderColor: "var(--fg)" },
+    },
+    // The affirmative answer, in the green the platform already speaks: the same
+    // tint / border / text recipe the status pills use (ok / Ready / 已完成), a
+    // step stronger than theirs because a button is a far larger area than a
+    // 12px chip and the same 13% would leave the primary action looking like the
+    // quietest thing on the card. A solid fill is the other end -- the accent's
+    // own weight, which this card's two other buttons do not have either.
+    ok: {
+      bgcolor: "color-mix(in oklch, var(--ok) 22%, transparent)",
+      color: "var(--ok-text)",
+      borderColor: "color-mix(in oklch, var(--ok) 45%, transparent)",
+      "&:hover:not([data-disabled])": { bgcolor: "color-mix(in oklch, var(--ok) 32%, transparent)" },
     },
     ghost: {
       bgcolor: "transparent",

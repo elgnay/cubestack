@@ -29,9 +29,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { PointerEvent as ReactPointerEvent } from "react";
 
 import {
+  addApproval,
   applyAgentEvent,
   historyToMsgs,
   newAgentMsg,
+  newApproval,
   newQuestion,
   openApprovals,
   openQuestions,
@@ -51,11 +53,11 @@ import type {
   AgentStatus,
   GatewayModel,
   HistoryMessage,
+  PendingApproval,
   SkillInfo,
 } from "@/lib/cubepilot/types";
 import { useI18n } from "@/lib/i18n";
 
-import { fmtTime } from "./format";
 import { HitlDock, type ApprovalDecision } from "./HitlDock";
 import { CopyBtn, ParamsPanel, SampleParams } from "./Playground";
 import { AgentThread } from "./AgentThread";
@@ -285,6 +287,13 @@ export function ChatPane() {
       (m) =>
         m.role === "agent" &&
         m.questions.some((q) => (q.state === "pending" || q.state === "submitting") && q.deadline !== undefined),
+    ) ||
+    // ...and for a held write with an expiry of its own: the gateway drops the
+    // record when it passes, so its card counts down too.
+    msgs.some(
+      (m) =>
+        m.role === "agent" &&
+        m.approvals.some((a) => (a.state === "pending" || a.state === "deciding") && a.expiresAtMs !== undefined),
     );
   useEffect(() => {
     if (!anyLive) return;
@@ -595,9 +604,16 @@ export function ChatPane() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { items?: HistoryMessage[] };
       if (genRef.current !== gen) return true;
-      lastHistoryRef.current = JSON.stringify(body.items ?? []);
-      const restored = historyToMsgs(body.items ?? [], nextId);
-      setMsgs(restored);
+      const items = body.items ?? [];
+      lastHistoryRef.current = JSON.stringify(items);
+      const restored = historyToMsgs(items, nextId);
+      // An empty document never replaces what is on screen. Read on its own it
+      // means "this conversation has not started", and the caller greets — but
+      // this same read is what the follow loop takes when a turn it was watching
+      // ENDS, and there the view already holds that turn's output and its cards.
+      // Empty then means the runtime has not written it yet, or is a read that
+      // raced the writer; adopting it deletes the turn in exchange for nothing.
+      if (restored.length > 0) setMsgs(restored);
       return restored.length > 0;
     } catch {
       if (genRef.current === gen) setAgentNotice(t("cubepilot.chat.historyUnavailable"));
@@ -620,18 +636,23 @@ export function ChatPane() {
         return m.map((x, xi) => (xi === i && x.role === "agent" ? patch(x) : x));
       });
     };
-    const attachApproval = (a: { approvalId: string; tool?: string; command?: string; level?: string; message?: string }) => {
+    const attachApproval = (a: PendingApproval) => {
       // The card belongs to the turn it was raised in — the newest one here,
       // since restore happens before anything else can arrive.
-      const card: AgentApproval = { callId: a.approvalId, name: a.tool, command: a.command, level: a.level, message: a.message, state: "pending" };
-      attachToNewest((x) => ({ ...x, approvals: [...x.approvals, card] }));
+      const card = newApproval({ ...a, name: a.tool });
+      // Through the fold's own add, so a stream event that already described
+      // this approval is not doubled by the read that describes it again.
+      attachToNewest((x) => addApproval(x, card));
     };
     try {
       const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/approval/pending`);
       if (res.ok && genRef.current === gen) {
-        const { approval } = (await res.json()) as { approval?: { approvalId?: string; tool?: string; command?: string; level?: string; message?: string } };
-        // Property narrowing does not change the object type, so pin the id.
-        if (approval && approval.approvalId) attachApproval({ ...approval, approvalId: approval.approvalId });
+        // A LIST: the gateway can be holding several for one session, and the
+        // oldest is not the only one this pane has to offer.
+        const { approvals } = (await res.json()) as { approvals?: PendingApproval[] };
+        for (const a of approvals ?? []) {
+          if (a.approvalId) attachApproval(a);
+        }
       }
       // 404 = no pending approval: silent by contract.
     } catch {
@@ -691,10 +712,17 @@ export function ChatPane() {
       // stream is writing to with it — every later event would be applied to an
       // id no longer in the list, and the turn would show nothing at all.
       if (ownTurnRef.current) return;
-      const raw = JSON.stringify(body.items ?? []);
+      // An empty read is not something to adopt. A turn's transcript is never
+      // empty once it has said anything, so an empty one means the runtime has
+      // not written it yet — and replacing the view with it would delete the
+      // stream's own output (and the cards it raised) in exchange for nothing.
+      // Skipping costs one stale tick; adopting costs the turn.
+      const items = body.items ?? [];
+      if (items.length === 0) return;
+      const raw = JSON.stringify(items);
       if (raw === lastHistoryRef.current) return;
       lastHistoryRef.current = raw;
-      setMsgs(historyToMsgs(body.items ?? [], nextId));
+      setMsgs(historyToMsgs(items, nextId));
     } catch {
       /* a dropped poll is not an error; the next one re-reads */
     }
@@ -1029,21 +1057,32 @@ export function ChatPane() {
       const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(agentSessionKey)}/approval`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ decision }),
+        // The id is required: a session can hold several pending approvals, and
+        // the server will not pick one for us — an un-named decision is a 400.
+        body: JSON.stringify({ approvalId: callId, decision }),
       });
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         if (res.status === 404 || res.status === 409) {
-          // The record is gone: the turn ended (or another client decided) while
-          // this click was in flight. Nobody decided, which is the neutral
-          // "stopped" — reporting the user's own click as a rejection would
-          // attribute to them a decision the server refused.
+          // The record is gone or was decided elsewhere while this click was in
+          // flight: the turn ended, it expired, or another client answered it
+          // first. Nobody decided HERE, which is the neutral "stopped" —
+          // reporting the user's own click as a rejection would attribute to
+          // them a decision the server refused.
           patchApproval(callId, (a) => ({ ...a, state: "stopped", error: undefined }));
           return;
         }
         throw new Error(body?.error ?? `HTTP ${res.status}`);
       }
-      const body = (await res.json().catch(() => null)) as { allowlisted?: boolean } | null;
+      const body = (await res.json().catch(() => null)) as { allowlisted?: boolean; approvalId?: string } | null;
+      // The approval this settled is the one that was named. A server that
+      // answered for a different one would have let a write through that the
+      // user never chose, which is the failure the id exists to prevent — so it
+      // is reported rather than recorded as this card's decision.
+      if (body?.approvalId && body.approvalId !== callId) {
+        patchApproval(callId, (a) => ({ ...a, state: "stopped", error: t("cubepilot.chat.approvalWrongRecord", { id: body.approvalId ?? "" }) }));
+        return;
+      }
       // The approval_resolved event normally follows on the stream; when the
       // stream is already closed the response is the only outcome signal.
       patchApproval(callId, (a) => (a.state === "deciding" ? { ...a, state: decision === "reject" ? "rejected" : "approved" } : a));
@@ -1373,9 +1412,7 @@ export function ChatPane() {
     ? t("cubepilot.chat.agentMetaLoading")
     : !agentStatus.exists
       ? t("cubepilot.chat.agentNotProvisioned")
-      : [agentStatus.phase || t("cubepilot.chat.agentStarting"), agentStatus.lastActivity ? fmtTime(agentStatus.lastActivity) : ""]
-          .filter(Boolean)
-          .join(" · ");
+      : agentStatus.phase || t("cubepilot.chat.agentStarting");
 
   const objName = isAgent ? "CubePilot" : (svc?.id ?? "—");
   const objRole = isAgent ? agentRoleLine : svc ? t("cubepilot.chat.roleModel") : "";
@@ -1389,7 +1426,12 @@ export function ChatPane() {
   // parked by a turn several bubbles back is still a turn blocked on the user,
   // and its card would otherwise have scrolled away with the bubble that raised
   // it.
-  const dockApprovals = msgs.flatMap((m) => (m.role === "agent" ? openApprovals(m) : []));
+  // Oldest first, the order the gateway lists them in: a session can hold
+  // several, and createdAtMs is the only stable key they have — a card restored
+  // after a reload never saw the arrival order its siblings did.
+  const dockApprovals = msgs
+    .flatMap((m) => (m.role === "agent" ? openApprovals(m) : []))
+    .sort((a, b) => (a.createdAtMs ?? 0) - (b.createdAtMs ?? 0));
   const dockQuestions = msgs.flatMap((m) => (m.role === "agent" ? openQuestions(m) : []));
 
   // What the card header says this conversation is doing. The order of the

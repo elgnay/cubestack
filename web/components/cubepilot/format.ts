@@ -27,12 +27,24 @@ export function fmtDuration(a?: string, b?: string): string {
   return Math.floor(s / 60) + "m " + (s % 60) + "s";
 }
 
-/** "73m 5s" style uptime from seconds. */
-export function fmtUptime(totalSeconds?: number): string {
+/** Uptime from seconds: "5m 3s" under an hour, "3h 20m" under a day, "4d 6h"
+ *  beyond — two units each, and each one naming the quantity it computed.
+ *
+ *  The reference stops at minutes and prints "6174m 59s" for a four-day
+ *  instance: correct, and unreadable. The coarser tiers are ours, and the first
+ *  version of them divided MINUTES by 60 and labelled the result "d" — so every
+ *  uptime over an hour read 24x longer than it was (a four-day-old instance
+ *  showed "102d"). */
+export function fmtSeconds(totalSeconds?: number): string {
   if (totalSeconds == null) return "-";
-  const m = Math.floor(totalSeconds / 60);
-  if (m >= 60) return Math.floor(m / 60) + "d " + (m % 60) + "m";
-  return m + "m " + (totalSeconds % 60) + "s";
+  // Under a minute is just seconds: "0m 26s" is what a countdown about to expire
+  // reads as, and that is exactly when someone is watching it.
+  if (totalSeconds < 60) return totalSeconds + "s";
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 60) return minutes + "m " + (totalSeconds % 60) + "s";
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return hours + "h " + (minutes % 60) + "m";
+  return Math.floor(hours / 24) + "d " + (hours % 24) + "h";
 }
 
 /** Trigger a client-side download of a text file (report export). */
