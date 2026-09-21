@@ -17,7 +17,8 @@
 # VM, so the VIP is reachable from the cluster but not from a macOS shell. Run
 # the reachability assertions on CI, or from a container/pod on the cluster.
 #
-# Idempotent: exits early when the controller is already Available.
+# Idempotent: a settled controller skips the manifest install, and every step
+# below it is a re-apply.
 set -euo pipefail
 
 METALLB_VERSION="${METALLB_VERSION:-v0.16.0}"
@@ -37,10 +38,17 @@ DOCKER="${DOCKER:-docker}"
 
 cd "$(dirname "$0")/.." # operator/
 
+# Skips the installation only, never the rest of the script: the pool and its
+# advertisement are applied below either way. Exiting here instead — as this
+# once did — means a run that stopped after the controller became Available but
+# before the pool was applied leaves every later run reporting success with no
+# IPAddressPool, and the Gateway's Service sitting EXTERNAL-IP <pending> for a
+# reason nothing in the log names.
+METALLB_READY=""
 if [ "$("${KUBECTL}" --context "${CTX}" get deployment -n "${NS}" controller \
   -o jsonpath='{.status.conditions[?(@.type=="Available")].status}' 2>/dev/null || true)" = "True" ]; then
-  echo "metallb controller already Available in ${NS} on ${CTX} — skipping"
-  exit 0
+  METALLB_READY=1
+  echo "metallb controller already Available in ${NS} on ${CTX} — reconciling the pool"
 fi
 
 # --- address pool ---
@@ -75,52 +83,54 @@ fi
 echo "MetalLB pool: ${POOL_RANGE} (kind network '${KIND_NETWORK}')"
 
 # --- install ---
-OUT="$(mktemp)"
-trap 'rm -f "${OUT}"' EXIT
-echo "fetching MetalLB ${METALLB_VERSION} native manifest"
-curl -fsSL "${METALLB_MANIFEST_URL}" -o "${OUT}"
-# sha256sum on the Linux CI runner, shasum on the macOS dev machines.
-if command -v sha256sum >/dev/null 2>&1; then
-  DIGEST="$(sha256sum "${OUT}" | awk '{print $1}')"
-else
-  DIGEST="$(shasum -a 256 "${OUT}" | awk '{print $1}')"
+if [ -z "${METALLB_READY}" ]; then
+  OUT="$(mktemp)"
+  trap 'rm -f "${OUT}"' EXIT
+  echo "fetching MetalLB ${METALLB_VERSION} native manifest"
+  curl -fsSL "${METALLB_MANIFEST_URL}" -o "${OUT}"
+  # sha256sum on the Linux CI runner, shasum on the macOS dev machines.
+  if command -v sha256sum >/dev/null 2>&1; then
+    DIGEST="$(sha256sum "${OUT}" | awk '{print $1}')"
+  else
+    DIGEST="$(shasum -a 256 "${OUT}" | awk '{print $1}')"
+  fi
+  [ "${DIGEST}" = "${METALLB_MANIFEST_SHA256}" ] \
+    || { echo "MetalLB manifest checksum mismatch — ${METALLB_VERSION} was re-tagged, or the download is wrong" >&2; exit 1; }
+
+  # The bundle's own image refs point at quay.io. Repoint them at the platform
+  # registry, which holds the same tags (hack/mirror-e2e-images.sh): the runner
+  # reaches harbor.isuanova.com on the internal network, and quay.io is both slow
+  # from it and one rate limit away from failing the job. Only the repository is
+  # rewritten, so the tag — and with it the version — stays whatever
+  # METALLB_VERSION pinned above. The checksum pin is what makes this safe to do
+  # blind: the rewrite is applied to exactly the manifest those refs were read
+  # from. Set METALLB_REGISTRY= (explicitly empty) to keep the upstream refs.
+  METALLB_REGISTRY="${METALLB_REGISTRY-harbor.isuanova.com/suanova}"
+  if [ -n "${METALLB_REGISTRY}" ]; then
+    sed -e "s#quay.io/metallb/controller:#${METALLB_REGISTRY}/metallb-controller:#g" \
+        -e "s#quay.io/metallb/speaker:#${METALLB_REGISTRY}/metallb-speaker:#g" \
+        "${OUT}" > "${OUT}.registry" && mv "${OUT}.registry" "${OUT}"
+    # Fail loudly if the bundle stops carrying the refs this rewrote. Silently
+    # falling back to quay.io would still pass on a runner that can reach it, so
+    # the mirror would rot unnoticed until the day it mattered.
+    grep -q 'quay.io/metallb/' "${OUT}" \
+      && { echo "MetalLB manifest still references quay.io after the registry rewrite — its image refs changed shape; update this script" >&2; exit 1; }
+  fi
+
+  # --server-side: the CRDs in this bundle (bgppeers, ipaddresspools, ...) carry
+  # schemas too large for client-side apply's last-applied-configuration annotation.
+  echo "applying MetalLB to ${CTX}"
+  "${KUBECTL}" --context "${CTX}" apply --server-side -f "${OUT}"
+
+  echo "waiting for metallb controller and speakers..."
+  "${KUBECTL}" --context "${CTX}" rollout status deployment/controller -n "${NS}" --timeout=300s
+  "${KUBECTL}" --context "${CTX}" rollout status daemonset/speaker -n "${NS}" --timeout=300s
+
+  # The webhook has to answer before an IPAddressPool can be admitted; the rollout
+  # above covers the pods, not the Service behind the webhook.
+  "${KUBECTL}" --context "${CTX}" wait --for=condition=Ready pod -n "${NS}" \
+    -l app=metallb,component=controller --timeout=120s
 fi
-[ "${DIGEST}" = "${METALLB_MANIFEST_SHA256}" ] \
-  || { echo "MetalLB manifest checksum mismatch — ${METALLB_VERSION} was re-tagged, or the download is wrong" >&2; exit 1; }
-
-# The bundle's own image refs point at quay.io. Repoint them at the platform
-# registry, which holds the same tags (hack/mirror-e2e-images.sh): the runner
-# reaches harbor.isuanova.com on the internal network, and quay.io is both slow
-# from it and one rate limit away from failing the job. Only the repository is
-# rewritten, so the tag — and with it the version — stays whatever
-# METALLB_VERSION pinned above. The checksum pin is what makes this safe to do
-# blind: the rewrite is applied to exactly the manifest those refs were read
-# from. Set METALLB_REGISTRY= (explicitly empty) to keep the upstream refs.
-METALLB_REGISTRY="${METALLB_REGISTRY-harbor.isuanova.com/suanova}"
-if [ -n "${METALLB_REGISTRY}" ]; then
-  sed -e "s#quay.io/metallb/controller:#${METALLB_REGISTRY}/metallb-controller:#g" \
-      -e "s#quay.io/metallb/speaker:#${METALLB_REGISTRY}/metallb-speaker:#g" \
-      "${OUT}" > "${OUT}.registry" && mv "${OUT}.registry" "${OUT}"
-  # Fail loudly if the bundle stops carrying the refs this rewrote. Silently
-  # falling back to quay.io would still pass on a runner that can reach it, so
-  # the mirror would rot unnoticed until the day it mattered.
-  grep -q 'quay.io/metallb/' "${OUT}" \
-    && { echo "MetalLB manifest still references quay.io after the registry rewrite — its image refs changed shape; update this script" >&2; exit 1; }
-fi
-
-# --server-side: the CRDs in this bundle (bgppeers, ipaddresspools, ...) carry
-# schemas too large for client-side apply's last-applied-configuration annotation.
-echo "applying MetalLB to ${CTX}"
-"${KUBECTL}" --context "${CTX}" apply --server-side -f "${OUT}"
-
-echo "waiting for metallb controller and speakers..."
-"${KUBECTL}" --context "${CTX}" rollout status deployment/controller -n "${NS}" --timeout=300s
-"${KUBECTL}" --context "${CTX}" rollout status daemonset/speaker -n "${NS}" --timeout=300s
-
-# The webhook has to answer before an IPAddressPool can be admitted; the rollout
-# above covers the pods, not the Service behind the webhook.
-"${KUBECTL}" --context "${CTX}" wait --for=condition=Ready pod -n "${NS}" \
-  -l app=metallb,component=controller --timeout=120s
 
 # --- pool + advertisement ---
 # Both objects, always. An IPAddressPool with no L2Advertisement is MetalLB's
