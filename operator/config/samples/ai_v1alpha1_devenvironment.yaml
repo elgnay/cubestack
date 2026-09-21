@@ -73,9 +73,27 @@ spec:
       name: dev-alice-ssh-keys   # must be labeled ai.cubestack.io/ssh-keys-delegated: "true"
       key: authorized_keys       # Secret.data[authorized_keys] holds the authorized_keys content
 
-  # Network
+  # Network. An environment can be given RDMA access, per fabric: the cluster
+  # advertises devices, and the environment is handed one for the fabric it
+  # names. How the platform attaches it — and so what it asks of the node and
+  # the namespace — is not part of this API, so the arrangement can change
+  # without the environment changing with it.
+  #
+  # Which device to request is cluster configuration rather than a spec field,
+  # so the resource names are the manager's: --rdma-ib-resource and
+  # --rdma-roce-resource, defaulting to rdma/ib_shared_devices and
+  # rdma/roce_shared_devices. A cluster that advertises other names points the
+  # flags at those; one that advertises neither leaves RDMA environments
+  # Pending.
+  #
+  # Whichever fabric, the namespace must admit the privileged Pod Security
+  # Standard: registering RDMA memory locks pages, and that capability is
+  # outside the Baseline set.
   network:
     rdmaEnabled: false
+    # An InfiniBand fabric addresses a device's peers itself; a RoCE fabric
+    # derives their addresses from the host's own networking. An environment is
+    # reachable only on the fabric it names.
     rdmaType: roce               # infiniband / roce
 
   # Container runtime customization

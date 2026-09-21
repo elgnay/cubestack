@@ -21,11 +21,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	"k8s.io/apimachinery/pkg/api/validate/content"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -71,6 +73,7 @@ func main() {
 	var tlsOpts []func(*tls.Config)
 	var gatewayDomain, gatewayName, gatewayNamespace, gatewayDataplaneNamespace string
 	var l4PortRangeStart, l4PortRangeEnd int
+	var rdmaIBResource, rdmaRoCEResource string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&gatewayDomain, "gateway-domain", "",
@@ -89,6 +92,15 @@ func main() {
 	flag.IntVar(&l4PortRangeEnd, "l4-port-range-end", 20999,
 		"Last port of the DevEnvironment L4 port pool. The pool is cluster-wide: each ssh exposure and "+
 			"each spec.ports[].type: tcp exposure takes one port from it.")
+	flag.StringVar(&rdmaIBResource, "rdma-ib-resource", "rdma/ib_shared_devices",
+		"Extended resource an InfiniBand DevEnvironment requests. It is advertised by the cluster's "+
+			"shared RDMA device plugin, whose ConfigMap owns the name. The rdma/ prefix is the plugin's "+
+			"own resourcePrefix default, so leaving it alone needs no change to that ConfigMap.")
+	flag.StringVar(&rdmaRoCEResource, "rdma-roce-resource", "rdma/roce_shared_devices",
+		"Extended resource a RoCE DevEnvironment requests, from the same device plugin. The two names "+
+			"are this platform's own: no convention exists for naming an RDMA resource after its fabric, "+
+			"so the pair is deliberately symmetric rather than copied from the plugin's own examples, "+
+			"which distinguish pools by instance (hca_shared_devices_a and _b).")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
@@ -126,6 +138,24 @@ func main() {
 	} {
 		if f.value != 0 && (f.value < 1 || f.value > 65535) {
 			setupLog.Error(fmt.Errorf("--%s must be a port between 1 and 65535, got %d", f.name, f.value), "Invalid flag")
+			os.Exit(1)
+		}
+	}
+
+	// A resource name reaches the pod verbatim. The API server would reject an
+	// unqualified one at admission — after the environment's StatefulSet exists
+	// and the failure is per-environment rather than once at startup — and a
+	// name the gpu field already owns would be overwritten in the resource map
+	// without any error at all, so both are caught here instead.
+	for _, f := range [...]struct {
+		name  string
+		value string
+	}{
+		{"rdma-ib-resource", rdmaIBResource},
+		{"rdma-roce-resource", rdmaRoCEResource},
+	} {
+		if err := validateRDMAResource(f.name, f.value); err != nil {
+			setupLog.Error(err, "Invalid flag")
 			os.Exit(1)
 		}
 	}
@@ -262,6 +292,8 @@ func main() {
 			HTTPPort:                  80,
 			L4PortRangeStart:          int32(l4PortRangeStart),
 			L4PortRangeEnd:            int32(l4PortRangeEnd),
+			RDMAIBResource:            rdmaIBResource,
+			RDMARoCEResource:          rdmaRoCEResource,
 		},
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "DevEnvironment")
@@ -282,4 +314,37 @@ func main() {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
+}
+
+// validateRDMAResource rejects a --rdma-ib-resource / --rdma-roce-resource value
+// the cluster could not honour. The name is copied verbatim into the pod's
+// resource map, next to the accelerator resource the environment's gpu field
+// selects (gpuResource in internal/controller), so the two names that field can
+// produce are rejected here to keep one from silently replacing the other.
+func validateRDMAResource(flagName, value string) error {
+	// The domain prefix is what makes the name an extended resource. IsLabelKey
+	// alone lets through both halves of what that excludes: a bare "example",
+	// which pod admission refuses as a non-native resource without a qualifier,
+	// and a native "ephemeral-storage" or "hugepages-2Mi", which is accepted and
+	// asks the node for storage or huge pages where a device was meant. Neither
+	// failure names its cause — the first strands the environment, the second
+	// hands it a resource it cannot use — so the slash is required outright.
+	if !strings.Contains(value, "/") {
+		return fmt.Errorf("--%s must be a domain-qualified extended resource name, e.g. rdma/ib_shared_devices", flagName)
+	}
+	if errs := content.IsLabelKey(value); len(errs) > 0 {
+		return fmt.Errorf("--%s must be a qualified resource name, e.g. rdma/ib_shared_devices: %s",
+			flagName, strings.Join(errs, "; "))
+	}
+	switch value {
+	case "cpu", "memory":
+		return fmt.Errorf("--%s must name an extended resource, not the native resource %q", flagName, value)
+	case "nvidia.com/gpu", "metax-tech.com/gpu":
+		return fmt.Errorf("--%s must not name the accelerator resource %q that spec.resources.gpu already requests",
+			flagName, value)
+	}
+	if strings.HasPrefix(value, "requests.") {
+		return fmt.Errorf("--%s must not start with %q", flagName, "requests.")
+	}
+	return nil
 }

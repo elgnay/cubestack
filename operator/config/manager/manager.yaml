@@ -78,6 +78,12 @@ spec:
           # flags from its l4PortRange.* values instead.
           - --l4-port-range-start=20000
           - --l4-port-range-end=20999
+          # Extended resources a DevEnvironment's spec.network requests, as
+          # advertised by the cluster's shared RDMA device plugin (whose
+          # ConfigMap owns the names). The helm chart renders these two flags
+          # from its rdma.* values instead.
+          - --rdma-ib-resource=rdma/ib_shared_devices
+          - --rdma-roce-resource=rdma/roce_shared_devices
         image: controller:latest
         imagePullPolicy: IfNotPresent
         name: manager

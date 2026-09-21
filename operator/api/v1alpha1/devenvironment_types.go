@@ -225,14 +225,34 @@ type SSHSpec struct {
 }
 
 // NetworkSpec configures the network.
+//
+// RDMA access is granted per fabric: an environment is given a device the
+// cluster advertises for the fabric it names. How that device is attached to
+// the environment, and what else it takes, is the platform's to arrange — it
+// is deliberately not part of this API, so the arrangement can change without
+// the environment changing with it.
 type NetworkSpec struct {
-	// RDMAEnabled enables the RDMA network (Multus).
+	// RDMAEnabled gives the environment access to an RDMA device on the node it
+	// runs on.
+	//
+	// The device is advertised by the cluster, so which one an environment
+	// requests is cluster configuration rather than a field here; an
+	// environment whose requested device no node advertises stays Pending.
+	//
+	// Registering a memory region locks pages, and the capability that permits
+	// it is outside the set the Baseline Pod Security Standard allows, so the
+	// namespace has to admit the privileged standard. That holds whichever
+	// fabric is selected.
 	// +kubebuilder:default=false
 	// +optional
 	RDMAEnabled bool `json:"rdmaEnabled,omitempty"`
 
-	// RDMAType is the RDMA network type: infiniband (requires IB switches) /
-	// roce (RoCEv2, reuses lossless ethernet); effective when rdmaEnabled=true.
+	// RDMAType names the fabric the environment joins; effective when
+	// rdmaEnabled=true.
+	//
+	// The fabric is what addresses the peers: an InfiniBand fabric assigns the
+	// addresses a device uses, a RoCE fabric derives them from the host's own
+	// networking, so an environment is reachable only on the fabric it names.
 	// +kubebuilder:validation:Enum=infiniband;roce
 	// +kubebuilder:default=roce
 	// +optional

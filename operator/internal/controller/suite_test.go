@@ -115,6 +115,11 @@ var _ = BeforeSuite(func() {
 			HTTPPort:                  80,
 			L4PortRangeStart:          testL4PortRangeStart,
 			L4PortRangeEnd:            20100,
+			// Not the production defaults, so a spec can tell a resource name
+			// that reached the pod from the flag through the config apart from
+			// one the controller defaulted on its own.
+			RDMAIBResource:   testRDMAIBResource,
+			RDMARoCEResource: testRDMARoCEResource,
 		},
 	}).SetupWithManager(testMgr)
 	Expect(err).NotTo(HaveOccurred())

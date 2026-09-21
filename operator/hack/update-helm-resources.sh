@@ -76,7 +76,9 @@ sed -i 's|namespace: cubestack-system|namespace: {{ .Release.Namespace }}|g' "${
 #
 # The DevEnvironment L4 port pool flags are rewritten the same way, but
 # unconditionally: the pool always has a range, so .Values.l4PortRange.start/end
-# are always passed.
+# are always passed. The RDMA extended resource flags follow that pattern for
+# the same reason — a name always exists, and the cluster's device plugin
+# ConfigMap, not this chart, is what defines it.
 awk '
 /^[[:space:]]*- --gateway-name=cubestack-gateway$/ {
   if (gateway_name++) { print "duplicate --gateway-name line in kustomize output" > "/dev/stderr"; exit 1 }
@@ -110,6 +112,18 @@ awk '
   print ind "- --l4-port-range-end={{ .Values.l4PortRange.end }}"
   next
 }
+/^[[:space:]]*- --rdma-ib-resource=rdma\/ib_shared_devices$/ {
+  if (rdma_ib++) { print "duplicate --rdma-ib-resource line in kustomize output" > "/dev/stderr"; exit 1 }
+  ind = substr($0, 1, index($0, "-") - 1)
+  print ind "- --rdma-ib-resource={{ .Values.rdma.ibResource }}"
+  next
+}
+/^[[:space:]]*- --rdma-roce-resource=rdma\/roce_shared_devices$/ {
+  if (rdma_roce++) { print "duplicate --rdma-roce-resource line in kustomize output" > "/dev/stderr"; exit 1 }
+  ind = substr($0, 1, index($0, "-") - 1)
+  print ind "- --rdma-roce-resource={{ .Values.rdma.roceResource }}"
+  next
+}
 { print }
 END {
   # Fail loudly if the needles above matched nothing (e.g. the args in
@@ -122,6 +136,10 @@ END {
   }
   if (l4_start != 1 || l4_end != 1) {
     print "l4 port range args not found in kustomize output — update needle in update-helm-resources.sh" > "/dev/stderr"
+    exit 1
+  }
+  if (rdma_ib != 1 || rdma_roce != 1) {
+    print "rdma resource args not found in kustomize output — update needle in update-helm-resources.sh" > "/dev/stderr"
     exit 1
   }
 }
@@ -242,6 +260,16 @@ expect_render defaults present '^[[:space:]]*- --l4-port-range-start=20000$'
 expect_render defaults present '^[[:space:]]*- --l4-port-range-end=20999$'
 expect_render l4-range-custom present '^[[:space:]]*- --l4-port-range-start=30000$' --set l4PortRange.start=30000
 expect_render l4-range-custom present '^[[:space:]]*- --l4-port-range-end=30999$' --set l4PortRange.end=30999
+
+# The RDMA extended resource names also always render, and follow their values
+# verbatim. They are defined by the cluster's shared device plugin, not by this
+# chart, so a name that did not reach the manager would leave every RDMA
+# environment requesting a resource no node advertises — and its pods pending,
+# with nothing in the environment's own spec to explain why.
+expect_render defaults present '^[[:space:]]*- --rdma-ib-resource=rdma/ib_shared_devices$'
+expect_render defaults present '^[[:space:]]*- --rdma-roce-resource=rdma/roce_shared_devices$'
+expect_render rdma-custom present '^[[:space:]]*- --rdma-ib-resource=example\.com/ib$' --set rdma.ibResource=example.com/ib
+expect_render rdma-custom present '^[[:space:]]*- --rdma-roce-resource=example\.com/roce$' --set rdma.roceResource=example.com/roce
 
 # The chart ships the platform Gateway (config/gateway). .Values.gateway.name
 # drives both its name and the manager's --gateway-name, so the Gateway the

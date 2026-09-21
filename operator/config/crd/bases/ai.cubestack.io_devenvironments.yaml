@@ -71,13 +71,28 @@ spec:
                 properties:
                   rdmaEnabled:
                     default: false
-                    description: RDMAEnabled enables the RDMA network (Multus).
+                    description: |-
+                      RDMAEnabled gives the environment access to an RDMA device on the node it
+                      runs on.
+
+                      The device is advertised by the cluster, so which one an environment
+                      requests is cluster configuration rather than a field here; an
+                      environment whose requested device no node advertises stays Pending.
+
+                      Registering a memory region locks pages, and the capability that permits
+                      it is outside the set the Baseline Pod Security Standard allows, so the
+                      namespace has to admit the privileged standard. That holds whichever
+                      fabric is selected.
                     type: boolean
                   rdmaType:
                     default: roce
                     description: |-
-                      RDMAType is the RDMA network type: infiniband (requires IB switches) /
-                      roce (RoCEv2, reuses lossless ethernet); effective when rdmaEnabled=true.
+                      RDMAType names the fabric the environment joins; effective when
+                      rdmaEnabled=true.
+
+                      The fabric is what addresses the peers: an InfiniBand fabric assigns the
+                      addresses a device uses, a RoCE fabric derives them from the host's own
+                      networking, so an environment is reachable only on the fabric it names.
                     enum:
                     - infiniband
                     - roce
