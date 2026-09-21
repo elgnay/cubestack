@@ -1,9 +1,10 @@
 # Images workspace Makefile — build, smoke & publish the DevEnvironment base images.
 # Build context is this directory (see AGENTS.md). Each image has one name: build and
 # smoke work on one platform in the local store, and push publishes that name plus
-# :latest as a single multi-arch index (PLATFORMS). buildx cannot load locally and
-# push in one step, so the published layers are a fresh build of the same source
-# rather than the very image the local smoke accepted.
+# :latest as a single multi-arch index (PLATFORMS); PUSH_LATEST=0 withholds :latest,
+# and retag-latest moves it afterwards for a caller that has to decide later. buildx
+# cannot load locally and push in one step, so the published layers are a fresh build
+# of the same source rather than the very image the local smoke accepted.
 
 CONTAINER_TOOL ?= docker
 
@@ -96,8 +97,18 @@ IMG_JUPYTER ?= $(JUPYTER_REPO):$(TAG)
 LATEST_SSH     = $(SSH_REPO):latest
 LATEST_JUPYTER = $(JUPYTER_REPO):latest
 
-.PHONY: help check-tag check-platform check-platforms build build-ssh build-jupyter smoke smoke-ssh \
-	smoke-jupyter push push-ssh push-jupyter
+# Whether `make push` also moves :latest. A caller that may not move it — CI, which
+# only moves :latest when the run's commit is still the head of main — passes
+# PUSH_LATEST=0 and calls `make retag-latest` once it knows: buildx cannot load
+# locally and push in one step, so asking this Makefile for both would rebuild the
+# whole index a second time. See .github/workflows/ci-images.yml.
+PUSH_LATEST ?= 1
+
+LATEST_ARG_SSH     = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH))
+LATEST_ARG_JUPYTER = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_JUPYTER))
+
+.PHONY: help check-tag check-platform check-platforms check-push-latest build build-ssh build-jupyter \
+	smoke smoke-ssh smoke-jupyter push push-ssh push-jupyter retag-latest
 
 .DEFAULT_GOAL := help
 
@@ -134,6 +145,16 @@ check-platforms:
 		esac; \
 	done
 
+# LATEST_ARG_* read any value other than 1 as "do not move :latest", which is the
+# wrong answer for the one a human reaches for: PUSH_LATEST=true would publish and
+# silently leave :latest behind. Name the two accepted values instead.
+check-push-latest:
+	@case "$(PUSH_LATEST)" in \
+		1 | 0) ;; \
+		*) echo "make -C images: PUSH_LATEST is '$(PUSH_LATEST)' - expected 1 (also move :latest) or 0 (leave it)." >&2; \
+		   exit 1;; \
+	esac
+
 build: build-ssh build-jupyter ## Build both images
 
 build-ssh: check-tag check-platform ## Build the self-authored ssh image
@@ -155,14 +176,22 @@ smoke-jupyter: build-jupyter ## Build and smoke only the jupyter image
 
 push: push-ssh push-jupyter ## Publish both images as multi-arch indexes (TAG + :latest)
 
-push-ssh: check-tag check-platforms ## Publish the ssh image as a multi-arch index (TAG + :latest)
+push-ssh: check-tag check-platforms check-push-latest ## Publish the ssh image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
 		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
-		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) -t $(LATEST_SSH) --push .
+		-f ssh-ubuntu-server/Dockerfile -t $(IMG_SSH) $(LATEST_ARG_SSH) --push .
 
-push-jupyter: check-tag check-platforms ## Publish the jupyter image as a multi-arch index (TAG + :latest)
+push-jupyter: check-tag check-platforms check-push-latest ## Publish the jupyter image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
-		-f jupyter/Dockerfile -t $(IMG_JUPYTER) -t $(LATEST_JUPYTER) --push .
+		-f jupyter/Dockerfile -t $(IMG_JUPYTER) $(LATEST_ARG_JUPYTER) --push .
+
+# Repoint :latest at a TAG already in the registry rather than rebuilding: imagetools
+# writes an index naming the same manifests, so this cannot publish anything the build
+# did not produce. It is how a caller that withheld :latest from `push` moves it after
+# deciding to. Needs no PLATFORMS: nothing is built.
+retag-latest: check-tag ## Repoint :latest at an already-published TAG (no rebuild)
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_SSH) $(IMG_SSH)
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_JUPYTER) $(IMG_JUPYTER)
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

@@ -1,0 +1,95 @@
+name: CI Images
+
+# Push-only so publishing never appears in pull request checks. The suite that
+# validates these images — build and smoke — runs in ci-operator.yml, on pull
+# requests too; this workflow is about what a merge publishes.
+on:
+  push:
+    branches: [main]
+
+permissions: {}
+
+concurrency:
+  group: ci-images-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    permissions:
+      contents: read
+      pull-requests: read
+    runs-on: ubuntu-latest
+    outputs:
+      images: ${{ steps.filter.outputs.images }}
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          # Full history so paths-filter can diff against the base ref without fetching
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Detect changed paths
+        uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
+        id: filter
+        with:
+          filters: |
+            images:
+              - 'images/**'
+
+  build-push-images:
+    # Publish only when a merge lands on main with a change under images/.
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Set up QEMU
+        # PLATFORMS is linux/amd64 plus linux/arm64, so one of the two is not the
+        # runner's own architecture and has to be emulated for the build to finish.
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - name: Set up Buildx
+        # A runner's default driver is `docker`, which builds for a single platform.
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Log in to Harbor
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: harbor.isuanova.com
+          username: ${{ vars.CI_BOT_NAME }}
+          password: ${{ secrets.CI_BOT_PASSWORD }}
+      - name: Smoke the images before publishing them
+        # The contract the e2e asserts through the Gateway, against a build of this
+        # commit's source. ci-operator.yml runs the same target, but on this push
+        # rather than before it, and a merge should not publish an image that fails
+        # the assertions the platform depends on.
+        run: make -C images smoke
+      - name: Build and push the images
+        env:
+          GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="$(git rev-parse --short HEAD)"
+
+          # PUSH_LATEST=0: the mutable tag is moved below, and only if this run's
+          # commit is still the head of main.
+          make -C images push PUSH_LATEST=0 TAG="${TAG}"
+
+          # An older run can finish after a newer main commit; putting its image on
+          # `latest` would mislabel which commit is newest.
+          CURRENT_MAIN="$(
+            curl -fsSL \
+              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/main" \
+              | jq -r .commit.sha
+          )"
+          if [ "${CURRENT_MAIN}" != "${GITHUB_SHA}" ]; then
+            echo "Skipping 'latest': ${GITHUB_SHA} is no longer the head of main (current: ${CURRENT_MAIN})"
+            exit 0
+          fi
+
+          # Repoints the tag at the index pushed above; nothing is rebuilt.
+          make -C images retag-latest TAG="${TAG}"
