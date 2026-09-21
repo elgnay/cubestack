@@ -52,8 +52,13 @@ cd "$(dirname "$0")/.." # operator/
 # tag is the version, because the manifest carries METALLB_VERSION as exactly that
 # tag (the rewrite further down changes only the repository, not the tag). Not
 # matching means apply the manifest again, which is idempotent.
+# Every request in this script that is not already bounded by its own --timeout carries
+# a --request-timeout, because kubectl's default of 0 applies no client deadline: a
+# server that accepts the connection and never answers leaves the command waiting, and
+# nothing here can tell that apart from slowness.
 METALLB_READY=""
-CONTROLLER="$("${KUBECTL}" --context "${CTX}" get deployment -n "${NS}" controller \
+CONTROLLER="$("${KUBECTL}" --context "${CTX}" --request-timeout=10s \
+  get deployment -n "${NS}" controller \
   -o jsonpath='{.status.conditions[?(@.type=="Available")].status}{" "}{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
 if [ "${CONTROLLER% *}" = "True" ] && [ "${CONTROLLER##*:}" = "${METALLB_VERSION}" ]; then
   METALLB_READY=1
@@ -128,8 +133,10 @@ if [ -z "${METALLB_READY}" ]; then
 
   # --server-side: the CRDs in this bundle (bgppeers, ipaddresspools, ...) carry
   # schemas too large for client-side apply's last-applied-configuration annotation.
+  # 60s rather than the 10s the pool calls use: this is the largest payload in the
+  # script, and a write that is merely slow is not a failure.
   echo "applying MetalLB to ${CTX}"
-  "${KUBECTL}" --context "${CTX}" apply --server-side -f "${OUT}"
+  "${KUBECTL}" --context "${CTX}" --request-timeout=60s apply --server-side -f "${OUT}"
 
   echo "waiting for metallb controller and speakers..."
   "${KUBECTL}" --context "${CTX}" rollout status deployment/controller -n "${NS}" --timeout=300s
@@ -174,10 +181,16 @@ YAML
 # until it answers. Server-side dry run is that question with nothing to create, so
 # retrying it cannot leave a half-applied pool behind and the apply below stays a
 # single call whose failure means what it says.
+#
+# Both calls carry a finite --request-timeout — the default is explained on the probe
+# above — so each attempt can end, and the loop can therefore bound setup time. Without
+# one, a stalled API server would hold it open for as long as the job is allowed to
+# run, 15 attempts or not.
 POOL_WEBHOOK_ERROR=""
 for attempt in $(seq 1 15); do
   if POOL_WEBHOOK_ERROR="$(printf '%s\n' "${POOL_AND_ADVERTISEMENT}" |
-      "${KUBECTL}" --context "${CTX}" apply --dry-run=server -f - 2>&1 >/dev/null)"; then
+      "${KUBECTL}" --context "${CTX}" --request-timeout=10s \
+        apply --dry-run=server -f - 2>&1 >/dev/null)"; then
     # Cleared explicitly: a dry run that succeeds but writes a warning to stderr
     # would otherwise read as the failure below.
     POOL_WEBHOOK_ERROR=""
@@ -192,6 +205,7 @@ done
   exit 1
 }
 
-printf '%s\n' "${POOL_AND_ADVERTISEMENT}" | "${KUBECTL}" --context "${CTX}" apply -f -
+printf '%s\n' "${POOL_AND_ADVERTISEMENT}" |
+  "${KUBECTL}" --context "${CTX}" --request-timeout=10s apply -f -
 
 echo "metallb installed in ${NS}; pool ${POOL_RANGE}"
