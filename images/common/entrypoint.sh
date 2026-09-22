@@ -23,9 +23,22 @@ mode="${CUBESTACK_TYPE:-${CUBESTACK_IMAGE:-ssh}}"
 # their own, so the file's presence means ssh is enabled.
 ssh_enabled() { [ -f /etc/ssh/ssh_host_ed25519_key ]; }
 
+# Root is admitted only where it can be served. A non-root sshd can only setuid to
+# the account it runs as, so admitting root there buys nothing and costs a login
+# that is accepted and then dies at setresuid ("Failed to set uids to 0.") - the
+# refusal belongs at authentication. The condition is the uid this process runs as,
+# which is also the only uid that can write there, so the two cannot disagree.
+# AllowUsers accumulates across drop-ins, so this adds to 10-devenv.conf rather
+# than needing to replace it (see common/sshd/10-devenv.conf).
+allow_root_login() {
+  [ "$EUID" -eq 0 ] || return 0
+  printf 'AllowUsers root\n' >/etc/ssh/sshd_config.d/20-allow-root.conf
+}
+
 case "$mode" in
   jupyter)
     if ssh_enabled; then
+      allow_root_login
       # Validate before backgrounding: a host key that is present but unusable
       # (bad config, unreadable key) would otherwise kill sshd while jupyter kept
       # serving on its own port — the environment reports ready with the published
@@ -46,6 +59,7 @@ case "$mode" in
            "is the ssh Secret mounted?" >&2
       exit 1
     fi
+    allow_root_login
     exec /usr/sbin/sshd -D -e -f /etc/ssh/sshd_config
     ;;
   *)

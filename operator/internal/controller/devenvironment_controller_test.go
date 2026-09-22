@@ -1371,6 +1371,50 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				Runtime: &aiv1alpha1.RuntimeSpec{Command: []string{"sleep"}},
 			}})).To(Equal("user"))
 		})
+
+		It("serves root when the environment runs as root, naming no account", func() {
+			Expect(runtimeUser(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Runtime: &aiv1alpha1.RuntimeSpec{
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				},
+			}})).To(Equal(rootRuntimeUser))
+		})
+
+		It("serves root when the environment runs as root and names an image account", func() {
+			Expect(runtimeUser(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Runtime: &aiv1alpha1.RuntimeSpec{
+					User:            testRuntimeUser,
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				},
+			}})).To(Equal(rootRuntimeUser))
+		})
+	})
+
+	Describe("buildEndpoints", func() {
+		// The account in the address is the only place a user learns which account
+		// to log in as, so a root environment must not publish the spec's account
+		// there: its sshd runs as root and serves that uid.
+		It("advertises root for an environment that runs as root", func() {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-root", Namespace: testNamespace},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeJupyter,
+					SSH:  &aiv1alpha1.SSHSpec{Enabled: true},
+					Runtime: &aiv1alpha1.RuntimeSpec{
+						User:            testRuntimeUser,
+						SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+					},
+				},
+			}
+			status := &aiv1alpha1.DevEnvironmentStatus{}
+			(&DevEnvironmentReconciler{}).buildEndpoints(env, status, testGatewayIP,
+				map[string]int32{sshPortName: 20001}, map[int32]int32{20001: 20001})
+			Expect(status.Endpoints).To(ContainElement(aiv1alpha1.Endpoint{
+				Name:         sshPortName,
+				Address:      fmt.Sprintf("ssh://%s@%s:20001", rootRuntimeUser, testGatewayIP),
+				ListenerPort: 20001,
+			}))
+		})
 	})
 
 	Describe("desiredPodSpec", func() {
@@ -1614,6 +1658,38 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
 						SecretName:  sshClientKeySecretName(env),
 						DefaultMode: ptrTo(int32(0o644)),
+						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
+					}},
+				},
+			}))
+		})
+
+		// The mode is not a property of the file but of whoever reads it, which is
+		// why it cannot be a constant: a Secret volume materialises its files
+		// root-owned, and OpenSSH's private-key check fires only on a file owned by
+		// the uid reading it. A root sshd (runAsUser 0) *is* that owner, so 0644 —
+		// the mode the non-root path needs — is refused with "Permissions 0644 ...
+		// are too open", and the images' entrypoint turns that into a failed start
+		// rather than an environment that is merely missing ssh.
+		It("mounts the ssh Secrets 0600 for an environment running as root", func() {
+			var env *aiv1alpha1.DevEnvironment
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				env = e
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				}
+			})
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{
+				{
+					Name:         sshHostKeyVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o600))}},
+				},
+				{
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshClientKeySecretName(env),
+						DefaultMode: ptrTo(int32(0o600)),
 						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
 					}},
 				},

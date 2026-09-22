@@ -10,6 +10,12 @@
 #                       NOTEBOOK_ARGS base_url, plus sshd-as-'jovyan' when the ssh
 #                       Secret is mounted; both services in the same container
 #
+# Both images are also run as **root** (uid 0), the shape an environment takes when
+# the spec asks for it, where the host key is mounted 0600 and sshd is root itself.
+# The non-root runs additionally assert that this root support is not a widening:
+# the entrypoint admits root only when sshd is root, so a uid-1000 sshd refuses a
+# root login at authentication and a non-root environment serves no root session.
+#
 # sshd listens on the unprivileged :2222 (so no NET_BIND_SERVICE is needed); the
 # platform's Service publishes it as 22. The smoke talks to 2222 directly.
 #
@@ -47,10 +53,12 @@ esac
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/cubestack-smoke.XXXXXX")"
 ssh_cont=""
 jup_cont=""
+root_cont=""
 cleanup() {
   local code=$?
   [ -n "$ssh_cont" ] && "$CONTAINER_TOOL" rm -f "$ssh_cont" >/dev/null 2>&1 || true
   [ -n "$jup_cont" ] && "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
+  [ -n "$root_cont" ] && "$CONTAINER_TOOL" rm -f "$root_cont" >/dev/null 2>&1 || true
   rm -rf "$tmp"
   exit $code
 }
@@ -161,6 +169,92 @@ check_served_host_key() {
   fi
 }
 
+# check_root_ssh <image> <secret dir> <container name> <label> [extra run args...]
+#
+# The root half of the contract, which neither block below reaches: an environment
+# runs its image as root when the spec asks for it
+# (spec.runtime.securityContext.runAsUser 0), and ssh has to work there too. Two
+# things are different from the non-root runs, and both are invisible from them:
+#
+#   - the host key is mounted 0600. The reader and the owner are the same uid here,
+#     so OpenSSH's private-key check fires and a wider mode is refused outright
+#     ("Permissions 0644 ... are too open") — the mode the non-root path *needs* is
+#     the mode the root path must not have.
+#   - sshd runs as root, so it wants its privilege separation directory (which the
+#     image ships) and admits root at all - the entrypoint adds that AllowUsers
+#     entry from the uid sshd runs as, so it is here and nowhere else.
+#
+# The login account is the container's, not the image's: root is served whatever
+# account the image was built around. Extra args carry what a family needs to *stay
+# up* as root — the jupyter launcher otherwise drops to its stock account, which the
+# platform prevents with the same environment.
+check_root_ssh() {
+  local img=$1 base=$2 cont=$3 label=$4 port out
+  shift 4
+  make_secret "$base"
+  # ssh-keygen already wrote the host key 0600, which is what root mode needs. No
+  # probing here, unlike the non-root runs: the container owns the key by
+  # construction, so the mode the owner tolerates is a fixed answer.
+  "$CONTAINER_TOOL" run -d --name "$cont" \
+    --user 0:0 \
+    -p 127.0.0.1::2222 \
+    -v "$base/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$base/keys:/run/ssh:ro" \
+    "$@" \
+    "$img" >/dev/null
+  root_cont="$cont"
+  port="$("$CONTAINER_TOOL" port "$cont" 2222 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
+  wait_ssh "$port" 30 "$cont" ||
+    bad "$label: sshd served no host key on port $port within 30s"
+
+  out="$(ssh -i "$base/client/id_ed25519" \
+    -p "$port" \
+    -o BatchMode=yes -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    root@127.0.0.1 \
+    'printf "uid=%s user=%s\n" "$(id -u)" "$(id -un)"' \
+    2>&1 || true)"
+  check_contains "$out" "uid=0" "$label: ssh key-auth login as root (uid 0)"
+
+  check_served_host_key "$port" "$base/host/ssh_host_ed25519_key.pub" \
+    "$cont" "$label: served host key == mounted Secret public key"
+
+  if ! case "$out" in *"uid=0"*) true ;; *) false ;; esac; then
+    echo "  container logs:"
+    "$CONTAINER_TOOL" logs "$cont" 2>&1 | tail -n 20
+    echo "  the privilege separation directory a root sshd requires:"
+    "$CONTAINER_TOOL" exec "$cont" ls -ld /run/sshd 2>&1 || true
+  fi
+  "$CONTAINER_TOOL" rm -f "$cont" >/dev/null 2>&1 || true
+  root_cont=""
+}
+
+# The family account is admitted *beside* root, and a non-root sshd must not admit
+# root at all: it cannot setuid to it, so the login would be accepted and then die
+# at setresuid. The assertion is therefore about *where* the refusal happens -
+# "Permission denied" is authentication, and the marker below only appears if a
+# session was built. Asserting the text is what makes the check load-bearing:
+# `AllowUsers root` baked back into the drop-in restores the accepted-then-failed
+# login, which a session-shaped assertion cannot tell from a refusal. Guarded
+# against the vacuous pass because it is what keeps admitting root from being a
+# widening of the non-root path.
+# check_no_root_login <port> <client key> <container> <label>
+check_no_root_login() {
+  local port=$1 key=$2 cont=$3 label=$4 out
+  # Without this the check passes vacuously: a server that never answered also
+  # cannot produce the marker.
+  if [ -z "$(served_key "$port")" ]; then
+    bad "$label — sshd was not answering, so the check proves nothing"
+    return
+  fi
+  out="$(ssh -i "$key" \
+    -p "$port" \
+    -o BatchMode=yes -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    root@127.0.0.1 'echo SHOULD-NOT-HAPPEN' 2>&1 || true)"
+  check_contains "$out" "Permission denied" "$label"
+}
+
 # ---------------------------------------------------------------------------
 # ssh-ubuntu22.04
 # ---------------------------------------------------------------------------
@@ -200,6 +294,9 @@ if [ "$run_ssh" = 1 ]; then
   check_served_host_key "$ssh_port" "$tmp/ssh/host/ssh_host_ed25519_key.pub" \
     "$ssh_cont" "served host key == mounted Secret public key"
 
+  check_no_root_login "$ssh_port" "$tmp/ssh/client/id_ed25519" "$ssh_cont" \
+    "ssh: a non-root sshd refuses a root login"
+
   if ! case "$out" in *"uid=1000"*) true ;; *) false ;; esac; then
     echo "  container logs:"
     "$CONTAINER_TOOL" logs "$ssh_cont" 2>&1 | tail -n 20
@@ -209,6 +306,8 @@ if [ "$run_ssh" = 1 ]; then
   fi
   "$CONTAINER_TOOL" rm -f "$ssh_cont" >/dev/null 2>&1 || true
   ssh_cont=""
+
+  check_root_ssh "$IMG_SSH" "$tmp/sshroot" "cs-smoke-sshroot-$$" "ssh-ubuntu22.04 as root"
 fi
 
 # ---------------------------------------------------------------------------
@@ -296,6 +395,9 @@ if [ "$run_jupyter" = 1 ]; then
   check_served_host_key "$jup_ssh_port" "$tmp/jupssh/host/ssh_host_ed25519_key.pub" \
     "$jup_cont" "jupyter served host key == mounted Secret public key"
 
+  check_no_root_login "$jup_ssh_port" "$tmp/jupssh/client/id_ed25519" "$jup_cont" \
+    "jupyter: a non-root sshd refuses a root login"
+
   if ! case "$out" in *"uid=1000"*) true ;; *) false ;; esac; then
     echo "  container logs:"
     "$CONTAINER_TOOL" logs "$jup_cont" 2>&1 | tail -n 20
@@ -305,6 +407,14 @@ if [ "$run_jupyter" = 1 ]; then
   fi
   "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
   jup_cont=""
+
+  # The launcher's own price for running as root, which the platform leaves to the
+  # spec (runtime.env) rather than the image. Without them start.sh drops back to the
+  # stock account, and a launcher that exits takes the sshd it started with it, so the
+  # login below would never be attempted against a live container.
+  check_root_ssh "$IMG_JUPYTER" "$tmp/juproot" "cs-smoke-juproot-$$" "jupyter-minimal as root" \
+    -e NB_USER=root -e NB_UID=0 -e NB_GID=0 \
+    -e NOTEBOOK_ARGS="--allow-root"
 fi
 
 echo

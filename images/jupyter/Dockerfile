@@ -51,7 +51,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # account's own ssh-copy-id target exists; the PVC shadows it in-cluster), and
 # drop the package-generated host keys: identity comes from the mounted Secret,
 # and their absence is how the entrypoint detects that ssh is enabled.
+# /run/sshd is the privilege separation directory a *root* sshd requires and a
+# non-root one never consults - the apt package relies on the init system to
+# create it, which a container has none of (see common/sshd/10-devenv.conf).
 RUN mkdir -p /home/jovyan/.ssh \
+    && mkdir -p -m 0700 /run/sshd \
     && chown 1000:100 /home/jovyan/.ssh \
     && chmod 700 /home/jovyan/.ssh \
     && rm -f /etc/ssh/ssh_host_*
@@ -61,9 +65,9 @@ COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
 # for the @SSH_USER@ placeholder. It must match the stock container account
 # (jovyan) that USER selects below.
 ARG SSH_USER=jovyan
-COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
+COPY common/sshd/10-devenv.conf /etc/ssh/sshd_config.d/10-devenv.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
-    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
+    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-devenv.conf
 
 ENV CUBESTACK_IMAGE=jupyter
 

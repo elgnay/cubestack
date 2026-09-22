@@ -51,15 +51,20 @@ Every image:
 - **Keep ignore rules in `images/.dockerignore`** (deny-by-default). Docker only honors the
   context-root ignore file; a per-subdir `.dockerignore` is inert and misleading.
 - **Shared runtime logic lives in `common/`**: `entrypoint.sh` (mode selection + optional sshd +
-  hand-off to the image CMD) and `sshd/10-nonroot.conf` (the sshd drop-in, where the mount
+  hand-off to the image CMD) and `sshd/10-devenv.conf` (the sshd drop-in, where the mount
   contract's paths are fixed). The only per-family value in the drop-in is the ssh login account,
   kept as an `@SSH_USER@` placeholder that each Dockerfile substitutes from its `ARG SSH_USER` — so
   the shared parts cannot drift between families. Dockerfiles assemble packages, the overlay deltas,
-  and the substitution.
+  and the substitution. The drop-in admits the family account **only**: `root` is admitted by
+  `entrypoint.sh` at startup, and only when the container runs as `uid 0`. Keep that split — a
+  non-root sshd cannot setuid to root, so baking `root` in makes a non-root environment accept a
+  root key and then die with *Failed to set uids to 0.*, where a refusal at authentication belongs.
 - **The ssh material is mounted, never baked or staged.** Changing the mount paths means changing the
   drop-in (`HostKey`, `AuthorizedKeysFile`) *and* `images/README.md`'s contract table together, plus
-  the operator's mount. Key material must stay readable by the container uid: `0644` root-owned is
-  correct, tighter `defaultMode` breaks a non-root sshd.
+  the operator's mount. Key material must stay readable by the container uid: the operator renders
+  `0644` for a non-root `sshd` and `0600` when `securityContext.runAsUser: 0`, because a root `sshd`
+  rejects `0644` root-owned files as too open, while a non-root one cannot read `0600` files it does
+  not own. Changing the mode means changing that rendering in the controller too.
 - **Never commit secrets, private keys, or tokens.** Smoke-generated keys live only under `hack/` at
   runtime (`mktemp -d`) and are cleaned up.
 - **English** code comments, commit messages, and docs.
