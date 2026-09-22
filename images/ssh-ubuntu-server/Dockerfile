@@ -17,13 +17,24 @@
 #     -t harbor.isuanova.com/suanova/ssh-ubuntu22.04:<tag> images/
 #   (or: make -C images build)
 
-# Base: the Ubuntu release tag, deliberately not a digest pin. The release is the
-# axis the published repository name carries (ssh-ubuntu22.04), and it is
-# re-resolved at build time so a rebuild picks up Ubuntu security updates; a pinned
-# digest would freeze those out until someone remembered to bump it. Offline
-# installs record the digest of what was actually shipped (decision doc §3.D, §5).
+# Base: the Ubuntu release tag plus the digest of the platform registry's copy of it, which
+# is what the build resolves (BASE_ARGS, images/Makefile). The release is the axis the
+# published repository name carries (ssh-ubuntu22.04). The digest is there because the tag
+# alone is not a decision made here: the mirror is repointed by
+# operator/hack/mirror-e2e-images.sh and `ubuntu:22.04` is refreshed upstream monthly, so the
+# same revision could otherwise build two different base layers under one published tag.
+# Pinning makes picking up the security updates that refresh carries a deliberate step —
+# read the new digest, update the two maps, re-mirror. Offline installs record the digest of
+# what was actually shipped (decision doc §3.D, §5).
+#
+# UBUNTU_BASE exists because UBUNTU_VERSION cannot carry a registry host: it also
+# names the published repository (ssh-ubuntu$(UBUNTU_VERSION), images/Makefile), so
+# writing a host into it would rename the image. The base is therefore a separate
+# arg defaulting to upstream through that same version, and the platform registry's
+# copy is substituted for offline builds — see BASE_MIRRORS in the operator Makefile.
 ARG UBUNTU_VERSION=22.04
-FROM ubuntu:${UBUNTU_VERSION}
+ARG UBUNTU_BASE=ubuntu:${UBUNTU_VERSION}
+FROM ${UBUNTU_BASE}
 
 # Optional apt mirror override (e.g. a Tsinghua/Aliyun mirror in CN); empty = upstream.
 ARG APT_MIRROR=""

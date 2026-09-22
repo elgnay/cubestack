@@ -1,0 +1,46 @@
+# The environment the helm e2e brings up: one container serving JupyterLab and
+# sshd, published through the platform Gateway.
+#
+# __DEV_ENV_IMAGE__ is substituted by `make helm-e2e-devenv-verify` with the
+# published jupyter-minimal:latest reference. The pod pulls it from the platform
+# registry itself — nothing pre-loads it on the node — so the reference is the
+# one a deployment would write, and reaching the registry is part of what the
+# test asserts.
+#
+# __DEV_ENV_NAME__ and __DEV_ENV_NAMESPACE__ come from the same script's DEV_ENV_NAME and
+# DEV_ENV_NAMESPACE, which it also uses to create the namespace and to read the environment
+# back. They are placeholders rather than literals so those two knobs reach the resource
+# they name: applied as literals, an overridden run would create its own namespace, install
+# this manifest into demo/e2e-devenv, and then poll the name it asked for until it timed out.
+#
+# The two runtime settings are not decoration, they are the documented contract
+# for this image (images/README.md): 'jovyan' is the docker-stacks account, which
+# is what derives the /home/jovyan workspace mount, and gid 100 is the image's
+# native group while the operator's default runAsGroup is 1000. Get either wrong
+# and the container cannot write its own home.
+apiVersion: ai.cubestack.io/v1alpha1
+kind: DevEnvironment
+metadata:
+  name: __DEV_ENV_NAME__
+  namespace: __DEV_ENV_NAMESPACE__
+spec:
+  type: jupyter
+  image: __DEV_ENV_IMAGE__
+  running: true
+  # CPU-only: no gpu block, so the pod carries no accelerator resource and the
+  # image brand is not checked.
+  resources: {}
+  # size is what drives the workspace claim, which the controller always
+  # provisions from the hardcoded cephfs-ephemeral class — hence the StorageClass
+  # `make helm-e2e-setup` creates under that name.
+  storage:
+    size: 10Gi
+  # One endpoint, two protocols: sshd listens on 2222 in the container and the
+  # platform Service publishes it as 22. The controller mints the host key and
+  # the login keypair and reports both through status.
+  ssh:
+    enabled: true
+  runtime:
+    user: jovyan
+    securityContext:
+      runAsGroup: 100

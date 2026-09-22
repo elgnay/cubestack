@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       operator: ${{ steps.filter.outputs.operator }}
+      images: ${{ steps.filter.outputs.images }}
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -31,11 +32,19 @@ jobs:
         uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad # v3
         id: filter
         with:
+          # images/** has its own filter rather than riding on the operator one. The
+          # e2e pulls the *published* DevEnvironment image, so an edit under images/
+          # changes nothing its cluster assertions can see until that commit is
+          # published — running the whole operator suite for it would buy nothing.
+          # What does validate the images is images-smoke below, which builds both
+          # and asserts the operator contract against them.
           filters: |
             operator:
               - 'operator/**'
               - 'Makefile'
               - '.github/**'
+            images:
+              - 'images/**'
 
   lint:
     needs: changes
@@ -75,12 +84,37 @@ jobs:
       - name: Running Tests
         run: make test
 
+  images-smoke:
+    needs: changes
+    if: needs.changes.outputs.images == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Build and smoke the DevEnvironment base images
+        # Both images are built for linux/amd64 and started as throwaway containers on
+        # 127.0.0.1, so this needs neither a cluster nor registry credentials. Both
+        # families are built: the e2e exercises jupyter-minimal alone and leaves
+        # ssh-ubuntu22.04 neither built nor pulled (operator/Makefile), so this is the
+        # only job that covers it.
+        run: make -C images smoke
+
   test-e2e:
     needs: changes
     if: needs.changes.outputs.operator == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    env:
+      # The install target runs codegen locally so an edited tree is reflected
+      # in the cluster. That is redundant here: generate-drift runs the same
+      # targets and lint runs the same govet, under the same `changes` filter,
+      # in parallel with this job — and this job is the critical path.
+      HELM_E2E_CODEGEN: "0"
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -99,13 +133,24 @@ jobs:
           chmod +x ./kind
           sudo mv ./kind /usr/local/bin/kind
       - name: Install the operator via helm into a kind cluster
-        run: make helm-e2e-install
+        # -j2 overlaps helm-e2e-setup (cluster bootstrap) with helm-e2e-images (docker
+        # builds and the init image pull). ~160s of this step needs no cluster at all,
+        # and the two are joined by helm-e2e-images-load, which waits for both before
+        # loading anything — so nothing loads into a cluster that is still being
+        # created. The environment's own image is not among them: its pod pulls
+        # jupyter-minimal:latest from the platform registry at start. The codegen
+        # targets whose parallel execution would be unsafe are already off in this job
+        # (HELM_E2E_CODEGEN=0).
+        run: make helm-e2e-install -j2
         working-directory: operator
       - name: Verify CRDs, VAPs and RBAC
         run: make helm-e2e-crd-check
         working-directory: operator
       - name: Run the gpu-less ISVC happy-path verification
         run: make helm-e2e-verify
+        working-directory: operator
+      - name: Run the DevEnvironment happy-path verification
+        run: make helm-e2e-devenv-verify
         working-directory: operator
       - name: Clean up the kind cluster
         if: always()
@@ -151,7 +196,7 @@ jobs:
         working-directory: operator
 
   result:
-    needs: [lint, test, test-e2e, helm-drift, generate-drift]
+    needs: [lint, test, images-smoke, test-e2e, helm-drift, generate-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:

@@ -25,6 +25,9 @@
 #     -t harbor.isuanova.com/suanova/jupyter-minimal:<tag> images/
 #   (or: make -C images build)
 
+# The upstream reference, for a build that reaches Docker Hub. Every published build
+# substitutes the platform registry's mirrored copy of this same date, pinned by digest
+# through BASE_ARGS in images/Makefile — which is where the base is bumped.
 ARG JUPYTER_BASE=quay.io/jupyter/minimal-notebook:2026-09-07
 FROM ${JUPYTER_BASE}
 

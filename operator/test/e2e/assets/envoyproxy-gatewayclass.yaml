@@ -1,0 +1,56 @@
+# The GatewayClass the platform's Gateway asks to be served by, and the
+# EnvoyProxy that says what the dataplane behind it looks like. The chart ships
+# neither: it creates only the Gateway, and this is the rest of the prerequisite
+# the chart README documents (Prerequisites, "A GatewayClass that carries an
+# EnvoyProxy").
+#
+# It lives in envoy-gateway-system rather than the release namespace on purpose.
+# The platform owns the dataplane for the whole class, so per the README a
+# chart-shipped EnvoyProxy would replace the class's provider config rather than
+# merge with it; `make helm-e2e-crd-check` asserts the release namespace holds
+# none.
+#
+# What the e2e differs on from the README's example, and why:
+#
+#   * envoyService.type is LoadBalancer, not NodePort. This cluster has MetalLB
+#     (hack/install-metallb.sh), so the Gateway gets a real address in the kind
+#     network — which is what makes a published endpoint address assertable from
+#     the runner at all. It also keeps the L4 port pool honest: the controller
+#     treats a LoadBalancer dataplane as an identity mapping, so a listener on
+#     pool port 20000 is reachable on 20000, whereas a NodePort dataplane
+#     renumbers it into 30000-32767 and only the dataplane Service knows where.
+#   * The proxy image is pinned to the platform registry's mirror of the envoy
+#     build Envoy Gateway ships with. Envoy Gateway does not derive the image
+#     from this object — leave it unset and the dataplane pulls whatever envoy
+#     its own binary was compiled against, from Docker Hub — so the tag has to
+#     be named somewhere, and this is where Envoy Gateway's air-gap guide names
+#     it. The tag is not derivable from the Envoy Gateway version, only
+#     published alongside it, so the two are pinned together in the Makefile
+#     (ENVOY_PROXY_IMAGE, next to ENVOY_GATEWAY_VERSION): move one, re-check the
+#     other, and re-run hack/mirror-e2e-images.sh before the e2e will pass.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: EnvoyProxy
+metadata:
+  name: cubestack-dataplane
+  namespace: envoy-gateway-system
+spec:
+  provider:
+    type: Kubernetes
+    kubernetes:
+      envoyService:
+        type: LoadBalancer
+      envoyDeployment:
+        container:
+          image: __ENVOY_PROXY_IMAGE__
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: eg
+spec:
+  controllerName: gateway.envoyproxy.io/gatewayclass-controller
+  parametersRef:
+    group: gateway.envoyproxy.io
+    kind: EnvoyProxy
+    name: cubestack-dataplane
+    namespace: envoy-gateway-system

@@ -63,8 +63,18 @@ Every image:
 - **Never commit secrets, private keys, or tokens.** Smoke-generated keys live only under `hack/` at
   runtime (`mktemp -d`) and are cleaned up.
 - **English** code comments, commit messages, and docs.
-- Reproducible base tags only; no floating tags. Mirror hooks are explicit build args
-  (`APT_MIRROR`, `PIP_INDEX_URL`); nothing is baked that assumes a mirror.
+- Reproducible bases only; no floating tags, and every base the build resolves is pinned by digest.
+  Every build resolves `FROM` this platform's mirrored copies of the upstream bases by default
+  (`BASE_ARGS`), so the published image descends from the base the platform serves. The tag names
+  that base; the digest is what the build resolves, because
+  `operator/hack/mirror-e2e-images.sh` repoints those tags when someone here re-mirrors — on the
+  tag alone the same revision could publish different base layers. Bumping a base is therefore a
+  deliberate step: read the new digest, update `images/Makefile` and `BASE_MIRRORS` in
+  `operator/Makefile` together, then re-run the mirror script, which fails if a mirrored tag no
+  longer hashes to the digest it is listed under. Override with `BASE_ARGS=` to resolve `FROM`
+  upstream instead, unpinned.
+  `APT_MIRROR` / `PIP_INDEX_URL` stay explicit build args, and nothing baked into the running
+  image assumes a mirror.
 
 ## Build & smoke
 
@@ -72,8 +82,9 @@ Every image:
 make -C images build    # builds both images ($(PLATFORM), default linux/amd64), tagged
                         # $(REGISTRY)/$(PROJECT)/<image>:$(TAG)
 make -C images smoke    # local Docker smoke (ssh key-auth login; jupyter + optional sshd)
-make -C images push TAG=<tag>   # build, then add :latest to that image and push both refs to
-                                # $(REGISTRY)/$(PROJECT); TAG defaults to the commit SHA
+make -C images push TAG=<tag>   # builds each image for every $(PLATFORMS) (default
+                                # linux/amd64 linux/arm64) and pushes it as one multi-arch
+                                # index carrying :TAG and :latest
 make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt-in)
 ```
 
@@ -81,5 +92,14 @@ make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt
 different architecture the build (and the smoke's throwaway containers) run emulated — slower, but
 they exercise the artifact that is actually published.
 
-There is no cluster and no CI wiring yet; `make -C images smoke` is the acceptance gate. When this
-workspace gains CI, it must add a build + smoke job like the other sub-projects.
+`PLATFORMS` is the publish list for the same reason, and `make push PLATFORMS=linux/amd64` narrows it
+back to one. `push` is a `buildx build --push`, so it needs a builder that can do more than one
+platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU). It does **not**
+push the image the local smoke ran — buildx cannot load a multi-platform result and push it in one
+invocation, so it builds a fresh one from the same source.
+
+`make -C images smoke` is the acceptance gate, and CI runs it on both sides of a merge:
+`ci-operator.yml`'s `images-smoke` job on any change under `images/**`, and `ci-images.yml` on a push
+to main, which smokes again and then publishes — withholding `:latest` unless this commit's `images/`
+tree is still main's. The smoke itself needs no cluster and no registry credentials: both families are
+built for linux/amd64 and run as throwaway containers on 127.0.0.1.

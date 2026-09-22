@@ -1,5 +1,16 @@
 # Build the manager binary
-FROM golang:1.26 AS builder
+#
+# Both bases are build args defaulting to upstream. The e2e overrides them with
+# the platform registry's copies (see BASE_MIRRORS in the Makefile) so its pulls
+# do not go to Docker Hub and GCR; leaving them as the defaults keeps a bare
+# `make docker-build` — and any build outside the platform's network — working.
+#
+# Both must be declared before the first FROM. An ARG declared after one is
+# scoped to that stage, and the second FROM then expands to a blank base name —
+# "base name (${DISTROLESS_BASE}) should not be blank".
+ARG GOLANG_BASE=golang:1.26
+ARG DISTROLESS_BASE=gcr.io/distroless/static:nonroot
+FROM ${GOLANG_BASE} AS builder
 ARG TARGETOS
 ARG TARGETARCH
 # Use the goproxy.cn module mirror (the default proxy.golang.org is
@@ -28,7 +39,7 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o ma
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
-FROM gcr.io/distroless/static:nonroot
+FROM ${DISTROLESS_BASE}
 WORKDIR /
 COPY --from=builder /workspace/manager .
 USER 65532:65532

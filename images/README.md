@@ -192,26 +192,32 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
 
 Each image has **one name**: `make build` tags it at the reference it is published under,
 `$(REGISTRY)/$(PROJECT)/<image>:$(TAG)`, defaulting to `harbor.isuanova.com/suanova/...` and the short
-commit SHA (decision doc §5). `push` adds `:latest` to that same reference rather than introducing a
-second name:
+commit SHA (decision doc §5). `push` adds `:latest` to that same name rather than introducing a
+second one, and publishes both as **one multi-arch index per image** covering `$(PLATFORMS)`:
 
 ```bash
-docker login harbor.isuanova.com           # once — the Makefile never authenticates
-make -C images push                        # build, then publish both images
+docker login harbor.isuanova.com              # once — the Makefile never authenticates
+make -C images push                           # publish both images, every platform
 make -C images push-ssh      TAG=20260910
 make -C images push-jupyter  TAG=2026-09-07
+make -C images push PLATFORMS=linux/amd64     # narrow back to one platform
 ```
 
-`push` depends on the build, then **adds the moving `:latest` to the built image** and pushes both
-references. `:latest` is the one tag `make build` never produces, so finding it locally means it came
-from a publish. The smoke is the acceptance gate but not a prerequisite of `push` — run
-`make -C images smoke` first.
+`push` is a single `docker buildx build --push` per image: it does **not** depend on `make build`, and
+it does not push the image sitting in the local store. buildx cannot load a multi-platform result into
+the local store and push it in the same invocation, so the published layers are a **fresh build of the
+same source** rather than the very image the smoke ran. That is why the smoke's acceptance carries over
+only as far as the Dockerfile and context are unchanged — run `make -C images smoke` first; it is the
+acceptance gate, but `push` neither runs it nor waits on it.
+
+`:latest` is the one tag `make build` never produces, so finding it locally means it came from a
+publish.
 
 `TAG` defaults to the short commit SHA (`git rev-parse --short HEAD`), so a bare `make build` yields a
 traceable, non-floating reference. It names the **last commit, not the working tree** — commit before
 publishing, or the tag will not describe the built content — and it is resolved per make invocation, so
-a commit landing between `make build` and `make push` makes the two disagree; let `make push` do both, or
-pass an explicit TAG. §5 gives the release schemes per image — `ssh-ubuntu22.04:<date>` and
+a commit landing after `make smoke` would have `make push` publish a tag nothing accepted; pass an
+explicit TAG. §5 gives the release schemes per image — `ssh-ubuntu22.04:<date>` and
 `jupyter-minimal:<base-date>` — the two families version on different axes, hence the per-target form.
 
 A deployment tracking `:latest` follows the newest publish while a pinned one keeps its SHA/release
@@ -221,16 +227,25 @@ destination.
 
 ### Platform
 
-Every published image is built for `$(PLATFORM)`, default `linux/amd64` — the architecture the
-cluster's nodes run. Both Dockerfiles start from a multi-arch base (`ubuntu`, `quay.io/jupyter`), so
-without `--platform` `docker build` resolves that base to the **host** architecture: a build on an
-arm64 machine produces an arm64-only image, which every amd64 node then refuses to pull
-(`no match for platform in manifest`). The Makefile passes `--platform` on every build, so the result
-does not depend on the architecture of the machine building it. `PLATFORM=linux/arm64` is the explicit
-opt-in to build for a different architecture; it takes one value (a list fails in `check-platform`,
-since a single `docker build` cannot produce a manifest list). On a host of another architecture the
-build and the smoke's throwaway containers run emulated — slower, but they exercise the artifact that
-is actually published.
+`make build` and `make smoke` work on **one** platform, `$(PLATFORM)`, default `linux/amd64` — the
+architecture the cluster's nodes run. Both Dockerfiles start from a multi-arch base (`ubuntu`,
+`quay.io/jupyter`), so without `--platform` `docker build` resolves that base to the **host**
+architecture: a build on an arm64 machine produces an arm64-only image, which every amd64 node then
+refuses to pull (`no match for platform in manifest`). The Makefile passes `--platform` on every build,
+so the result does not depend on the architecture of the machine building it. `PLATFORM=linux/arm64` is
+the explicit opt-in to build for a different architecture; it takes one value (a list fails in
+`check-platform`, since a single `docker build` loads exactly one image into the local store). On a host
+of another architecture the build and the smoke's throwaway containers run emulated — slower, but they
+exercise the artifact that is actually published.
+
+`make push` is the other flow: it builds for every platform in `$(PLATFORMS)`, default
+`linux/amd64 linux/arm64`, and publishes the results as one index. A node then pulls the manifest for
+its own architecture, so an arm64 laptop can run what an amd64 cluster runs. It needs a builder capable
+of more than one platform — Docker Desktop's is; on a plain `docker` install run
+`docker buildx create --use` and provide QEMU (`docker/setup-qemu-action` in CI), or the build fails on
+the non-native platform. Both flows drop buildx's provenance and SBOM attestations: Harbor rejects an
+index carrying them with a 404 on the manifest PUT even though every manifest it references resolves on
+its own.
 
 Verify what a registry received rather than assuming the build host's architecture:
 
@@ -240,14 +255,30 @@ docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/ssh-ubuntu22.
 
 ### Overrides / mirror builds (CN or offline)
 
+Every build resolves `FROM` this registry's mirrored copies of the upstream bases —
+`$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:<base-date>` and `…/ubuntu:$(UBUNTU_VERSION)`,
+passed through `BASE_ARGS`. Building from the mirror keeps the published image descended from the
+base the platform serves, where `FROM ubuntu:22.04` would silently give whatever upstream has
+retagged it to — and it is the only copy that resolves where upstream is unreachable. Each is
+pinned by the digest of the mirror's index, and the digest is what the build resolves:
+`operator/hack/mirror-e2e-images.sh` repoints those tags, so on the tag alone the same commit
+could publish different base layers under one `TAG`. Bumping a base is therefore deliberate —
+read the new digest, update `images/Makefile` and `BASE_MIRRORS` in `operator/Makefile`, then
+re-run the mirror script, which fails if a mirrored tag no longer hashes to the digest it is
+listed under. `BASE_ARGS=` (empty) resolves from upstream instead, unpinned. The jupyter mirror's
+date tracks the base in `jupyter/Dockerfile` — bump both together.
+
+APT and pip still go upstream unless asked otherwise:
+
 ```bash
 APT_MIRROR=https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports \
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 make -C images build
 ```
 
-`IMG_SSH` / `IMG_JUPYTER` override the output tags; `CONTAINER_TOOL` overrides `docker` (e.g. `podman`);
-`PLATFORM` the build architecture (see Platform).
+`IMG_SSH` / `IMG_JUPYTER` override the output tags; `BASE_ARGS` the base images (above);
+`CONTAINER_TOOL` overrides `docker` (e.g. `podman`); `PLATFORM` the build/smoke architecture and
+`PLATFORMS` what `push` publishes (see Platform).
 
 ## Layout
 

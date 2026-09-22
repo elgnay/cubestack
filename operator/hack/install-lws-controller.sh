@@ -7,14 +7,19 @@
 #
 # The controller image reference in the manifests points at the upstream
 # staging registry, which is unreachable from this network. Image fallback
-# chain: (1) docker pull of the manifest image, (2) the same image via the
-# docker.1ms.run mirror (retagged to the original ref), (3) a local build from
+# chain: (1) the platform registry's mirror of the release-tagged upstream
+# image, (2) docker pull of the manifest image, (3) the same image via the
+# docker.1ms.run mirror (retagged to the original ref), (4) a local build from
 # the pinned lws go module (golang:1.26 + distroless bases are cached; the
 # build uses the goproxy.cn mirror because proxy.golang.org is unreachable).
 # The picked image is then loaded into kind so the kubelet runs it locally.
 #
-# When CI is set (GitHub Actions sets CI=true) steps 1-2 are skipped: the
-# pinned module is always built so e2e runs are deterministic.
+# CI stops at step 1 (GitHub Actions sets CI=true): everything past it is
+# either the mutable `main` tag the note below rejects or a local build that
+# costs a cold ~80s Go compile on every run to reproduce a byte-identical
+# image. The mirror is pinned to the release tag for the same module version
+# go.mod names, so it is the deterministic v0.10.0 build steps 2-4 were trying
+# to approximate — and cheaper than all of them.
 #
 # Idempotent: exits early when lws-controller-manager is already Available.
 set -euo pipefail
@@ -43,6 +48,14 @@ go mod download sigs.k8s.io/lws
 LWS_MOD="$(go env GOMODCACHE)/sigs.k8s.io/lws@${LWS_VER}"
 [ -f "${LWS_MOD}/config/default/kustomization.yaml" ] || { echo "lws module config missing: ${LWS_MOD}" >&2; exit 1; }
 
+# The mirrored release image. Tagging it with the module version rather than
+# the upstream one (v0.10.0 here, 0.10.0 there) is deliberate: a bump to the
+# pin in go.mod then names a tag nobody has published, which fails the pull
+# below loudly instead of quietly running the previous controller against a
+# newer CRD set. Re-publish with hack/mirror-e2e-images.sh.
+LWS_IMAGE_REPO="${LWS_IMAGE_REPO:-harbor.isuanova.com/suanova/lws}"
+LWS_IMAGE="${LWS_IMAGE_REPO}:${LWS_VER}"
+
 KUSTOMIZE="${KUSTOMIZE:-$(pwd)/bin/kustomize}"
 if [ ! -x "${KUSTOMIZE}" ]; then
   make -s kustomize
@@ -53,28 +66,34 @@ MANIFEST_REF="$("${KUSTOMIZE}" build "${LWS_MOD}/config/manager" 2>/dev/null | a
 MANIFEST_REF="${MANIFEST_REF:-us-central1-docker.pkg.dev/k8s-staging-images/lws/lws:main}"
 
 # NOTE: the pinned v0.10.0 module's own config/manager kustomization sets
-# newTag: main, so a successful direct/mirror pull runs a mutable `main`
+# newTag: main, so a successful pull of MANIFEST_REF runs a mutable `main`
 # controller against v0.10.0 CRDs (nondeterministic, and staging GCs
-# non-release tags so the pull can silently start failing later). The local
-# build of the pinned module is the deterministic path: it builds v0.10.0
-# source. Under CI (any non-empty CI value; GitHub Actions sets CI=true) the
-# pulls are skipped entirely so e2e always runs the pinned v0.10.0 build;
-# local devs on open networks keep the pull fast path.
+# non-release tags so the pull can silently start failing later). The mirror is
+# built from the release tag for the same version, which is why it is tried
+# first everywhere, not just in CI. Steps 2-4 below are the fallbacks for a
+# network that cannot reach the platform registry.
 REF=""
-if [ -z "${CI:-}" ] && "${DOCKER}" pull "${MANIFEST_REF}" >/dev/null 2>&1; then
+if "${DOCKER}" pull "${LWS_IMAGE}" >/dev/null 2>&1; then
+  REF="${LWS_IMAGE}"
+  echo "pulled the pinned lws controller image ${REF}"
+elif [ -n "${CI:-}" ]; then
+  # Deliberately not falling through to the local build. A CI run that quietly
+  # spends ~80s rebuilding what the mirror should have supplied is how a
+  # missing mirror goes unnoticed for months.
+  echo "cannot pull ${LWS_IMAGE} from the platform registry. If it is missing" >&2
+  echo "rather than unreachable, publish it with hack/mirror-e2e-images.sh —" >&2
+  echo "it mirrors registry.k8s.io/lws/lws:${LWS_VER#v}." >&2
+  exit 1
+elif "${DOCKER}" pull "${MANIFEST_REF}" >/dev/null 2>&1; then
   REF="${MANIFEST_REF}"
   echo "pulled upstream manifest image ${REF}"
-elif [ -z "${CI:-}" ] && "${DOCKER}" pull "docker.1ms.run/${MANIFEST_REF}" >/dev/null 2>&1; then
+elif "${DOCKER}" pull "docker.1ms.run/${MANIFEST_REF}" >/dev/null 2>&1; then
   "${DOCKER}" tag "docker.1ms.run/${MANIFEST_REF}" "${MANIFEST_REF}"
   REF="${MANIFEST_REF}"
   echo "pulled docker.1ms.run/${MANIFEST_REF} via mirror, retagged to ${REF}"
 else
   REF="example.com/lws/lws:${LWS_VER}"
-  if [ -n "${CI:-}" ]; then
-    echo "CI set: skipping registry pulls — building the pinned lws module locally as ${REF}"
-  else
-    echo "registry pulls unavailable — building the lws manager locally from the pinned go module as ${REF}"
-  fi
+  echo "registry pulls unavailable — building the lws manager locally from the pinned go module as ${REF}"
   "${DOCKER}" build -t "${REF}" -f - "${LWS_MOD}" <<'DOCKERFILE'
 FROM golang:1.26 AS builder
 # proxy.golang.org is unreachable from this network; mirror the operator

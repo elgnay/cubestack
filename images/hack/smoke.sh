@@ -72,14 +72,12 @@ check_contains() {
 # make_secret <parent> — generate a throwaway host keypair + authorized_keys that
 # emulates an operator Secret.
 #
-# Kubernetes projects Secret files root-owned 0644, and a non-root sshd accepts
-# them because OpenSSH only enforces private-key permissions on files owned by the
-# uid doing the reading. Docker does not reproduce that faithfully: Docker Desktop
-# reports a bind mount as root-owned 0600 yet lets any container uid read it, while
-# a rootful Linux daemon keeps the host uid and modes — there a 0600 key really is
-# unreadable to uid 1000. So the smoke mounts the private key 0600 and asserts up
-# front that the container uid can read it (check_mount_readable), rather than
-# leaving that to a 30s ssh timeout.
+# authorized_keys is world-readable because nothing checks it: the images set
+# `StrictModes no` (the workspace PVC may not carry the modes sshd demands), so it
+# only has to be readable by the container uid. The host key is the one file whose
+# mode matters, and ensure_mount_readable below settles it against the engine. The
+# client key stays 0600 — the ssh binary reading it runs as the invoking user, the
+# case OpenSSH's private-key check is for.
 make_secret() {
   local base=$1
   mkdir -p "$base/client" "$base/host" "$base/keys"
@@ -88,29 +86,46 @@ make_secret() {
   # Only the public half is materialised, one entry renamed to authorized_keys —
   # the operator's items mapping, by which the login private key stays out.
   cp "$base/client/id_ed25519.pub" "$base/keys/authorized_keys"
-  chmod 600 "$base/host/ssh_host_ed25519_key" "$base/keys/authorized_keys"
-  chmod 644 "$base/host/ssh_host_ed25519_key.pub"
+  chmod 644 "$base/keys/authorized_keys"
   chmod 700 "$base/client"
   chmod 600 "$base/client/id_ed25519"
 }
 
-# check_mount_readable <image> <host key on the host> — assert the container uid
-# (1000) can read the mounted host key. On an engine that keeps the invoking user's
-# uid on bind mounts (rootful Linux Docker, or a userns remap) the 0600 key is
-# unreadable to uid 1000, and sshd exits with "no hostkeys available" — a property
-# of the environment, not of the image. Records the failure and returns, so the
-# dependent ssh assertions report their own failures and the summary still prints.
-check_mount_readable() {
+# container_can_read <image> <host file> — whether uid 1000 can read the file as the
+# container sees it. Mounts the file alone, at the path sshd reads it from, so it is
+# the mount sshd will get.
+container_can_read() {
+  "$CONTAINER_TOOL" run --rm --user 1000:1000 --entrypoint /usr/bin/test \
+    -v "$2:/etc/ssh/ssh_host_ed25519_key:ro" "$1" \
+    -r /etc/ssh/ssh_host_ed25519_key >/dev/null 2>&1
+}
+
+# ensure_mount_readable <image> <host key> — sshd has to be able to read the mounted
+# host key, and the mode that lets it is the engine's choice, not the image's.
+# OpenSSH ignores a private key that group or other can read, but only when the uid
+# reading it owns the file — and which uid that is depends on the engine:
+#   Docker Desktop  presents a bind-mounted *file* as owned by the container's user,
+#                   so the check fires and the key has to stay 0600;
+#   a rootful Linux daemon keeps the invoking user's uid, so a 0600 key belongs to
+#                   nobody the container can read and it has to be 0644 — the check
+#                   is then skipped, which is the case the platform relies on, since
+#                   it projects the Secret 0644.
+# Probing beats branching on the engine: neither behaviour is in a version string.
+# ssh-keygen has already written the key 0600, so widen only if that is unreadable.
+# Records the outcome rather than returning it, so a failure here reads as the
+# mount's and the ssh assertions below still report their own.
+ensure_mount_readable() {
   local img=$1 key=$2
-  if "$CONTAINER_TOOL" run --rm --user 1000:1000 --entrypoint /usr/bin/test \
-       -v "$key:/etc/ssh/ssh_host_ed25519_key:ro" "$img" \
-       -r /etc/ssh/ssh_host_ed25519_key >/dev/null 2>&1; then
+  if ! container_can_read "$img" "$key"; then
+    chmod 644 "$key"
+  fi
+  if container_can_read "$img" "$key"; then
     ok "container uid 1000 can read the mounted host key"
-    return 0
+    return
   fi
   bad "container uid 1000 cannot read $key"
-  echo "        this engine enforces the host uid on bind mounts, which the smoke cannot set;"
-  echo "        run it as uid 1000, or from Docker Desktop (which does not enforce it)."
+  echo "        the bind mount did not arrive readable by the container uid; check the"
+  echo "        mount and the key's mode (0600 where the container owns it, else 0644)."
 }
 
 # served_key <port> — the ed25519 host key sshd serves, or empty if it is not
@@ -153,7 +168,7 @@ if [ "$run_ssh" = 1 ]; then
   echo "== smoke: $IMG_SSH (ssh-ubuntu22.04) =="
   ssh_cont="cs-smoke-ssh-$$"
   make_secret "$tmp/ssh"
-  check_mount_readable "$IMG_SSH" "$tmp/ssh/host/ssh_host_ed25519_key"
+  ensure_mount_readable "$IMG_SSH" "$tmp/ssh/host/ssh_host_ed25519_key"
 
   "$CONTAINER_TOOL" run -d --name "$ssh_cont" \
     --user 1000:1000 \
@@ -204,7 +219,7 @@ if [ "$run_jupyter" = 1 ]; then
   jup_cont="cs-smoke-jupyter-$$"
   base="/dev/ns/env"
   make_secret "$tmp/jupssh"
-  check_mount_readable "$IMG_JUPYTER" "$tmp/jupssh/host/ssh_host_ed25519_key"
+  ensure_mount_readable "$IMG_JUPYTER" "$tmp/jupssh/host/ssh_host_ed25519_key"
 
   # Native identity (uid 1000, gid 'users' 100) and pure-stock knobs: token via
   # JUPYTER_TOKEN, URL prefix via NOTEBOOK_ARGS. The ssh Secret is mounted so the
