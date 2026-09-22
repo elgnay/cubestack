@@ -1620,6 +1620,38 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
+		// The mode is not a property of the file but of whoever reads it, which is
+		// why it cannot be a constant: a Secret volume materialises its files
+		// root-owned, and OpenSSH's private-key check fires only on a file owned by
+		// the uid reading it. A root sshd (runAsUser 0) *is* that owner, so 0644 —
+		// the mode the non-root path needs — is refused with "Permissions 0644 ...
+		// are too open", and the images' entrypoint turns that into a failed start
+		// rather than an environment that is merely missing ssh.
+		It("mounts the ssh Secrets 0600 for an environment running as root", func() {
+			var env *aiv1alpha1.DevEnvironment
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				env = e
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				}
+			})
+			Expect(spec.Volumes).To(Equal([]corev1.Volume{
+				{
+					Name:         sshHostKeyVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: sshHostKeySecretName(env), DefaultMode: ptrTo(int32(0o600))}},
+				},
+				{
+					Name: sshAuthorizedKeysVolumeName,
+					VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
+						SecretName:  sshClientKeySecretName(env),
+						DefaultMode: ptrTo(int32(0o600)),
+						Items:       []corev1.KeyToPath{{Key: sshClientPubKeyKey, Path: sshAuthorizedKeysFile}},
+					}},
+				},
+			}))
+		})
+
 		// With keysSecret of its own the environment supplies the authorized keys,
 		// so that mount follows the selector's data key rather than a name the
 		// controller generates.

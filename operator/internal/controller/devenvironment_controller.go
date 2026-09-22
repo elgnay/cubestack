@@ -1575,10 +1575,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		// place when the Secret changes, so rotating a key needs no pod restart.
 		// Only the mapped entry is materialised, so the generated login private key
 		// — which shares its Secret with the authorized_keys entry it signs for —
-		// never enters the container. DefaultMode stays 0644: the files are
-		// root-owned and OpenSSH only enforces its private-key check on files owned
-		// by the uid reading them, so a tighter mode would make a non-root sshd exit
-		// with "no hostkeys available".
+		// never enters the container. The mode both volumes carry is the reading
+		// uid's to decide rather than the file's, which is why it is set below
+		// beside the volumes instead of here.
 		container.VolumeMounts = append(container.VolumeMounts,
 			corev1.VolumeMount{
 				Name: sshHostKeyVolumeName, MountPath: sshHostKeyPath, SubPath: sshHostKeyKey, ReadOnly: true,
@@ -1625,7 +1624,27 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		})
 	}
 	if sshExposed(env) {
+		// A Secret volume materialises its files root-owned, and OpenSSH's
+		// private-key check fires only on a file owned by the uid reading it
+		// (sshkey_perm_ok). The mode a reader tolerates therefore follows the
+		// reader's identity rather than the file's sensitivity, and the two
+		// identities the platform runs an environment under want opposite modes:
+		//
+		//   - A non-root sshd is not the owner, so it is never checked — and it
+		//     cannot read a file it does not own, so 0600 leaves it exiting with
+		//     "no hostkeys available". 0644 is what keeps the key readable.
+		//   - A root sshd (runAsUser 0) *is* the owner, so the check applies and
+		//     0644 is refused outright: "Permissions 0644 ... are too open". The
+		//     images' entrypoint turns that into a failed start, so an environment
+		//     that should be serving ssh does not come up at all.
+		//
+		// The authorized keys take the same mode: the same sshd reads them under
+		// the same ownership, and 0600 is as readable to the root that owns them.
 		mode := int32(0o644)
+		if rt := env.Spec.Runtime; rt != nil && rt.SecurityContext != nil &&
+			rt.SecurityContext.RunAsUser != nil && *rt.SecurityContext.RunAsUser == 0 {
+			mode = 0o600
+		}
 		authorizedName, authorizedKey := sshAuthorizedKeysSource(env)
 		podSpec.Volumes = append(podSpec.Volumes,
 			corev1.Volume{

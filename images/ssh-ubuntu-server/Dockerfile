@@ -62,15 +62,19 @@ RUN groupadd -g 1000 ubuntu \
 
 # No host keys in the image: identity comes from the mounted Secret. Their
 # absence is also what tells the entrypoint whether ssh is enabled.
-RUN rm -f /etc/ssh/ssh_host_*
+# /run/sshd is the privilege separation directory a *root* sshd requires and a
+# non-root one never consults - the apt package relies on the init system to
+# create it, which a container has none of (see common/sshd/10-devenv.conf).
+RUN rm -f /etc/ssh/ssh_host_* \
+    && mkdir -p -m 0700 /run/sshd
 
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
 # Shared sshd config (common/), with this family's ssh login account substituted
 # for the @SSH_USER@ placeholder. It must match USER below.
 ARG SSH_USER=ubuntu
-COPY common/sshd/10-nonroot.conf /etc/ssh/sshd_config.d/10-nonroot.conf
+COPY common/sshd/10-devenv.conf /etc/ssh/sshd_config.d/10-devenv.conf
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
-    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-nonroot.conf
+    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-devenv.conf
 
 ENV CUBESTACK_IMAGE=ssh \
     HOME=/home/ubuntu

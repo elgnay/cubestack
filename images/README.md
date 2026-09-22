@@ -144,11 +144,20 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   adding a colleague's key does not restart anyone's session. It still watches Secrets, mapping one
   back to every environment whose `spec.ssh.keysSecret` names it, to re-check a reference that has been
   undelegated or had its entry removed.
-- **Keep the files readable by the container uid.** The default Secret `defaultMode` `0644` is
-  correct: the files are root-owned, and OpenSSH only enforces its private-key permission check on
-  files owned by the uid reading them, so a uid-1000 sshd accepts a root-owned `0644` host key.
-  Tightening `defaultMode` to `0600`/`0400` makes the key unreadable to that uid and sshd exits with
-  *no hostkeys available*.
+- **Set the Secret `defaultMode` from the reading uid, not from the file.** OpenSSH enforces its
+  private-key permission check only on a file owned by the uid reading it, and a Secret volume
+  materialises its files root-owned — so the mode a reader tolerates follows **who the reader is**.
+  A uid-1000 sshd is not the owner: it is never checked, and it cannot read a file it does not own, so
+  the host key has to stay `0644`; at `0600`/`0400` it exits with *no hostkeys available*. A root sshd
+  (`spec.runtime.securityContext.runAsUser: 0`) **is** the owner, so the check applies and `0644` is
+  refused outright — *Permissions 0644 … are too open* — which the `jupyter` entrypoint turns into a
+  failed start rather than a dead endpoint. The controller renders `0600` for a root environment and
+  `0644` otherwise (`::desiredPodSpec`); the authorized keys take the same mode, since one sshd reads
+  both under one ownership.
+- **Create `/run/sshd` in the image.** A root sshd refuses to start without its privilege separation
+  directory, and refuses it *before* loading a host key; a non-root sshd never consults one. The apt
+  package leaves the directory to the init system, which a container has none of, so both Dockerfiles
+  create it root-owned.
 - **Mount the PVC at the account's home** — the controller derives it from `spec.runtime.user` (see
   above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
   there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
@@ -285,8 +294,9 @@ make -C images build
 ```
 images/
   common/                  runtime config shared by both images (single source)
-    entrypoint.sh          mode selection + optional sshd, then hand-off to the image CMD
-    sshd/10-nonroot.conf   sshd_config.d drop-in; AllowUsers is @SSH_USER@
+    entrypoint.sh          mode selection + optional sshd (admits root when it runs as root),
+                           then hand-off to the image CMD
+    sshd/10-devenv.conf    sshd_config.d drop-in; AllowUsers is @SSH_USER@
   ssh-ubuntu-server/Dockerfile
   jupyter/Dockerfile
   hack/smoke.sh            local acceptance smoke
@@ -296,8 +306,16 @@ The sshd_config drop-in is **shared**: it holds the mount contract's paths (`Hos
 `AuthorizedKeysFile`, the latter `%h`-relative so it follows each image's home) and the login account as
 an `@SSH_USER@` placeholder, which each Dockerfile substitutes from its `ARG SSH_USER` (`ubuntu` /
 `jovyan`). A missed substitution is not a parse error — `AllowUsers` is a valid keyword and the pattern
-simply matches no account — so it fails *closed*: sshd starts but denies every login, and the smoke
-fails on its login assertion. **Build context is `images/`** for every Dockerfile
+simply matches no account — so it fails *closed* for the family account: sshd starts but denies that
+login, and the smoke fails on its login assertion. `root` is admitted **beside** the family account,
+because one image serves both identities (see Requirements on the operator) — but by the entrypoint
+rather than by this file: it writes a second drop-in, `20-allow-root.conf`, only when the container runs
+as `uid 0`. A non-root sshd cannot setuid to root, so admitting it there would buy nothing and cost a
+login that is accepted and then dies at `setresuid` (*Failed to set uids to 0.*) instead of being refused
+at authentication. `AllowUsers` is one of the few sshd options that **accumulate** across files, so that
+drop-in adds to this one rather than replacing it. A missed substitution therefore fails *closed* with
+nothing surviving it, and the smoke's family-account login assertion is what catches it.
+**Build context is `images/`** for every Dockerfile
 — that is why ignore rules live in the single `images/.dockerignore` (deny-by-default) and why shared
 files are `COPY common/...`.
 
