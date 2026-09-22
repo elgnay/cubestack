@@ -61,8 +61,10 @@ Every image:
   root key and then die with *Failed to set uids to 0.*, where a refusal at authentication belongs.
 - **The ssh material is mounted, never baked or staged.** Changing the mount paths means changing the
   drop-in (`HostKey`, `AuthorizedKeysFile`) *and* `images/README.md`'s contract table together, plus
-  the operator's mount. Key material must stay readable by the container uid: `0644` root-owned is
-  correct, tighter `defaultMode` breaks a non-root sshd.
+  the operator's mount. Key material must stay readable by the container uid: the operator renders
+  `0644` for a non-root `sshd` and `0600` when `securityContext.runAsUser: 0`, because a root `sshd`
+  rejects `0644` root-owned files as too open, while a non-root one cannot read `0600` files it does
+  not own. Changing the mode means changing that rendering in the controller too.
 - **Never commit secrets, private keys, or tokens.** Smoke-generated keys live only under `hack/` at
   runtime (`mktemp -d`) and are cleaned up.
 - **English** code comments, commit messages, and docs.

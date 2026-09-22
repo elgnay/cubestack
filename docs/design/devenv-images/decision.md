@@ -85,9 +85,12 @@ image.
 A root sshd can serve any account, so the image's native account is not the only one it may serve, and
 `spec.runtime.securityContext.runAsUser: 0` is served as `root` whatever the image's account is — the
 entrypoint admits `root` beside the family account when the container is root, and a non-root sshd does
-not admit it at all, since it could not serve it. The image still has to be *capable* of it: a root sshd
-needs `/run/sshd`, which the images now ship, and a root env needs the host key at a mode its owner
-accepts (#211).
+not admit it at all, since it could not serve it. In the shipped images a root environment ends up
+serving `root` alone regardless, because docker-stacks leaves its build account locked in `/etc/shadow`
+and only a root sshd can read that file — so that refusal is the image's rather than this design's, and
+is recorded in `images/README.md` for whoever changes the base image. The image still has to be *capable*
+of it: a root sshd needs `/run/sshd`, which the images now ship, and a root env needs the host key at a
+mode its owner accepts (#211).
 
 ### Gap A — closed: the home mount is writable by uid 1000
 

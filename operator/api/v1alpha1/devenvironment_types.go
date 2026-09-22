@@ -290,7 +290,10 @@ type RuntimeSpec struct {
 	// defaults to the platform's conventional account "user"; set it when the
 	// image runs as something else (e.g. "jovyan" for a docker-stacks image),
 	// since a non-root sshd can only serve the uid it runs as, and
-	// securityContext.runAsUser has to name that same account.
+	// securityContext.runAsUser has to name that same account. An environment
+	// running as root is advertised as "root" whatever this field says: that is
+	// the account its sshd runs as, where which family account a root sshd admits
+	// beside it is the image's to decide.
 	// +kubebuilder:validation:MaxLength=32
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]*$`
 	// +optional

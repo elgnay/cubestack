@@ -204,7 +204,8 @@ const (
 
 	// sshPortName names the SSH Service port and the "ssh" endpoint; the ssh
 	// endpoint address carries the environment's login account, which is
-	// spec.runtime.user or defaultRuntimeUser when the spec names none.
+	// spec.runtime.user or defaultRuntimeUser when the spec names none, and root
+	// when the environment runs as root (see runtimeUser).
 	sshPortName  = "ssh"
 	mainPortName = "main"
 	// The ssh material arrives as two Secrets — the host identity and the
@@ -1336,8 +1337,16 @@ func podTemplateAnnotations(env *aiv1alpha1.DevEnvironment) map[string]string {
 }
 
 // runtimeUser is the account the environment's sshd serves: spec.runtime.user,
-// else the platform default.
+// else the platform default. A root environment serves root whatever the spec
+// names. The address is where a user reads which account to log in as, and root
+// is the only account the platform can promise there: it is the one whose uid
+// the sshd runs as, where which family account a root sshd admits beside it is
+// the image's to decide rather than the spec's.
 func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
+	if sc := env.Spec.Runtime; sc != nil && sc.SecurityContext != nil &&
+		sc.SecurityContext.RunAsUser != nil && *sc.SecurityContext.RunAsUser == 0 {
+		return "root"
+	}
 	if env.Spec.Runtime != nil && env.Spec.Runtime.User != "" {
 		return env.Spec.Runtime.User
 	}

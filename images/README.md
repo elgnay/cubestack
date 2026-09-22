@@ -58,9 +58,11 @@ always wins.
   published through the Gateway's TCP listener pool, not on 22 either way.
 - ssh is enabled by the presence of the mounted host key file — images ship no host keys of their own,
   and there is no key staging (see the mount contract below).
-- sshd runs as the container account (uid 1000): a non-root sshd can only serve the uid it runs as,
-  so the only login account is the image's own, and the resolved account has to name it — that is
-  `spec.runtime.user` when it is set, else the platform default `user`.
+- sshd runs as the container's uid, which bounds what it can serve: at uid 1000 that is the image's own
+  account, and at uid 0 (`spec.runtime.securityContext.runAsUser: 0`) it is `root`. The ssh endpoint
+  address names the account to log in as — `spec.runtime.user` when it is set, else the platform default
+  `user`, and `root` for a root environment whatever the spec names, since root is the only account the
+  platform can promise there.
 - Jupyter is stock-native: the overlay adds no jupyter logic. `JUPYTER_TOKEN` (token) and
   `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`) are honored by the upstream launcher.
 
@@ -313,8 +315,20 @@ rather than by this file: it writes a second drop-in, `20-allow-root.conf`, only
 as `uid 0`. A non-root sshd cannot setuid to root, so admitting it there would buy nothing and cost a
 login that is accepted and then dies at `setresuid` (*Failed to set uids to 0.*) instead of being refused
 at authentication. `AllowUsers` is one of the few sshd options that **accumulate** across files, so that
-drop-in adds to this one rather than replacing it. A missed substitution therefore fails *closed* with
-nothing surviving it, and the smoke's family-account login assertion is what catches it.
+drop-in adds to this one rather than replacing it. A missed substitution therefore fails *closed* for
+the family account — but only for it: the entrypoint's file is written from the uid and never consults
+the substitution, so a root environment still serves `root`, and the login a broken substitution costs
+you is the family one. The smoke's assertion on that login is what catches it.
+
+In practice the family account is refused whenever the container is root, and the accumulation above is
+not what decides it: docker-stacks leaves its build account locked in `/etc/shadow`, OpenSSH refuses a
+locked account, and only a *root* sshd can read that file — so `getspnam` returns nothing to uid 1000 and
+the non-root path never ran the check at all. Root mode thus serves `root` alone, the identity it
+advertises; the family entry stays because it is what the non-root mode serves. Worth knowing because the
+refusal is docker-stacks' and not ours: an image whose build account was unlocked would be served from a
+root environment too, into the image's own `/home/$USER`, which in root mode is not the workspace claim.
+(`passwd -S` reports both accounts as locked and cannot tell you which one sshd will refuse.)
+
 **Build context is `images/`** for every Dockerfile
 — that is why ignore rules live in the single `images/.dockerignore` (deny-by-default) and why shared
 files are `COPY common/...`.
