@@ -12,9 +12,9 @@ import { devEnvironmentList } from "@/test/fixtures/devenvironments";
 const OPTIONS = {
   namespaces: [{ name: "project-a" }, { name: "default" }],
   images: [
-    { tag: "base-cuda-12.4:v1.6", label: "base-cuda-12.4:v1.6 · CUDA 12.4" },
-    { tag: "base-cuda-12.1:v1.6", label: "base-cuda-12.1:v1.6 · CUDA 12.1" },
-    { tag: "base-maca-2.28:v1.3", label: "base-maca-2.28:v1.3 · MACA 2.28" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)" },
+    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)" },
+    { tag: "harbor.isuanova.com/suanova/base-cuda:latest", label: "suanova/base-cuda · NVIDIA CUDA (ubuntu)" },
   ],
 };
 
@@ -76,7 +76,10 @@ describe("dev environments page", () => {
     expect(container.textContent).toContain("连接信息");
     expect(container.textContent).toContain("https://dev.cubestack.local/ws/jupyter-nlp-ln");
     expect(container.textContent).toContain("规格与状态");
-    expect(container.textContent).toContain("base-cuda-12.4:v1.6");
+    expect(container.textContent).toContain("harbor.isuanova.com/suanova/base-cuda:latest");
+    // The GPU environment's accelerator, and the stopped one's absence of one.
+    expect(container.textContent).toContain("1 × nvidia");
+    expect(container.textContent).toContain("无加速卡");
 
     act(() => root.unmount());
   });
@@ -280,6 +283,84 @@ describe("create wizard", () => {
     return { container, root };
   }
 
+  /** The wizard's accelerator select — the first combobox on step 2. */
+  function acceleratorSelect(): HTMLElement {
+    return document.body.querySelector('[data-step="2"] [role="combobox"]') as HTMLElement;
+  }
+
+  /**
+   * Open a MUI Select, pick the option whose text matches, and return the option
+   * texts it offered — so a test can assert the list itself and not just the pick.
+   */
+  async function selectOption(select: HTMLElement, optionText: string): Promise<string[]> {
+    await act(async () => {
+      select.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    const options = Array.from(document.body.querySelectorAll('[role="option"]'));
+    const option = options.find((o) => o.textContent === optionText);
+    expect(option).toBeTruthy();
+    await act(async () => {
+      (option as HTMLElement).click();
+    });
+    return options.map((o) => o.textContent ?? "");
+  }
+
+  /** Step 2's selects in render order: accelerator, cpu, memory, idle. */
+  function step2Selects(): HTMLElement[] {
+    return Array.from(document.body.querySelectorAll('[data-step="2"] [role="combobox"]')) as HTMLElement[];
+  }
+
+  /** Open the wizard and advance to step 2 under a valid name. */
+  async function toStep2(container: HTMLElement) {
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+    const input = document.body.querySelector('input[placeholder="e.g. jupyter-nlp-ln"]') as HTMLInputElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, "my-env");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {});
+    await act(async () => {
+      (Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent === "下一步") as HTMLElement).click();
+    });
+    await act(async () => {});
+    expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
+  }
+
+  it("offers 1/2/4/8/16 cores, and lists only the memory sizes those cores allow", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep2(container);
+
+    const [, cpu, memory] = step2Selects();
+    // Cores are the 1/2/4/8/16 the platform offers, not the old 16/32/64 list.
+    expect(await selectOption(cpu, "8 核")).toEqual(["1 核", "2 核", "4 核", "8 核", "16 核"]);
+    // Memory is 1x/2x/4x the cores, and nothing else: 64Gi was legal at 16 cores
+    // and must be gone at 8.
+    expect(await selectOption(memory, "16Gi")).toEqual(["8Gi", "16Gi", "32Gi"]);
+
+    act(() => root.unmount());
+  });
+
+  it("carries the memory ratio across a core change", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep2(container);
+
+    const [, cpu] = step2Selects();
+    // The wizard opens at 2 核 / 4Gi (the 2x ratio); at 4 cores that is 8Gi.
+    await selectOption(cpu, "4 核");
+    expect(step2Selects()[2].textContent).toBe("8Gi");
+    // ...and at 1 core it is 2Gi, still 2x.
+    await selectOption(cpu, "1 核");
+    expect(step2Selects()[2].textContent).toBe("2Gi");
+
+    act(() => root.unmount());
+  });
+
   it("opens the wizard, loads options and reaches step 2", async () => {
     const { container, root } = renderWithBoth();
     await act(async () => {});
@@ -311,13 +392,44 @@ describe("create wizard", () => {
     await act(async () => {});
 
     expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
-    expect(document.body.textContent).toContain("GPU 类型");
+    expect(document.body.textContent).toContain("加速卡");
     expect(document.body.textContent).toContain("持久化存储(Gi)");
 
     act(() => root.unmount());
   });
 
-  it("blocks advancing past step 2 on invalid GPU / storage values", async () => {
+  it("asks for a card count only once an accelerator is chosen", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+    const input = document.body.querySelector('input[placeholder="e.g. jupyter-nlp-ln"]') as HTMLInputElement;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
+      setter.call(input, "my-env");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {});
+    await act(async () => {
+      (Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent === "下一步") as HTMLElement).click();
+    });
+    await act(async () => {});
+    expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
+
+    // The catalog opens on a CPU image, so the accelerator starts at "无(纯 CPU)"
+    // and no GPU card count is asked for — only the storage input remains.
+    expect(Array.from(document.body.querySelectorAll('[data-step="2"] input[type="number"]'))).toHaveLength(1);
+
+    await selectOption(acceleratorSelect(), "nvidia");
+    // Choosing a vendor is what brings the count back.
+    expect(Array.from(document.body.querySelectorAll('[data-step="2"] input[type="number"]'))).toHaveLength(2);
+
+    act(() => root.unmount());
+  });
+
+  it("blocks advancing past step 2 on invalid storage, and on an invalid card count", async () => {
     const { container, root } = renderWithBoth();
     await act(async () => {});
     await act(async () => {
@@ -337,24 +449,26 @@ describe("create wizard", () => {
     });
     await act(async () => {});
     expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
+    await selectOption(acceleratorSelect(), "nvidia");
 
-    // number inputs in step 2: [gpuCount, storageGi]
-    const nums = Array.from(document.body.querySelectorAll('[data-step="2"] input[type="number"]')) as HTMLInputElement[];
-    expect(nums).toHaveLength(2);
+    const nums = () => Array.from(document.body.querySelectorAll('[data-step="2"] input[type="number"]')) as HTMLInputElement[];
     const setNum = (el: HTMLInputElement, v: string) => {
       const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value")!.set!;
       setter.call(el, v);
       el.dispatchEvent(new Event("input", { bubbles: true }));
     };
+    const next = async () => {
+      await act(async () => {
+        (Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent === "下一步") as HTMLElement).click();
+      });
+      await act(async () => {});
+    };
+
     await act(async () => {
-      setNum(nums[0], "1.5"); // fractional gpuCount
-      setNum(nums[1], "10"); // storage below 20
+      setNum(nums()[0], "1.5"); // fractional gpuCount
+      setNum(nums()[1], "10"); // storage below 20
     });
-    await act(async () => {});
-    await act(async () => {
-      (Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent === "下一步") as HTMLElement).click();
-    });
-    await act(async () => {});
+    await next();
     // still on step 2 and per-field errors surfaced
     expect(document.body.querySelector('[data-step="3"]')).toBeNull();
     expect(document.body.textContent).toContain("GPU 卡数须为 1–16 的整数。");
@@ -362,14 +476,10 @@ describe("create wizard", () => {
 
     // fixing both lets the wizard proceed
     await act(async () => {
-      setNum(nums[0], "2");
-      setNum(nums[1], "200");
+      setNum(nums()[0], "2");
+      setNum(nums()[1], "200");
     });
-    await act(async () => {});
-    await act(async () => {
-      (Array.from(document.body.querySelectorAll("button")).find((b) => b.textContent === "下一步") as HTMLElement).click();
-    });
-    await act(async () => {});
+    await next();
     expect(document.body.querySelector('[data-step="3"]')).not.toBeNull();
 
     act(() => root.unmount());
