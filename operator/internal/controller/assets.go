@@ -112,7 +112,7 @@ const (
 	// may be distroless, and the init container fails closed, so an image without
 	// a shell would leave the environment unable to start at all. An offline
 	// deployment mirrors it under the same name/host as its other images.
-	permissionInitImage = "harbor.isuanova.com/suanova/busybox:1.38.0"
+	permissionInitImage = "harbor.isuanova.com/mirrors/docker.io/library/busybox:1.38.0"
 
 	// permissionInitMountPath is where that container mounts the workspace claim.
 	// It is a path of the init container's own — the claim is also mounted at the

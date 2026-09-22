@@ -255,9 +255,11 @@ docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/ssh-ubuntu22.
 
 ### Overrides / mirror builds (CN or offline)
 
-Every build resolves `FROM` this registry's mirrored copies of the upstream bases —
-`$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:<base-date>` and `…/ubuntu:$(UBUNTU_VERSION)`,
-passed through `BASE_ARGS`. Building from the mirror keeps the published image descended from the
+Every build resolves `FROM` this registry's mirrored copies of the upstream bases — they live in
+the shared `$(MIRROR_PROJECT)` project, each repo named for the upstream reference it holds —
+`$(REGISTRY)/$(MIRROR_PROJECT)/quay.io/jupyter/minimal-notebook:<base-date>` and
+`…/docker.io/library/ubuntu:$(UBUNTU_VERSION)`, passed through `BASE_ARGS`. Building from the
+mirror keeps the published image descended from the
 base the platform serves, where `FROM ubuntu:22.04` would silently give whatever upstream has
 retagged it to — and it is the only copy that resolves where upstream is unreachable. Each is
 pinned by the digest of the mirror's index, and the digest is what the build resolves:

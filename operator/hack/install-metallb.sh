@@ -21,12 +21,17 @@
 # below it is a re-apply.
 set -euo pipefail
 
-METALLB_VERSION="${METALLB_VERSION:-v0.16.0}"
+# The version is not free to bump on its own: the controller and speaker images
+# come from the shared mirrors project, and the only tag that project carries is
+# the one below (the rewrite further down changes the repository, never the tag).
+# v0.13.9 is what is mirrored there; a newer MetalLB would have to be mirrored
+# into mirrors/quay.io/metallb/ before this could name it.
+METALLB_VERSION="${METALLB_VERSION:-v0.13.9}"
 # The native manifest is fetched, not vendored: it is 2.4k lines of CRDs and
 # RBAC that only this test needs. Pinned by checksum for the same reason the CI
 # workflow pins the kind binary — a tag alone is a mutable reference.
 METALLB_MANIFEST_URL="${METALLB_MANIFEST_URL:-https://raw.githubusercontent.com/metallb/metallb/${METALLB_VERSION}/config/manifests/metallb-native.yaml}"
-METALLB_MANIFEST_SHA256="${METALLB_MANIFEST_SHA256:-b0b9be2802f10aa32d45308b4457d06cde0c70544712c8d0cf5511657ffd2b69}"
+METALLB_MANIFEST_SHA256="${METALLB_MANIFEST_SHA256:-acf9490589d58d94df025228b58e4bf22190a3d8e50c53736a30b814302a9f77}"
 
 NS="metallb-system"
 KIND_NETWORK="${KIND_NETWORK:-kind}"
@@ -116,23 +121,25 @@ if [ -z "${METALLB_READY}" ]; then
   [ "${DIGEST}" = "${METALLB_MANIFEST_SHA256}" ] \
     || { echo "MetalLB manifest checksum mismatch — ${METALLB_VERSION} was re-tagged, or the download is wrong" >&2; exit 1; }
 
-  # The bundle's own image refs point at quay.io. Repoint them at the platform
-  # registry, which holds the same tags (hack/mirror-e2e-images.sh): the runner
-  # reaches harbor.isuanova.com on the internal network, and quay.io is both slow
-  # from it and one rate limit away from failing the job. Only the repository is
-  # rewritten, so the tag — and with it the version — stays whatever
-  # METALLB_VERSION pinned above. The checksum pin is what makes this safe to do
-  # blind: the rewrite is applied to exactly the manifest those refs were read
-  # from. Set METALLB_REGISTRY= (explicitly empty) to keep the upstream refs.
-  METALLB_REGISTRY="${METALLB_REGISTRY-harbor.isuanova.com/suanova}"
+  # The bundle's own image refs point at quay.io. Repoint them at the shared
+  # mirrors project, which holds the same tags (hack/mirror-e2e-images.sh): the
+  # runner reaches harbor.isuanova.com on the internal network, and quay.io is
+  # both slow from it and one rate limit away from failing the job. The mirror
+  # names a repo for its upstream reference, so the rewrite is a prefix —
+  # quay.io/metallb/<image> becomes <registry>/quay.io/metallb/<image> — and the
+  # tag, which is the version, is untouched. The checksum pin is what makes this
+  # safe to do blind: the rewrite is applied to exactly the manifest those refs
+  # were read from. Set METALLB_REGISTRY= (explicitly empty) to keep them.
+  METALLB_REGISTRY="${METALLB_REGISTRY-harbor.isuanova.com/mirrors}"
   if [ -n "${METALLB_REGISTRY}" ]; then
-    sed -e "s#quay.io/metallb/controller:#${METALLB_REGISTRY}/metallb-controller:#g" \
-        -e "s#quay.io/metallb/speaker:#${METALLB_REGISTRY}/metallb-speaker:#g" \
+    sed "s#quay\.io/metallb/#${METALLB_REGISTRY}/quay.io/metallb/#g" \
         "${OUT}" > "${OUT}.registry" && mv "${OUT}.registry" "${OUT}"
     # Fail loudly if the bundle stops carrying the refs this rewrote. Silently
     # falling back to quay.io would still pass on a runner that can reach it, so
-    # the mirror would rot unnoticed until the day it mattered.
-    grep -q 'quay.io/metallb/' "${OUT}" \
+    # the mirror would rot unnoticed until the day it mattered. Anchored on
+    # `image:` because a rewritten ref legitimately contains the upstream path —
+    # only a ref the sed left alone still reads `image: quay.io/...`.
+    grep -qE '^[[:space:]]*image: quay\.io/metallb/' "${OUT}" \
       && { echo "MetalLB manifest still references quay.io after the registry rewrite — its image refs changed shape; update this script" >&2; exit 1; }
   fi
 

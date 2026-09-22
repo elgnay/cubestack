@@ -43,7 +43,7 @@ done
 
 # The MetalLB refs are the two repositories hack/install-metallb.sh rewrites the
 # upstream manifest to, and they have to match it for the node to find them.
-METALLB_REGISTRY="${METALLB_REGISTRY:-harbor.isuanova.com/suanova}"
+METALLB_REGISTRY="${METALLB_REGISTRY:-harbor.isuanova.com/mirrors}"
 
 # The bases the images themselves are built FROM. The Makefile holds the map,
 # because helm-e2e-images is what hands each Dockerfile its base as a
@@ -64,8 +64,8 @@ done
 # ENVOY_GATEWAY_VERSION, the proxy's from the compatibility matrix published
 # beside that release (see the Makefile).
 MIRRORS=(
-  "quay.io/metallb/controller:${METALLB_VERSION}=${METALLB_REGISTRY}/metallb-controller:${METALLB_VERSION}"
-  "quay.io/metallb/speaker:${METALLB_VERSION}=${METALLB_REGISTRY}/metallb-speaker:${METALLB_VERSION}"
+  "quay.io/metallb/controller:${METALLB_VERSION}=${METALLB_REGISTRY}/quay.io/metallb/controller:${METALLB_VERSION}"
+  "quay.io/metallb/speaker:${METALLB_VERSION}=${METALLB_REGISTRY}/quay.io/metallb/speaker:${METALLB_VERSION}"
   "docker.io/envoyproxy/gateway:${ENVOY_GATEWAY_VERSION}=${ENVOY_GATEWAY_IMAGE}:${ENVOY_GATEWAY_VERSION}"
   "docker.io/envoyproxy/envoy:${ENVOY_PROXY_IMAGE##*:}=${ENVOY_PROXY_IMAGE}"
   "docker.io/envoyproxy/gateway-helm:${ENVOY_GATEWAY_VERSION}=${ENVOY_GATEWAY_CHART}:${ENVOY_GATEWAY_VERSION}"

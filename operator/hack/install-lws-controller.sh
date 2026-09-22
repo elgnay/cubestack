@@ -53,7 +53,7 @@ LWS_MOD="$(go env GOMODCACHE)/sigs.k8s.io/lws@${LWS_VER}"
 # pin in go.mod then names a tag nobody has published, which fails the pull
 # below loudly instead of quietly running the previous controller against a
 # newer CRD set. Re-publish with hack/mirror-e2e-images.sh.
-LWS_IMAGE_REPO="${LWS_IMAGE_REPO:-harbor.isuanova.com/suanova/lws}"
+LWS_IMAGE_REPO="${LWS_IMAGE_REPO:-harbor.isuanova.com/mirrors/registry.k8s.io/lws/lws}"
 LWS_IMAGE="${LWS_IMAGE_REPO}:${LWS_VER}"
 
 KUSTOMIZE="${KUSTOMIZE:-$(pwd)/bin/kustomize}"
