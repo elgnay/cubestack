@@ -254,6 +254,10 @@ const (
 	// images conventionally use.
 	defaultRuntimeUser = "user"
 
+	// rootRuntimeUser is the account a root environment logs in as, and what its
+	// endpoint advertises whatever the spec names (see runtimeUser).
+	rootRuntimeUser = "root"
+
 	// defaultWorkspacePath is where the workspace PVC mounts when neither
 	// spec.storage.mountPath nor a declared HOME nor the runtime identity implies
 	// another home.
@@ -1345,7 +1349,7 @@ func podTemplateAnnotations(env *aiv1alpha1.DevEnvironment) map[string]string {
 func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
 	if sc := env.Spec.Runtime; sc != nil && sc.SecurityContext != nil &&
 		sc.SecurityContext.RunAsUser != nil && *sc.SecurityContext.RunAsUser == 0 {
-		return "root"
+		return rootRuntimeUser
 	}
 	if env.Spec.Runtime != nil && env.Spec.Runtime.User != "" {
 		return env.Spec.Runtime.User

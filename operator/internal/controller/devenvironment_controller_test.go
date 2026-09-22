@@ -1377,7 +1377,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				Runtime: &aiv1alpha1.RuntimeSpec{
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 				},
-			}})).To(Equal("root"))
+			}})).To(Equal(rootRuntimeUser))
 		})
 
 		It("serves root when the environment runs as root and names an image account", func() {
@@ -1386,7 +1386,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					User:            testRuntimeUser,
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 				},
-			}})).To(Equal("root"))
+			}})).To(Equal(rootRuntimeUser))
 		})
 	})
 
@@ -1396,7 +1396,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		// there: its sshd runs as root and serves that uid.
 		It("advertises root for an environment that runs as root", func() {
 			env := &aiv1alpha1.DevEnvironment{
-				ObjectMeta: metav1.ObjectMeta{Name: "de-root", Namespace: "default"},
+				ObjectMeta: metav1.ObjectMeta{Name: "de-root", Namespace: testNamespace},
 				Spec: aiv1alpha1.DevEnvironmentSpec{
 					Type: aiv1alpha1.DevEnvironmentTypeJupyter,
 					SSH:  &aiv1alpha1.SSHSpec{Enabled: true},
@@ -1411,7 +1411,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				map[string]int32{sshPortName: 20001}, map[int32]int32{20001: 20001})
 			Expect(status.Endpoints).To(ContainElement(aiv1alpha1.Endpoint{
 				Name:         sshPortName,
-				Address:      fmt.Sprintf("ssh://root@%s:20001", testGatewayIP),
+				Address:      fmt.Sprintf("ssh://%s@%s:20001", rootRuntimeUser, testGatewayIP),
 				ListenerPort: 20001,
 			}))
 		})
