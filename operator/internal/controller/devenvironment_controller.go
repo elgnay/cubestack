@@ -1667,7 +1667,7 @@ func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 			if v.Name != notebookArgsEnv {
 				continue
 			}
-			for _, arg := range strings.Fields(v.Value) {
+			for arg := range strings.FieldsSeq(v.Value) {
 				if isNotebookBaseURLArg(arg) {
 					findings = append(findings, specFinding{
 						field:  "runtime.env[" + notebookArgsEnv + "]",

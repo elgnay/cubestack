@@ -140,13 +140,13 @@ func sshKeyPairMatches(privPEM, pubOpenSSH []byte) bool {
 
 // nvidiaGPU and metaxGPU build the requested-accelerator block the way a spec
 // would carry it, so the cases below read as the request rather than as struct
-// literals.
-func nvidiaGPU(count int32) *aiv1alpha1.GPUSpec {
-	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(count)}
+// literals. Every case asks for one.
+func nvidiaGPU() *aiv1alpha1.GPUSpec {
+	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorNvidia, Count: ptrTo(int32(1))}
 }
 
-func metaxGPU(count int32) *aiv1alpha1.GPUSpec {
-	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorMetax, Count: ptrTo(count)}
+func metaxGPU() *aiv1alpha1.GPUSpec {
+	return &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendorMetax, Count: ptrTo(int32(1))}
 }
 
 // validDevEnvironment mirrors the API package fixture (minus the SSH config,
@@ -1089,21 +1089,21 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Expect(reason).NotTo(BeEmpty())
 				}
 			},
-			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(1), true),
-			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(1), false),
-			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(1), false),
-			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(1), true),
-			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(1), true),
-			Entry("metax with an uppercase reference matches", strings.ToUpper(testMetaxImage), metaxGPU(1), true),
+			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(), true),
+			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(), false),
+			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(), false),
+			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(), true),
+			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(), true),
+			Entry("metax with an uppercase reference matches", strings.ToUpper(testMetaxImage), metaxGPU(), true),
 			// The rule reads the whole reference, so a path segment alone can
 			// satisfy it. That is the price of one rule for both vendors: the
 			// gate asks whether the name states its vendor, not whether the
 			// reference points at a real platform image.
-			Entry("metax with maca only in the path matches", testMacaInPathImage, metaxGPU(1), true),
+			Entry("metax with maca only in the path matches", testMacaInPathImage, metaxGPU(), true),
 			// base-maca spells the metax token, so it satisfies the rule on its
 			// own terms — the token is what is checked, not the product name the
 			// platform happens to publish under.
-			Entry("metax with a base-maca image matches", testBaseMacaImage, metaxGPU(1), true),
+			Entry("metax with a base-maca image matches", testBaseMacaImage, metaxGPU(), true),
 			// No accelerator ⇒ nothing to match, whatever the image. The block's
 			// absence is the only spelling of this, so there is no count to zero out
 			// and no vendor left over to contradict it.
@@ -1125,7 +1125,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("names the CPU-only escape in the mismatch message", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
 				Image:     testBaseMacaImage,
-				Resources: aiv1alpha1.ResourcesSpec{GPU: nvidiaGPU(1)},
+				Resources: aiv1alpha1.ResourcesSpec{GPU: nvidiaGPU()},
 			}}
 			Expect(brandMismatchReason(env)).To(ContainSubstring("omit spec.resources.gpu"))
 		})
@@ -1160,7 +1160,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		mismatched := func() *aiv1alpha1.DevEnvironment {
 			env := newJupyter()
 			env.Spec.Image = testBaseMacaImage
-			env.Spec.Resources.GPU = nvidiaGPU(1)
+			env.Spec.Resources.GPU = nvidiaGPU()
 			return env
 		}
 		// unreadable NOTEBOOK_ARGS: the one refusal that is not about the brand.
@@ -1202,7 +1202,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Entry("a declared runtime account is ignored when the environment is root",
 				root(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
 					Type: aiv1alpha1.DevEnvironmentTypeJupyter, Image: testDevImage,
-					Runtime: &aiv1alpha1.RuntimeSpec{User: "jovyan"},
+					Runtime: &aiv1alpha1.RuntimeSpec{User: testRuntimeUser},
 				}}), 0, []string{"spec.runtime.user: ignored — "}),
 			// Both dispositions in one spec: the refusal is what the phase follows,
 			// and the resolved value is reported beside it rather than instead of it.
@@ -1217,7 +1217,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("fails the environment on the brand mismatch before any other refusal", func() {
 			env := fromValueFrom()
 			env.Spec.Image = testBaseMacaImage
-			env.Spec.Resources.GPU = nvidiaGPU(1)
+			env.Spec.Resources.GPU = nvidiaGPU()
 			// The phase and the Accepted reason come from the first must-update
 			// finding, so which one leads is part of the contract.
 			blocking := mustUpdateFindings(specFindings(env))
@@ -1431,7 +1431,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("keeps an explicit non-root runAsUser on the account's home", func() {
 			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
 				s.Runtime = &aiv1alpha1.RuntimeSpec{
-					User:            "jovyan",
+					User:            testRuntimeUser,
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(1000))},
 				}
 			}))).To(Equal("/home/jovyan"))
@@ -1925,9 +1925,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
 				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "1Gi"}
 				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
-					User:            "root",
+					User:            rootRuntimeUser,
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0)), RunAsGroup: ptrTo(int64(0))},
-					Env:             []corev1.EnvVar{{Name: homeEnv, Value: "/home/root"}, {Name: "NB_USER", Value: "root"}},
+					Env:             []corev1.EnvVar{{Name: homeEnv, Value: "/home/root"}, {Name: "NB_USER", Value: rootRuntimeUser}},
 				}
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
@@ -2030,7 +2030,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}
 			c := (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0]
 			Expect(c.Env).To(ContainElements(
-				corev1.EnvVar{Name: nbUserEnv, Value: "root"},
+				corev1.EnvVar{Name: nbUserEnv, Value: rootRuntimeUser},
 				corev1.EnvVar{Name: nbUIDEnv, Value: "0"},
 				corev1.EnvVar{Name: nbGIDEnv, Value: "0"},
 			))
@@ -2053,7 +2053,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
 				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 				Env: []corev1.EnvVar{
-					{Name: nbUserEnv, Value: "jovyan"},
+					{Name: nbUserEnv, Value: testRuntimeUser},
 					{Name: nbUIDEnv, Value: "1000"},
 				},
 			}
@@ -2068,7 +2068,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			// the one configuration a pod group could have been derived into, and the
 			// one that does not start (::withRootLauncherEnv).
 			Expect(rendered).To(Equal([]corev1.EnvVar{
-				{Name: nbUserEnv, Value: "root"},
+				{Name: nbUserEnv, Value: rootRuntimeUser},
 				{Name: nbUIDEnv, Value: "0"},
 				{Name: nbGIDEnv, Value: "0"},
 			}))
@@ -2761,7 +2761,7 @@ var _ = Describe("DevEnvironment controller", func() {
 		It("accepts an environment whose declared values the controller resolves", func() {
 			env := validDevEnvironment("de-accepted-overridden")
 			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
-				User:            "jovyan",
+				User:            testRuntimeUser,
 				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 				Env: []corev1.EnvVar{
 					{Name: nbGIDEnv, Value: "1000"},
