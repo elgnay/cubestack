@@ -80,6 +80,12 @@ const TURN_APPROVAL = [
   },
 ];
 
+/** The computed view-transition name of an element. The morph's two ends carry
+ *  the same one and nothing else does, so this is how the wiring is asserted —
+ *  the animation itself is the browser's and is not observable from a test. */
+const vtName = (page: Page, selector: string) =>
+  page.locator(selector).evaluate((el) => getComputedStyle(el).viewTransitionName);
+
 function sseBody(events: object[]): string {
   return events.map((e) => `data: ${JSON.stringify(e)}\n\n`).join("");
 }
@@ -89,9 +95,25 @@ interface Captured {
 }
 
 /** Stub the endpoints the surface touches (plus /api/overview so a test that
- *  visits the landing page stays healthy). */
-async function stubFloatingChat(page: Page, turnEvents: object[]): Promise<Captured> {
+ *  visits the landing page stays healthy).
+ *
+ *  `historyOnce` answers the FIRST transcript read with those items and every
+ *  later one with the runtime's "this conversation has not started". That is how
+ *  the handoff is provable: whichever surface reads second cannot supply the
+ *  thread, so a thread on screen came from the handoff.
+ *
+ *  `staleHistory` is served for every read once the test calls `serveStale()`.
+ *  That flip is what makes the case deterministic: reads before it (the widget's
+ *  restore and its follow tick) carry the thread, and the reads after it — the
+ *  pane's own restore, and the follow loop's — carry an older copy. */
+async function stubFloatingChat(
+  page: Page,
+  turnEvents: object[],
+  stubs: { historyOnce?: object[]; staleHistory?: object[] } = {},
+): Promise<Captured & { serveStale: () => void }> {
   const captured: Captured = { messagePosts: [] };
+  let historyReads = 0;
+  let stale = false;
   await page.route("**/api/overview", (route) => route.fulfill({ json: overviewSummary() }));
   await page.route("**/api/cubepilot/**", async (route) => {
     const req = route.request();
@@ -111,29 +133,38 @@ async function stubFloatingChat(page: Page, turnEvents: object[]): Promise<Captu
       return json({ models: [{ id: "qwen38-27b", ownedBy: "cubestack" }], endpoint: "http://ai-gateway.test:8080" });
 
     if (path.includes("/api/cubepilot/pilot/")) {
-      if (path.endsWith("/approval/pending")) return json({ error: "no pending approval" }, 404);
-      if (path.endsWith("/question/pending")) return json({ error: "no pending question" }, 404);
+      // The send and the transcript read are the SAME path, so the method is
+      // what tells them apart — matched first, or the 404 below would answer
+      // the send.
       if (path.endsWith("/messages")) {
         if (method === "POST") {
-          captured.messagePosts.push({ path, body: post() as { content?: string; sessionId?: string } });
+          captured.messagePosts.push({ path, body: post() as { content?: string } });
           return route.fulfill({
             status: 200,
             headers: { "content-type": "text/event-stream", "cache-control": "no-cache" },
             body: sseBody(turnEvents),
           });
         }
+        if (stale && stubs.staleHistory) return json({ items: stubs.staleHistory });
+        if (stubs.historyOnce && ++historyReads === 1) return json({ items: stubs.historyOnce });
         return json({ error: "no such session" }, 404);
       }
+      // The pending collections: an empty one is the ordinary "nothing is
+      // parked".
+      if (path.endsWith("/approvals")) return json({ approvals: [] });
+      if (path.endsWith("/questions")) return json({ questions: [] });
       if (path.endsWith("/turn")) return json({ active: false });
-      if (path.endsWith("/approval") && method === "POST") {
+      if (path.endsWith("/approvals/decision") && method === "POST") {
         const body = post();
         return json({ approved: body.decision !== "reject", decision: body.decision, approvalId: body.approvalId });
       }
+      if (path.endsWith("/questions/answer")) return json({ questionId: "q-1", cancelled: false });
+      if (path.endsWith("/questions/cancel")) return json({ questionId: "q-1", cancelled: true });
       if (path.endsWith("/abort") && method === "POST") return json({ ok: true });
     }
     return json({ error: `unstubbed ${method} ${path}` }, 404);
   });
-  return captured;
+  return { ...captured, serveStale: () => { stale = true; } };
 }
 
 test.beforeEach(async ({ context, page }) => {
@@ -188,6 +219,151 @@ test.describe("global floating AI chat", () => {
     await expect(fab).toHaveCount(0);
   });
 
+  test("expanding hands the conversation over, so the pane paints it before its own restore lands", async ({ page }) => {
+    // Both surfaces drive the same session, so the pane would restore the same
+    // thread by itself — but only behind a metadata read and a history read, and
+    // until those land a reader who just expanded a conversation sees a greeting,
+    // which reads as "it is gone" rather than "it got bigger".
+    //
+    // The stub makes that provable: only the FIRST transcript read answers (the
+    // widget's). Every later one is the runtime's "this conversation has not
+    // started", so a thread on screen after the expansion can only be the one the
+    // widget handed over.
+    await stubFloatingChat(page, TURN_DONE, {
+      historyOnce: [
+        { role: "user", content: "上次巡检的结论?" },
+        { role: "assistant", content: [{ type: "text", text: "2 个节点 NotReady,已在 09:20 恢复。" }] },
+      ],
+    });
+    await page.goto("/");
+    await page.click('[data-od-id="fchat-fab"]');
+    await expect(page.locator('[data-od-id="fchat-panel"]')).toContainText("上次巡检的结论?");
+
+    await page.click('[data-od-id="fchat-expand"]');
+
+    // The full pane, on the chat tab, holding the same conversation.
+    await expect(page).toHaveURL(/\/cubepilot/);
+    await expect(page.locator('[data-od-id="pane-chat"]')).toBeVisible();
+    await expect(page.locator('[data-od-id="chat-thread"]')).toContainText("2 个节点 NotReady,已在 09:20 恢复。");
+    // …and saying where it came from, which is the whole point of the move.
+    await expect(page.locator('[data-od-id="handoff-chip"]')).toBeVisible();
+    // The widget became the page: it is not drawn beside it.
+    await expect(page.locator('[data-od-id="fchat-fab"]')).toHaveCount(0);
+  });
+
+  test("the sidebar's own link to the chat page hands the thread over too", async ({ page }) => {
+    // ⤢ is not the only way in, and the conversation belongs to the reader, not to
+    // one button: leaving through the nav has to carry the same thread.
+    await stubFloatingChat(page, TURN_DONE, {
+      historyOnce: [{ role: "user", content: "上次巡检的结论?" }, { role: "assistant", content: [{ type: "text", text: "2 个节点 NotReady。" }] }],
+    });
+    await page.goto("/");
+    await page.click('[data-od-id="fchat-fab"]');
+    await expect(page.locator('[data-od-id="fchat-panel"]')).toContainText("上次巡检的结论?");
+
+    await page.click('[data-od-id="nav-copilot"]');
+
+    await expect(page).toHaveURL(/\/cubepilot/);
+    await expect(page.locator('[data-od-id="handoff-chip"]')).toBeVisible();
+    await expect(page.locator('[data-od-id="chat-thread"]')).toContainText("2 个节点 NotReady。");
+  });
+
+  test("the two surfaces carry one view-transition name, so the morph has something to move between", async ({ page }) => {
+    // The animation itself is the browser's and cannot be asserted here; what this
+    // pins is the wiring it needs — the same name on the launcher, the panel and
+    // the pane's thread, with never more than one of them on screen at a time.
+    await stubFloatingChat(page, TURN_DONE);
+    await page.goto("/");
+    expect(await vtName(page, '[data-od-id="fchat-fab"]')).toBe("agent-chat");
+
+    await page.click('[data-od-id="fchat-fab"]');
+    // Open: the panel takes the name, the launcher gives it up.
+    expect(await vtName(page, '[data-od-id="fchat-panel"]')).toBe("agent-chat");
+    expect(await vtName(page, '[data-od-id="fchat-fab"]')).toBe("none");
+
+    await page.goto("/cubepilot");
+    await expect(page.locator('[data-od-id="chat-thread"]')).toBeVisible();
+    // Polled: the name arrives with the agent selection, which the pane makes
+    // after its own mount (the same element serves the model playground, unnamed).
+    await expect.poll(() => vtName(page, '[data-od-id="chat-thread"]')).toBe("agent-chat");
+  });
+
+  test("a stale history read does not replace the thread that was handed over", async ({ page }) => {
+    // The handed thread is what the reader was looking at, so it can be AHEAD of
+    // the runtime: a turn still streaming, or one the writer has not caught up
+    // with. The pane's own restore must not overwrite it with an older copy — the
+    // assertion runs after that read has landed, and later reads answer 404 so
+    // nothing can put it back.
+    const captured = await stubFloatingChat(page, TURN_DONE, {
+      historyOnce: [
+        { role: "user", content: "上次巡检的结论?" },
+        { role: "assistant", content: [{ type: "text", text: "刚跑完的那次巡检结论。" }] },
+      ],
+      staleHistory: [{ role: "user", content: "很早以前的那次提问" }],
+    });
+    await page.goto("/");
+    await page.click('[data-od-id="fchat-fab"]');
+    await expect(page.locator('[data-od-id="fchat-panel"]')).toContainText("刚跑完的那次巡检结论。");
+
+    // From here every transcript read — the pane's own restore first among them —
+    // answers with the older copy, so what survives is decided by the guard alone.
+    captured.serveStale();
+    await page.click('[data-od-id="fchat-expand"]');
+    await expect(page).toHaveURL(/\/cubepilot/);
+    const thread = page.locator('[data-od-id="chat-thread"]');
+    // The stale read has landed by now; the handed thread is still what is on
+    // screen.
+    await page.waitForTimeout(2000);
+    await expect(thread).toContainText("刚跑完的那次巡检结论。");
+    await expect(thread).not.toContainText("很早以前的那次提问");
+  });
+
+  test("opens on the newest message, not the oldest", async ({ page }) => {
+    // A conversation longer than the panel must open where the reader left it —
+    // at the end. The pane has always done this; the panel restored its history
+    // with the scroll pinned to the top, so the first thing a reader saw after
+    // opening a long conversation was its oldest turn.
+    const long = Array.from({ length: 20 }, (_, i) => [
+      { role: "user", content: `第 ${i + 1} 个问题` },
+      { role: "assistant", content: [{ type: "text", text: `第 ${i + 1} 个回答` }] },
+    ]).flat();
+    await stubFloatingChat(page, TURN_DONE, { historyOnce: long });
+    await page.goto("/");
+    await page.click('[data-od-id="fchat-fab"]');
+
+    const thread = page.locator('[data-od-id="fchat-thread"]');
+    await expect(thread).toContainText("第 20 个回答");
+    // At the bottom: nothing left to scroll to. Asserted as "the distance to the
+    // end is zero" so the case cannot pass by the thread being too short to
+    // scroll at all — the fixture below overflows the panel.
+    await expect.poll(() => thread.evaluate((el) => el.scrollHeight - el.scrollTop - el.clientHeight)).toBeLessThan(8);
+  });
+
+  test("comes back on the chat tab when a MODEL is what that tab shows", async ({ page }) => {
+    // The chat tab IS the conversation only while the assistant is what it shows.
+    // A model playground is a different chat, so the assistant belongs there —
+    // hiding it would take it away exactly when a reader might want to ask about
+    // what the model just said.
+    await stubFloatingChat(page, TURN_DONE);
+    await page.goto("/cubepilot");
+    await expect(page.locator('[data-od-id="fchat-fab"]')).toHaveCount(0);
+    // With the assistant selected, the thread is the named end of the morph…
+    await expect.poll(() => vtName(page, '[data-od-id="chat-thread"]')).toBe("agent-chat");
+
+    await page.click('[data-od-id="obj-qwen38-27b"]');
+    await expect(page.locator('[data-od-id="fchat-fab"]')).toBeVisible();
+    // …and with a model selected it is the launcher: the same two ends the route
+    // change morphs between, so switching objects inside the page reads as the
+    // same move rather than as one surface blinking out.
+    await expect.poll(() => vtName(page, '[data-od-id="fchat-fab"]')).toBe("agent-chat");
+    expect(await vtName(page, '[data-od-id="chat-thread"]')).toBe("none");
+
+    // …and it goes away again when the assistant is what is on screen.
+    await page.click('[data-od-id="obj-cubepilot"]');
+    await expect(page.locator('[data-od-id="fchat-fab"]')).toHaveCount(0);
+    await expect.poll(() => vtName(page, '[data-od-id="chat-thread"]')).toBe("agent-chat");
+  });
+
   test("opens the panel, greets from real data, and streams a turn to its end", async ({ page }) => {
     const captured = await stubFloatingChat(page, TURN_DONE);
     await page.goto("/");
@@ -212,12 +388,16 @@ test.describe("global floating AI chat", () => {
     // The conversation is no longer fresh: the quick prompts are gone.
     await expect(panel.locator('[data-od-id="fchat-quick"]')).toHaveCount(0);
 
-    // The send named the ONE fixed conversation the chat tab owns.
+    // The send names the ONE fixed conversation the chat tab owns — in its
+    // path, with nothing else in the body: the route decodes strictly, so a
+    // leftover field would be a 400.
     await expect
       .poll(() => captured.messagePosts.length)
       .toBe(1);
-    expect(captured.messagePosts[0].body.sessionId).toBe(SESSION_KEY);
-    expect(captured.messagePosts[0].body.content).toBe("集群状态如何?");
+    expect(decodeURIComponent(captured.messagePosts[0].path)).toContain(
+      `/api/v1/sessions/${SESSION_KEY}/messages`,
+    );
+    expect(captured.messagePosts[0].body).toEqual({ content: "集群状态如何?" });
   });
 
   test("parks on the approval card its turn raises, and answers it", async ({ page }) => {

@@ -19,6 +19,7 @@
 // surface needs: restore on open, follow while open, stop-first on send.
 
 import { Box } from "@mui/material";
+import { useRouter } from "next/navigation";
 import { Fragment, useEffect, useRef, useState } from "react";
 
 import {
@@ -54,6 +55,9 @@ import { useI18n } from "@/lib/i18n";
 import { AgentThread } from "./AgentThread";
 import { HitlDock, type ApprovalDecision } from "./HitlDock";
 import { Btn, CpTextArea, Icons, Pill, monoSx, useToast } from "./ui";
+import { offerHandoffFromFloatingChat, registerFloatingThread } from "./agentHandoff";
+import { setStoredTab } from "./tabStore";
+import { AGENT_CHAT_TRANSITION, withViewTransition } from "./viewTransition";
 
 // The same fixed conversation key the chat tab uses (see ChatPane): one
 // conversation per user, wherever they open it.
@@ -92,6 +96,7 @@ const QUICK_PROMPTS = ["fchat.qp1", "fchat.qp2"] as const;
 export function FloatingChat() {
   const { t } = useI18n();
   const { showToast, toastView } = useToast();
+  const router = useRouter();
 
   const [open, setOpen] = useState(false);
   const [msgs, setMsgs] = useState<ThreadMsg[]>([]);
@@ -321,10 +326,17 @@ export function FloatingChat() {
       });
     };
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/approval/pending`);
-      if (res.ok && genRef.current === gen) {
+      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/approvals`);
+      // A failed read is thrown so that it is reported rather than folded into
+      // "nothing is parked": an empty collection is the ordinary answer for a
+      // session that is not parked, and a read that could not be made is not
+      // that answer.
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (genRef.current === gen) {
         // A LIST, oldest first: a session can hold several pending approvals
-        // at once, and the oldest is not the only one this surface offers.
+        // at once, and the oldest is not the only one this surface offers. An
+        // empty one draws nothing, which is why the read above reports its
+        // failures rather than leaving this branch to say it silently.
         const { approvals } = (await res.json()) as { approvals?: PendingApproval[] };
         for (const a of approvals ?? []) {
           if (a.approvalId) {
@@ -336,15 +348,24 @@ export function FloatingChat() {
           }
         }
       }
-      // 404 = no pending approval: silent by contract.
-    } catch {
-      /* silent */
+    } catch (e) {
+      // The read failed, so whether a write is parked is simply unknown.
+      // Staying silent would leave a parked turn looking idle, with no card
+      // anywhere — and the card is the only place the decision can be made.
+      // Same reason the question read below reports its failures.
+      if (genRef.current === gen) {
+        setMsgs((m) => [
+          ...m,
+          { ...newAgentMsg(nextId()), phase: "done", error: t("cubepilot.chat.pendingApprovalUnavailable", { error: String(e) }) },
+        ]);
+      }
     }
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/question/pending`);
-      // This endpoint's 404 IS "nothing is pending", not a failed read.
-      if (res.status !== 404 && !res.ok) throw new Error(`HTTP ${res.status}`);
-      if (res.ok && genRef.current === gen) {
+      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/questions`);
+      // An empty collection is "nothing is pending", and a read that FAILED is
+      // thrown so that it is reported rather than folded into "idle".
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      if (genRef.current === gen) {
         const { questions } = (await res.json()) as {
           questions?: Array<{ id?: string; questions?: AgentQuestionItem[]; timeoutSeconds?: number }>;
         };
@@ -510,12 +531,54 @@ export function FloatingChat() {
     stopFollowing();
   }
 
+  /** ⤢ opens this conversation in the full pane: the module's chat tab, with the
+   *  agent selected. It is the same session either surface would restore, so the
+   *  thread is handed over rather than left to be rediscovered — an expansion
+   *  that lands on a greeting reads as a lost conversation, not a bigger one —
+   *  and the navigation runs inside a view transition, so the panel is seen
+   *  growing into the thread it becomes. */
+  function expandToPane(): void {
+    offerHandoffFromFloatingChat();
+    setStoredTab("chat");
+    // The panel is deliberately left open: it is the element the browser morphs
+    // FROM, so it has to still be on screen when the transition captures the
+    // outgoing state. Entering the chat tab is what unmounts this whole surface,
+    // and its unmount cleanup retires the follow loop.
+    withViewTransition(
+      () => router.push("/cubepilot"),
+      () => !!document.querySelector('[data-od-id="pane-chat"]'),
+    );
+  }
+
+  // While the panel is open, publish what it holds to whoever asks: the sidebar's
+  // own link to the chat page cannot see this component, and the conversation is
+  // as much the reader's when they leave through the nav as when they leave
+  // through ⤢.
+  useEffect(() => {
+    registerFloatingThread(open ? () => msgs : null);
+    return () => registerFloatingThread(null);
+  }, [open, msgs]);
+
   // Focus the composer on open, so Enter starts talking immediately.
   useEffect(() => {
     if (!open) return;
     const id = requestAnimationFrame(() => inputEl.current?.focus());
     return () => cancelAnimationFrame(id);
   }, [open]);
+
+  // The thread follows the newest content, exactly as the pane's does. `open` is
+  // in the deps because the panel is not rendered while it is closed: the element
+  // this scrolls only exists once the reader opens it, and a history restored in
+  // the meantime never changes `msgs` again — so without it a long conversation
+  // opened on its OLDEST turn.
+  useEffect(() => {
+    const el = threadEl.current;
+    if (!el) return;
+    const id = requestAnimationFrame(() => {
+      el.scrollTop = el.scrollHeight;
+    });
+    return () => cancelAnimationFrame(id);
+  }, [open, msgs]);
 
   // The surface lives for the whole visit: retire its in-flight work when the
   // shell unmounts it (entering the chat tab) or the session ends.
@@ -538,10 +601,12 @@ export function FloatingChat() {
   async function sendAgent(text: string, gen: number, msgId: number): Promise<void> {
     let gotDone = false;
     try {
-      const res = await fetch("/api/cubepilot/pilot/api/v1/messages", {
+      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: text, sessionId: SESSION_KEY }),
+        // The conversation is named by the path. Bodies are decoded strictly,
+        // so the key does not belong in the body as well.
+        body: JSON.stringify({ content: text }),
       });
       if (!res.ok) {
         // Request-phase failure (400/409/503-warming): surfaced as an error on
@@ -621,7 +686,7 @@ export function FloatingChat() {
     // look like it landed immediately.
     patchApproval(callId, (a) => ({ ...a, state: "deciding", error: undefined }));
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/approval`, {
+      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/approvals/decision`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // The id is required: a session can hold several pending approvals,
@@ -660,15 +725,15 @@ export function FloatingChat() {
    *  refusal (404/409) does not say WHY, and guessing is what loses an answer. */
   async function reopenOrExpireQuestion(callId: string): Promise<void> {
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/question/pending`);
-      if (res.status === 404) {
-        patchQuestion(callId, (q) => ({ ...q, state: "expired", error: undefined }));
-        return;
-      }
+      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/questions`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { questions } = (await res.json()) as {
         questions?: Array<{ id?: string; questions?: AgentQuestionItem[]; timeoutSeconds?: number }>;
       };
+      // Membership in the collection IS the open/closed signal — the gateway's
+      // own account of what is still waiting. A question that is absent is gone
+      // (expired or answered); a read that failed does not get here at all, so
+      // "gone" and "could not ask" stay two different answers.
       const still = (questions ?? []).find((q) => q.id === callId);
       if (still) {
         patchQuestion(callId, (q) => ({
@@ -688,11 +753,17 @@ export function FloatingChat() {
   async function submitQuestion(callId: string, answers: Record<string, string[]>, cancel: boolean): Promise<void> {
     patchQuestion(callId, (q) => ({ ...q, state: "submitting", answers: cancel ? q.answers : answers, error: undefined }));
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/question`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: callId, ...(cancel ? { cancel: true } : { answers }) }),
-      });
+      const res = await fetch(
+        `/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/questions/${cancel ? "cancel" : "answer"}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // Answer and cancel are two routes rather than one route with a flag:
+          // each body carries exactly the fields its route acts on, so a cancel
+          // cannot arrive carrying answers.
+          body: JSON.stringify(cancel ? { id: callId } : { id: callId, answers }),
+        },
+      );
       if (!res.ok) {
         const body = (await res.json().catch(() => null)) as { error?: string } | null;
         if (res.status === 404 || res.status === 409) {
@@ -860,6 +931,11 @@ export function FloatingChat() {
           right: "20px",
           bottom: "20px",
           zIndex: 40,
+          // The morph's far end when the reader LEAVES the chat page: the pane's
+          // thread collapses into this launcher. Named only while closed, because
+          // the panel below carries the same name when it is open and one element
+          // may carry it at a time.
+          ...(open ? {} : { viewTransitionName: AGENT_CHAT_TRANSITION }),
           width: "52px",
           height: "52px",
           borderRadius: "50%",
@@ -888,6 +964,8 @@ export function FloatingChat() {
             right: "20px",
             bottom: "84px",
             zIndex: 40,
+            // The morph's near end: the panel grows into the pane's thread on ⤢.
+            ...(open ? { viewTransitionName: AGENT_CHAT_TRANSITION } : {}),
             width: "min(460px, calc(100vw - 40px))",
             height: "min(680px, calc(100dvh - 120px))",
             display: "flex",
@@ -940,6 +1018,28 @@ export function FloatingChat() {
               <Box sx={{ ...monoSx, fontSize: 10.5, color: "text.secondary", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {agentRoleLine(agentStatus, t)}
               </Box>
+            </Box>
+            <Box
+              component="button"
+              type="button"
+              data-od-id="fchat-expand"
+              aria-label={t("fchat.expand")}
+              title={t("fchat.expand")}
+              onClick={expandToPane}
+              sx={{
+                border: 0,
+                bgcolor: "transparent",
+                color: "text.secondary",
+                p: "4px",
+                borderRadius: "6px",
+                display: "grid",
+                placeItems: "center",
+                cursor: "pointer",
+                flex: "none",
+                "&:hover": { bgcolor: "action.hover", color: "text.primary" },
+              }}
+            >
+              {Icons.expand({ size: 16 })}
             </Box>
             <Box
               component="button"

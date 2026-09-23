@@ -4,6 +4,13 @@ import { act } from "react-dom/test-utils";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { FloatingChat } from "./FloatingChat";
+import { takeAgentHandoff } from "./agentHandoff";
+
+// The widget's ⤢ navigates to the full pane — client-side, so the handed-over
+// thread survives the trip — and that needs the app router the unit environment
+// does not mount.
+const { push } = vi.hoisted(() => ({ push: vi.fn() }));
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push }) }));
 
 // No JSX: the repo's tsconfig is Next's (jsx: preserve), which vitest's
 // import analysis cannot transform. Same approach as the other component
@@ -49,8 +56,8 @@ const TURN_APPROVAL = [
 
 /** Stub every endpoint the surface hits. `turn` is the SSE body of the first
  *  POST /messages (repeated for later ones). */
-function stubApi(turn: object[]) {
-  const messagePosts: Array<{ path: string; body: { content?: string; sessionId?: string } }> = [];
+function stubApi(turn: object[], opts: { approvalsStatus?: number } = {}) {
+  const messagePosts: Array<{ path: string; body: { content?: string } }> = [];
   const sse = (events: object[]) => {
     const enc = new TextEncoder();
     const stream = new ReadableStream({
@@ -89,21 +96,31 @@ function stubApi(turn: object[]) {
         });
       if (url.includes("/api/cubepilot/pilot/")) {
         const post = () => JSON.parse((init?.body as string) ?? "{}") as Record<string, unknown>;
-        if (url.endsWith("/approval/pending")) return json({ error: "no pending approval" }, 404);
-        if (url.endsWith("/question/pending")) return json({ error: "no pending question" }, 404);
+        // The send and the transcript read are the SAME path, so the method is
+        // what tells them apart — and it is matched first, or the transcript's
+        // 404 would answer the send.
+        if (url.endsWith("/messages") && method === "POST") {
+          messagePosts.push({ path: url, body: post() as { content?: string } });
+          return sse(turn);
+        }
         if (url.endsWith("/messages")) {
-          if (method === "POST") {
-            messagePosts.push({ path: url, body: post() as { content?: string; sessionId?: string } });
-            return sse(turn);
-          }
           // No conversation for this stub user: the surface greets.
           return json({ error: "no such session" }, 404);
         }
+        // The pending collections: an empty one is the ordinary "nothing is
+        // parked", and the status knob is the gateway being unreadable.
+        if (url.endsWith("/approvals")) {
+          if (opts.approvalsStatus) return json({ error: "could not read the gateway" }, opts.approvalsStatus);
+          return json({ approvals: [] });
+        }
+        if (url.endsWith("/questions")) return json({ questions: [] });
         if (url.endsWith("/turn")) return json({ active: false });
-        if (url.endsWith("/approval") && method === "POST") {
+        if (url.endsWith("/approvals/decision") && method === "POST") {
           const body = post();
           return json({ approved: body.decision !== "reject", decision: body.decision, approvalId: body.approvalId });
         }
+        if (url.endsWith("/questions/answer")) return json({ questionId: "q-1", cancelled: false });
+        if (url.endsWith("/questions/cancel")) return json({ questionId: "q-1", cancelled: true });
         if (url.endsWith("/abort") && method === "POST") return json({ ok: true });
       }
       return json({});
@@ -223,11 +240,64 @@ describe("floating chat (global AI assistant)", () => {
     expect((container.querySelector('[data-od-id="fchat-input"]') as HTMLTextAreaElement).value).toBe("");
     expect(container.querySelector('[data-od-id="fchat-quick"]')).toBeNull();
 
-    // The send named the ONE fixed conversation — the same key the chat tab
-    // owns — not a session the API minted of its own.
+    // The send names the ONE fixed conversation — the same key the chat tab
+    // owns — in its PATH, and the body carries nothing else: the route decodes
+    // bodies strictly, so a leftover field would be a 400.
     expect(messagePosts.length).toBe(1);
-    expect(messagePosts[0].body.sessionId).toBe(SESSION_KEY);
-    expect(messagePosts[0].body.content).toBe("集群状态如何?");
+    expect(decodeURIComponent(messagePosts[0].path)).toContain(`/api/v1/sessions/${SESSION_KEY}/messages`);
+    expect(messagePosts[0].body).toEqual({ content: "集群状态如何?" });
+    act(() => root.unmount());
+  });
+
+  it("reports a pending-approval read that failed, not a panel that looks idle", async () => {
+    // The gateway may be holding a write this surface cannot see, and a panel
+    // that draws nothing leaves the user with no card to unblock it. An empty
+    // collection is the ordinary "nothing is parked"; a read that FAILED is not
+    // that, and the two are only tellable apart if the failure is said out loud
+    // — the same reasoning the chat pane's own restore follows.
+    stubApi(TURN_DONE, { approvalsStatus: 502 });
+    const { container, root } = renderChat();
+    await act(async () => {});
+    act(() => {
+      (container.querySelector('[data-od-id="fchat-fab"]') as HTMLElement).click();
+    });
+
+    const reported = await waitFor(root, () => (container.textContent ?? "").includes("无法确认是否有待审批的写操作"));
+    expect(reported).toBe(true);
+    // Nothing was read, so no card is invented either.
+    expect(container.querySelector('[data-od-id="approval-approve"]')).toBeNull();
+    act(() => root.unmount());
+  });
+
+  it("hands the thread over and opens the full pane when expanded", async () => {
+    // Expanding is the widget's way of saying "same conversation, more room". It
+    // has to arrive on the chat tab (that is where the pane lives), and it has to
+    // carry the thread: the pane restores the same session, but asynchronously,
+    // and a greeting in the meantime reads as a lost conversation.
+    stubApi(TURN_DONE);
+    const { container, root } = renderChat();
+    await act(async () => {});
+    act(() => {
+      (container.querySelector('[data-od-id="fchat-fab"]') as HTMLElement).click();
+    });
+    await waitFor(root, () => (container.textContent ?? "").includes("会话审计已开启"));
+
+    const expand = container.querySelector('[data-od-id="fchat-expand"]') as HTMLElement;
+    expect(expand).not.toBeNull();
+    act(() => {
+      expand.click();
+    });
+
+    expect(push).toHaveBeenCalledWith("/cubepilot");
+    // The module's stored tab is what the page opens on.
+    expect(localStorage.getItem("cubestack.cubepilot.tab")).toBe("chat");
+    // What the reader was looking at travels with them.
+    const handed = takeAgentHandoff();
+    expect(handed).not.toBeNull();
+    expect((handed ?? []).length).toBeGreaterThan(0);
+    // The panel stays on screen here: it is the element the view transition morphs
+    // FROM, and in the app it is the route change that removes this whole surface.
+    expect(container.querySelector('[data-od-id="fchat-panel"]')).not.toBeNull();
     act(() => root.unmount());
   });
 

@@ -26,10 +26,12 @@
 
 import { Box, Popover, SxProps, Theme } from "@mui/material";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 import type { PointerEvent as ReactPointerEvent } from "react";
 
 import {
   addApproval,
+  adoptsRestoredThread,
   applyAgentEvent,
   historyToMsgs,
   newAgentMsg,
@@ -61,6 +63,9 @@ import { useI18n } from "@/lib/i18n";
 import { HitlDock, type ApprovalDecision } from "./HitlDock";
 import { CopyBtn, ParamsPanel, SampleParams } from "./Playground";
 import { AgentThread } from "./AgentThread";
+import { subscribeAgentHandoff, takeAgentHandoff } from "./agentHandoff";
+import { setPaneObject } from "./paneObject";
+import { AGENT_CHAT_TRANSITION, withViewTransition } from "./viewTransition";
 import { Btn, Card, CpTextArea, Icons, Pill, monoSx, useToast } from "./ui";
 
 // The agent's identity colour is the violet globals.css derives from --accent,
@@ -250,6 +255,18 @@ export function ChatPane() {
   // mint a NEW session and quietly leave the user with two conversations again.
   const [agentSessionKey, setAgentSessionKey] = useState<string | null>(SESSION_KEY);
   const [agentNotice, setAgentNotice] = useState("");
+  /** Set when the floating surface handed its thread over (its ⤢ opens this
+   *  pane); drives the chip that says where this conversation came from. */
+  const [handedOver, setHandedOver] = useState(false);
+  /** Whether what is on screen was seeded by a handoff, so the restore below
+   *  does not greet over it. Read and cleared by restoreAgentSession. */
+  const seededRef = useRef(false);
+  /** The thread that handoff carried, kept for this effect's own second run. The
+   *  offer is consumed on the first, and React's development double-invoke would
+   *  otherwise leave the pane seeded but never reconciled with the runtime: the
+   *  first run's restore is spent by the cleanup's generation bump, and the second
+   *  finds the offer gone. */
+  const handoffSeedRef = useRef<ThreadMsg[] | null>(null);
   /** A turn is running for this session with no stream of this pane's own — one
    *  another tab started, or one that outlived a reload. The card header says
    *  so and the composer's Stop is the control that ends it. */
@@ -489,11 +506,18 @@ export function ChatPane() {
     }
   }
 
-  function selectAgent(): void {
+  function selectAgent(seed?: ThreadMsg[]): void {
     cancelInflight();
     setObjKind("agent");
     setSvcId(null);
-    setMsgs([]);
+    // A handed-over thread is what the other surface was showing a moment ago, so
+    // it is painted as-is; the restore below then reconciles it with the runtime's
+    // copy, which is the same conversation one read behind at worst. Without it,
+    // an expansion draws a greeting or an empty thread until that read lands,
+    // which reads as "my conversation is gone" rather than "it got bigger".
+    seededRef.current = seed !== undefined;
+    setMsgs(seed ?? []);
+    if (seed !== undefined) setHandedOver(true);
     // The key is NOT cleared. It is a literal, not a session this pane has to
     // discover, and the composer is live from the line above while the restore
     // below is asynchronous: a send in that window captured null, went out
@@ -511,6 +535,54 @@ export function ChatPane() {
       }
     })();
   }
+
+  // The shell reads this to decide whether its floating assistant would be a
+  // second copy of what is on screen: it would while the AGENT is selected, and it
+  // would not while a MODEL is, so the selection has to leave the pane.
+  useEffect(() => {
+    setPaneObject(objKind);
+    return () => setPaneObject(null);
+  }, [objKind]);
+
+  /** Switch what the pane shows as ONE view transition, so whichever surface sits
+   *  on the other side of the switch morphs with it: selecting the assistant pulls
+   *  the floating launcher into this thread, and selecting a model sends the thread
+   *  back into the corner. It is the same pair of elements the route change morphs,
+   *  for the same reason — the two are one conversation, and one of them is about to
+   *  become the other.
+   *
+   *  The commit has to happen inside the transition's callback, which is what
+   *  flushSync is for; the launcher appears or disappears one effect later (the
+   *  shell reads the selection from the store), so the arrival probe is what waits
+   *  for that half. */
+  function switchObject(select: () => void, arrived: () => boolean): void {
+    withViewTransition(() => flushSync(select), arrived);
+  }
+
+  /** The floating surface's ⤢ hands its thread over and sends the reader here.
+   *  This pane is normally already mounted when that happens — the module's tabs
+   *  keep their panes alive — so it subscribes rather than reading at mount, and
+   *  goes through a ref because the subscription is installed once while
+   *  selectAgent closes over this render's state. */
+  const selectAgentLatestRef = useRef(selectAgent);
+  useEffect(() => {
+    selectAgentLatestRef.current = selectAgent;
+  });
+  useEffect(
+    () =>
+      subscribeAgentHandoff(() => {
+        const handed = takeAgentHandoff();
+        if (handed) selectAgentLatestRef.current(handed);
+      }),
+    [],
+  );
+  // The chip that says where this thread came from. It withdraws on its own: it
+  // explains an arrival, and an explanation that stays is chrome.
+  useEffect(() => {
+    if (!handedOver) return;
+    const timer = setTimeout(() => setHandedOver(false), 4500);
+    return () => clearTimeout(timer);
+  }, [handedOver]);
 
   /**
    * Restore this user's conversation after a (re)select: history, an in-flight
@@ -531,8 +603,11 @@ export function ChatPane() {
     if (genRef.current !== gen) return;
     // Nothing under this key yet: a conversation has not started, so greet. An
     // empty thread with no prompt is the one thing a first-time visitor must not
-    // see — it reads as a chat that lost its contents.
-    if (!hadHistory) setMsgs(greetingMsgs(meta.status, meta.config, meta.skills));
+    // see — it reads as a chat that lost its contents. A handed-over thread is
+    // the exception: it IS the conversation, and the read behind it may simply
+    // not have caught up yet.
+    if (!hadHistory && !seededRef.current) setMsgs(greetingMsgs(meta.status, meta.config, meta.skills));
+    seededRef.current = false;
     const running = await checkTurnElsewhere(key, gen);
     if (genRef.current !== gen) return;
     if (running) {
@@ -613,7 +688,14 @@ export function ChatPane() {
       // ENDS, and there the view already holds that turn's output and its cards.
       // Empty then means the runtime has not written it yet, or is a read that
       // raced the writer; adopting it deletes the turn in exchange for nothing.
-      if (restored.length > 0) setMsgs(restored);
+      //
+      // A handed-over thread is the same argument with more force: it is what the
+      // other surface was showing, so it can be AHEAD of the runtime — a turn
+      // still streaming, or a just-finished one the writer has not caught up
+      // with. This is that thread's only read (the follow loop's later ones see
+      // the seed consumed and adopt as usual), and replacing it here would drop
+      // the very thing the reader carried across.
+      if (adoptsRestoredThread(restored, seededRef.current)) setMsgs(restored);
       return restored.length > 0;
     } catch {
       if (genRef.current === gen) setAgentNotice(t("cubepilot.chat.historyUnavailable"));
@@ -860,7 +942,20 @@ export function ChatPane() {
     // The page opens on the assistant. It is the one object here that is not a
     // model, and it is the one this page's own entry is about; a model can be
     // picked from the list below it.
-    selectAgent();
+    //
+    // …unless the floating surface handed this conversation over, which is the
+    // same assistant with the thread the reader was already looking at: an offer
+    // made before this pane existed — expanding from another page IS that case —
+    // is still pending, and this is where it is claimed.
+    const handed = takeAgentHandoff();
+    if (handed) handoffSeedRef.current = handed;
+    const seed = handed ?? handoffSeedRef.current;
+    if (seed) selectAgent(seed);
+    else if (!seededRef.current) selectAgent();
+    // `handoffSeedRef` is what makes the second run carry the same thread: without
+    // it, that run would take nothing (the offer is one-shot) and either re-select
+    // plainly — wiping what the first run painted — or, with the guard alone, skip
+    // the restore entirely and leave the pane unreconciled.
     // The policy that decides whether a durable approval is on offer: read once,
     // like the rest of the instance meta.
     void loadConfirmPolicy();
@@ -1493,7 +1588,7 @@ export function ChatPane() {
           <Box
             component="button"
             type="button"
-            onClick={selectAgent}
+            onClick={() => switchObject(() => selectAgent(), () => !document.querySelector('[data-od-id="fchat-fab"]'))}
             aria-pressed={isAgent}
             data-od-id="obj-cubepilot"
             sx={{
@@ -1545,7 +1640,7 @@ export function ChatPane() {
                 key={m.id}
                 component="button"
                 type="button"
-                onClick={() => selectModel(m.id)}
+                onClick={() => switchObject(() => selectModel(m.id), () => !!document.querySelector('[data-od-id="fchat-fab"]'))}
                 aria-pressed={active}
                 title={m.id}
                 data-od-id={`obj-${m.id}`}
@@ -1787,6 +1882,11 @@ export function ChatPane() {
             data-od-id="chat-thread"
             aria-live="polite"
             sx={{
+              // The far end of the floating panel's morph, and only for the agent:
+              // this is the same conversation that panel shows, so the widget can
+              // be seen growing into it (and collapsing back out of it). The model
+              // playground below is a different surface and stays unnamed.
+              ...(isAgent ? { viewTransitionName: AGENT_CHAT_TRANSITION } : {}),
               // 480px basis keeps the thread sized when the card has no
               // definite height (narrow layout); otherwise it flex-fills and
               // scrolls inside its own scrollbar.
@@ -1802,6 +1902,23 @@ export function ChatPane() {
           >
             {agentNotice ? (
               <Box sx={{ ...botMsgSx, fontSize: 12.5, color: "text.secondary", borderStyle: "dashed" }}>{agentNotice}</Box>
+            ) : null}
+            {handedOver ? (
+              <Box
+                data-od-id="handoff-chip"
+                sx={{
+                  alignSelf: "flex-start",
+                  px: "10px",
+                  py: "3px",
+                  borderRadius: "999px",
+                  fontSize: 12,
+                  color: "var(--accent-strong)",
+                  bgcolor: "color-mix(in oklch, var(--accent) 10%, transparent)",
+                  border: "1px solid color-mix(in oklch, var(--accent) 28%, transparent)",
+                }}
+              >
+                {t("cubepilot.chat.handedOver")}
+              </Box>
             ) : null}
             {/* The agent's side of the thread is AgentThread's to draw: its
                 bubbles, its text, its tool cards and the cards it settled. The
