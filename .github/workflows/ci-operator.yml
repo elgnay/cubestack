@@ -95,12 +95,16 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Reclaim disk space
+        uses: ./.github/actions/reclaim-disk
       - name: Build and smoke the DevEnvironment base images
-        # Both images are built for linux/amd64 and started as throwaway containers on
-        # 127.0.0.1, so this needs neither a cluster nor registry credentials. Both
-        # families are built: the e2e exercises jupyter-minimal alone and leaves
-        # ssh-ubuntu22.04 neither built nor pulled (operator/Makefile), so this is the
-        # only job that covers it.
+        # Every image is built for linux/amd64 and started as a throwaway container on
+        # 127.0.0.1, so this needs neither a cluster nor registry credentials. The e2e
+        # exercises jupyter-minimal alone and leaves the rest neither built nor pulled
+        # (operator/Makefile), so this is the only job that covers them.
+        #
+        # The reclaim above is what makes it fit: the MACA pair is ~33 GB unpacked,
+        # against the ~31 GB a standard runner has free on /.
         run: make -C images smoke
 
   test-e2e:

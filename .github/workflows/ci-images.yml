@@ -51,6 +51,31 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+      - name: Reclaim disk space
+        uses: ./.github/actions/reclaim-disk
+      - name: Smoke the images before publishing them
+        # The contract the e2e asserts through the Gateway, against a build of this
+        # commit's source. ci-operator.yml runs the same target, but on this push
+        # rather than before it, and a merge should not publish an image that fails
+        # the assertions the platform depends on.
+        #
+        # Before `Set up Buildx`, not after: `docker build` then uses the engine's
+        # own builder, which holds the images where `docker run` finds them — one
+        # copy of the MACA images' 33 GB base. Against the container builder that
+        # step installs, the same build would hold a second copy in the builder's
+        # cache, and two do not fit on a runner. Nothing here needs buildx, QEMU or
+        # a Harbor login: every base is pulled anonymously and every container is a
+        # throwaway on 127.0.0.1.
+        run: make -C images smoke
+      - name: Drop what the smoke built
+        # The push below builds all four images again, in the buildx builder, whose
+        # store is its own — so what the smoke loaded into the engine is 33 GB that
+        # nothing downstream reads. Dropping it here is the difference between one
+        # copy of the MACA base on this runner and two.
+        run: |
+          docker image prune -af
+          docker builder prune -af
+          df -h /
       - name: Set up QEMU
         # PLATFORMS is linux/amd64 plus linux/arm64, so one of the two is not the
         # runner's own architecture and has to be emulated for the build to finish.
@@ -64,12 +89,6 @@ jobs:
           registry: harbor.isuanova.com
           username: ${{ vars.CI_BOT_NAME }}
           password: ${{ secrets.CI_BOT_PASSWORD }}
-      - name: Smoke the images before publishing them
-        # The contract the e2e asserts through the Gateway, against a build of this
-        # commit's source. ci-operator.yml runs the same target, but on this push
-        # rather than before it, and a merge should not publish an image that fails
-        # the assertions the platform depends on.
-        run: make -C images smoke
       - name: Build and push the images
         run: |
           set -euo pipefail
