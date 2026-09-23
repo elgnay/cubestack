@@ -71,6 +71,12 @@ explicitly for `jupyter-minimal`: no other spec field implies the stock `gid 100
 1000. A bring-your-own image whose home is somewhere else pins it with `spec.storage.mountPath`, which
 always wins.
 
+A **root** environment (`spec.runtime.securityContext.runAsUser: 0`) is the case this table does not
+cover, since the identity comes from the security context rather than from `runtime.user`: the derived
+mount is `/root`, which is the home three of the four images serve as they stand. `jupyter-minimal` is
+the exception — its launcher relocates root's home to `/home/root` and overrides any `HOME` — so an
+environment there states the mount itself (see Runtime behavior above).
+
 A GPU image additionally has to be requested as one: the brand gate runs only when an environment asks
 for a vendor, and it requires the image's name to carry that vendor's token (`cuda` for `nvidia`,
 `maca` for `metax`) — both MACA image names do, so `spec.resources.gpu.vendor: metax` is what makes
@@ -106,7 +112,13 @@ for the GPU.
   handed more than those two: the controller adds `NB_USER`, `NB_UID`, `NB_GID` and, into the same
   `NOTEBOOK_ARGS`, `--allow-root` (`::withRootLauncherEnv`). A launcher that reads none of the trio may
   ignore it — the MACA one expands `NOTEBOOK_ARGS` and nothing else — but a Jupyter launcher that
-  ignores `--allow-root` will not start as root at all.
+  ignores `--allow-root` will not start as root at all. The **home** a root environment runs with is a
+  launcher decision as well, and the two jupyter images reach it differently: `jupyter-minimal` keeps
+  docker-stacks' `start.sh`, which relocates root's home to `/home/root` for a root container whatever
+  the environment declares, while `start-jupyter.sh` serves root's own `/root` — the home the controller
+  derives for `runAsUser: 0` — and leaves a declared `HOME` standing. So a root environment on
+  `jupyter-minimal` states `HOME=/home/root` for its workspace to be mounted where its notebooks land,
+  and on the other three images it states nothing.
 
 ## ssh Secret mount contract
 
@@ -246,7 +258,9 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
   `/opt/maca` is **readable by uid 1000**. That last one is checkable without a GPU and is the risk
   that would otherwise surface only on a node: the base was built as root, and a library the account
   cannot read fails at runtime with no build-time signal. Whether the *driver* works on a Metax node
-  is not covered here.
+  is not covered here. Root mode adds one check that is this image's own work and not docker-stacks':
+  a root run serves `/root` — the home the platform derives, and so where the claim is mounted —
+  rather than the `/home/ubuntu` the image bakes, and a declared `HOME` is served unchanged.
 - **ssh-maca-pytorch** — the same ssh assertions at the same identity and the same vendor-stack
   check, plus the two properties that make it a separate image rather than a copy: **no JupyterLab
   exists in it** (the guard against its sibling's pip step being copied across, which would silently

@@ -12,7 +12,11 @@
 #   jupyter-maca-pytorch: platform layer on the Metax MACA base (user 'ubuntu', uid/gid
 #                         1000, /home/ubuntu) — the same two services and the same
 #                         assertions as jupyter-minimal, plus that the vendor stack
-#                         under /opt/maca is readable by the account that runs it
+#                         under /opt/maca is readable by the account that runs it, and
+#                         that a root run serves the home the platform derives (/root,
+#                         or the one the spec declares) rather than the account home
+#                         this image bakes — the stock CPU launcher relocates root's
+#                         home for its own image, so this one has to decide it itself
 #   ssh-maca-pytorch    : the same vendor base and platform layer with no JupyterLab at
 #                         all — sshd alone, as CUBESTACK_IMAGE=ssh bakes in. Asserted
 #                         apart from its jupyter sibling precisely on that difference, and
@@ -352,6 +356,50 @@ check_maca_readable() {
   fi
 }
 
+# check_jupyter_home <image> <home> <label> [extra run args...]
+#
+# The home a jupyter container actually runs with, which is the launcher's to decide as much as
+# the image's: jupyter writes its runtime directory *under $HOME* and nothing else on the image
+# chooses that path, so the directory appearing there is the observable, and its absence is a
+# failure rather than a slow start. The run reproduces the shape the operator creates — a writable
+# directory where the workspace claim goes, which is a tmpfs here so that a container running as
+# root writes nothing on the host:
+#
+#   - with no HOME in the environment, the image's baked value is still in place — the underived
+#     case, where the platform mounts the claim at the home the *identity* implies;
+#   - with HOME passed, that is what the claim was mounted at, and the launcher must not override
+#     it — a home the spec declared is a statement about where the container will look.
+#
+# uid 0 throughout, since this is the root branch's check, and no Secret is mounted, so sshd never
+# starts and the run is the launcher alone.
+check_jupyter_home() {
+  local img=$1 home=$2 label=$3 found=""
+  shift 3
+  # Named under root_cont like the other root-mode containers, so the EXIT trap owns it too.
+  root_cont="cs-smoke-maca-home-$$"
+  "$CONTAINER_TOOL" run -d --name "$root_cont" \
+    --user 0:0 \
+    -e JUPYTER_TOKEN=testtoken \
+    -e NOTEBOOK_ARGS="--allow-root" \
+    --tmpfs "$home" \
+    "$@" \
+    "$img" >/dev/null
+  for _ in $(seq 1 120); do
+    found="$("$CONTAINER_TOOL" exec "$root_cont" \
+      sh -c "test -d '$home/.local/share/jupyter/runtime' && echo yes" 2>/dev/null || true)"
+    if [ -n "$found" ]; then break; fi
+    sleep 1
+  done
+  if [ -n "$found" ]; then
+    ok "$label"
+  else
+    bad "$label (no jupyter runtime directory under $home)"
+    "$CONTAINER_TOOL" logs "$root_cont" 2>&1 | tail -n 20
+  fi
+  "$CONTAINER_TOOL" rm -f "$root_cont" >/dev/null 2>&1 || true
+  root_cont=""
+}
+
 # ---------------------------------------------------------------------------
 # ssh-ubuntu22.04
 # ---------------------------------------------------------------------------
@@ -640,6 +688,17 @@ if [ "$run_maca" = 1 ]; then
   check_root_ssh "$IMG_MACA" "$tmp/macaroot" "cs-smoke-macaroot-$$" \
     "jupyter-maca-pytorch as root" \
     -e NOTEBOOK_ARGS="--allow-root"
+
+  # Where a root environment's workspace is. This image bakes the uid-1000 account's home, so the
+  # launcher has to decide this itself: a root container's own home is /root, the one the platform
+  # derives for runAsUser: 0 and mounts the claim at. Both halves are asserted — the derived home,
+  # and the declared one the launcher must leave standing, since that is where the claim really is
+  # when a spec names it.
+  check_jupyter_home "$IMG_MACA" /root \
+    "maca as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_MACA" /workspace/home \
+    "maca as root: a declared HOME is served instead" \
+    -e HOME=/workspace/home
 fi
 
 # ---------------------------------------------------------------------------
