@@ -55,9 +55,19 @@ import (
 )
 
 const (
-	testDevImage          = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
-	testMismatchImage     = "harbor.local/ai-images/base-maca:1.0"
-	testCPUImage          = "harbor.local/ai-images/ssh-ubuntu22.04:latest"
+	testDevImage      = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
+	testBaseMacaImage = "harbor.local/ai-images/base-maca:1.0"
+	testCPUImage      = "harbor.local/ai-images/ssh-ubuntu22.04:latest"
+	// testMetaxImage is the mirror of the upstream Metax package: the metax token
+	// is `maca` in the package's own name, whatever registry path fronts it.
+	testMetaxImage = "harbor.isuanova.com/mirrors/cr.metax-tech.com/public-library/maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64"
+	// testBareMacaImage is the same rule against an unqualified reference.
+	testBareMacaImage = "maca:3.9.0.12-ubuntu22.04-amd64"
+	// testMacaInPathImage spells "maca" in a path segment rather than in the
+	// repository name — which the rule accepts, since it reads the whole
+	// reference. Kept to pin that: the gate answers "does the name say its
+	// vendor", not "is this a real platform image".
+	testMacaInPathImage   = "harbor.local/maca-images/ssh-ubuntu22.04:latest"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
 	// testGatewayDataplaneNamespace is where the test Gateway's proxy pods run.
@@ -1080,26 +1090,166 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				}
 			},
 			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(1), true),
-			Entry("nvidia with a base-maca image mismatches", testMismatchImage, nvidiaGPU(1), false),
+			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(1), false),
 			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(1), false),
+			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(1), true),
+			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(1), true),
+			Entry("metax with an uppercase reference matches", strings.ToUpper(testMetaxImage), metaxGPU(1), true),
+			// The rule reads the whole reference, so a path segment alone can
+			// satisfy it. That is the price of one rule for both vendors: the
+			// gate asks whether the name states its vendor, not whether the
+			// reference points at a real platform image.
+			Entry("metax with maca only in the path matches", testMacaInPathImage, metaxGPU(1), true),
+			// base-maca spells the metax token, so it satisfies the rule on its
+			// own terms — the token is what is checked, not the product name the
+			// platform happens to publish under.
+			Entry("metax with a base-maca image matches", testBaseMacaImage, metaxGPU(1), true),
 			// No accelerator ⇒ nothing to match, whatever the image. The block's
 			// absence is the only spelling of this, so there is no count to zero out
 			// and no vendor left over to contradict it.
 			Entry("an absent block exempts a non-brand image", testCPUImage, nil, true),
-			Entry("an absent block exempts a mismatched image", testMismatchImage, nil, true),
-			// The vendor is resolved before the comparison, so a value the API can
-			// never store still lands on a brand rather than falling out of the
-			// switch and disabling the gate — the old two-field shape's failure mode.
+			Entry("an absent block exempts a mismatched image", testBaseMacaImage, nil, true),
+			// desiredGPU resolves the vendor before the comparison, and it
+			// recognises metax as the only alternative to its nvidia default — so
+			// a value the API can never store lands on the nvidia rule rather
+			// than falling out of the switch and disabling the gate. The first
+			// entry holds because base-maca carries the metax token, which the
+			// nvidia rule does not accept; the second pins the resolution itself,
+			// since that image satisfies the metax rule but not this one.
 			Entry("an unrecognised vendor is still gated",
-				testMismatchImage, &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendor("amd"), Count: ptrTo(int32(1))}, false),
+				testBaseMacaImage, &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendor("amd"), Count: ptrTo(int32(1))}, false),
+			Entry("an unrecognised vendor follows the nvidia rule",
+				testDevImage, &aiv1alpha1.GPUSpec{Vendor: aiv1alpha1.AcceleratorVendor("amd"), Count: ptrTo(int32(1))}, true),
 		)
 
 		It("names the CPU-only escape in the mismatch message", func() {
 			env := &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
-				Image:     testMismatchImage,
+				Image:     testBaseMacaImage,
 				Resources: aiv1alpha1.ResourcesSpec{GPU: nvidiaGPU(1)},
 			}}
 			Expect(brandMismatchReason(env)).To(ContainSubstring("omit spec.resources.gpu"))
+		})
+	})
+
+	Describe("specFindings", func() {
+		// The smallest environment these checks are about: a jupyter environment
+		// with no gpu block, so the brand gate stays out of every case that is not
+		// about it.
+		newJupyter := func() *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Type: aiv1alpha1.DevEnvironmentTypeJupyter, Image: testDevImage,
+			}}
+		}
+		// root resolves the security context the launcher checks read, without
+		// touching any runtime env the case declares.
+		root := func(env *aiv1alpha1.DevEnvironment) *aiv1alpha1.DevEnvironment {
+			if env.Spec.Runtime == nil {
+				env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{}
+			}
+			env.Spec.Runtime.SecurityContext = &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))}
+			return env
+		}
+		declaring := func(env *aiv1alpha1.DevEnvironment, vars ...corev1.EnvVar) *aiv1alpha1.DevEnvironment {
+			if env.Spec.Runtime == nil {
+				env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{}
+			}
+			env.Spec.Runtime.Env = append(env.Spec.Runtime.Env, vars...)
+			return env
+		}
+		// A mismatch needs a gpu block and an image that does not name its vendor.
+		mismatched := func() *aiv1alpha1.DevEnvironment {
+			env := newJupyter()
+			env.Spec.Image = testBaseMacaImage
+			env.Spec.Resources.GPU = nvidiaGPU(1)
+			return env
+		}
+		// unreadable NOTEBOOK_ARGS: the one refusal that is not about the brand.
+		fromValueFrom := func() *aiv1alpha1.DevEnvironment {
+			return declaring(newJupyter(), corev1.EnvVar{
+				Name: notebookArgsEnv,
+				ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "notebook-args"}, Key: "args",
+				}},
+			})
+		}
+
+		// Each entry states the disposition it expects, not just that something was
+		// reported: the whole point of the condition is which of the two a value
+		// gets, so a check that quietly refused a value the render path resolves
+		// would pass a message-only assertion.
+		DescribeTable("classifies every value the controller resolves",
+			func(env *aiv1alpha1.DevEnvironment, wantBlocking int, want []string) {
+				found := specFindings(env)
+				Expect(mustUpdateFindings(found)).To(HaveLen(wantBlocking))
+				message := findingsMessage(found)
+				for _, clause := range want {
+					Expect(message).To(ContainSubstring(clause))
+				}
+			},
+			Entry("a brand mismatch must be updated",
+				mismatched(), 1, []string{`spec.resources.gpu.vendor: must be updated — image "` + testBaseMacaImage}),
+			Entry("an unreadable NOTEBOOK_ARGS must be updated",
+				fromValueFrom(), 1, []string{"spec.runtime.env[NOTEBOOK_ARGS]: must be updated"}),
+			Entry("a declared launcher account is ignored when the environment is root",
+				declaring(root(newJupyter()), corev1.EnvVar{Name: nbGIDEnv, Value: "1000"}), 0,
+				[]string{"spec.runtime.env[NB_GID]: ignored — "}),
+			Entry("a declared JUPYTER_TOKEN is ignored",
+				declaring(newJupyter(), corev1.EnvVar{Name: jupyterTokenEnv, Value: "chosen"}), 0,
+				[]string{"spec.runtime.env[JUPYTER_TOKEN]: ignored — "}),
+			Entry("a declared base_url is ignored",
+				declaring(newJupyter(), corev1.EnvVar{Name: notebookArgsEnv, Value: "--ServerApp.allow_origin=* " + notebookBaseURLFlag + "/served/elsewhere/"}), 0,
+				[]string{"spec.runtime.env[NOTEBOOK_ARGS]: ignored — " + notebookBaseURLFlag + "/served/elsewhere/ is replaced by " + notebookBaseURLFlag}),
+			Entry("a declared runtime account is ignored when the environment is root",
+				root(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeJupyter, Image: testDevImage,
+					Runtime: &aiv1alpha1.RuntimeSpec{User: "jovyan"},
+				}}), 0, []string{"spec.runtime.user: ignored — "}),
+			// Both dispositions in one spec: the refusal is what the phase follows,
+			// and the resolved value is reported beside it rather than instead of it.
+			Entry("reports a refusal and a resolved value together",
+				declaring(root(mismatched()), corev1.EnvVar{Name: nbUIDEnv, Value: "1000"}), 1,
+				[]string{
+					"spec.resources.gpu.vendor: must be updated — ",
+					"spec.runtime.env[NB_UID]: ignored — ",
+				}),
+		)
+
+		It("fails the environment on the brand mismatch before any other refusal", func() {
+			env := fromValueFrom()
+			env.Spec.Image = testBaseMacaImage
+			env.Spec.Resources.GPU = nvidiaGPU(1)
+			// The phase and the Accepted reason come from the first must-update
+			// finding, so which one leads is part of the contract.
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(2))
+			Expect(blocking[0].reason).To(Equal(reasonBrandMismatch))
+			Expect(blocking[1].reason).To(Equal(reasonNotebookArgsUnusable))
+		})
+
+		It("reports nothing for a spec the controller applies as written", func() {
+			Expect(specFindings(newJupyter())).To(BeEmpty())
+			// And nothing for a value the render path does not resolve either: a
+			// non-root environment keeps the account it declares.
+			Expect(specFindings(declaring(newJupyter(), corev1.EnvVar{Name: nbGIDEnv, Value: "1000"}))).To(BeEmpty())
+		})
+
+		It("reports nothing for the values an ssh environment's image never reads", func() {
+			env := newJupyter()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			declaring(root(env),
+				corev1.EnvVar{Name: nbGIDEnv, Value: "1000"},
+				corev1.EnvVar{Name: jupyterTokenEnv, Value: "chosen"},
+				corev1.EnvVar{Name: notebookArgsEnv, Value: notebookBaseURLFlag + "/served/elsewhere/"},
+			)
+			Expect(specFindings(env)).To(BeEmpty())
+		})
+
+		It("keeps every other NOTEBOOK_ARGS flag out of the message", func() {
+			message := findingsMessage(specFindings(declaring(newJupyter(), corev1.EnvVar{
+				Name: notebookArgsEnv, Value: "--ServerApp.allow_origin=* " + notebookBaseURLFlag + "/served/elsewhere/ --debug",
+			})))
+			Expect(message).NotTo(ContainSubstring("allow_origin"))
+			Expect(message).NotTo(ContainSubstring("--debug"))
 		})
 	})
 
@@ -1434,6 +1584,16 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			return (&DevEnvironmentReconciler{}).desiredPodSpec(env)
 		}
 
+		// An unset profile is Unconfined on Kubernetes, which the Restricted Pod
+		// Security Standard refuses outright: without this, no environment could
+		// run in a restricted namespace, storage or not. Pod-level rather than
+		// per-container, so the workspace-ownership init container inherits it.
+		It("applies the runtime default seccomp profile to the pod", func() {
+			Expect(render(nil).SecurityContext).To(Equal(&corev1.PodSecurityContext{
+				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+			}))
+		})
+
 		// Host networking is the difference between the two fabrics, not an
 		// independent switch: a RoCE device derives its GID table from the
 		// addresses of the interfaces in the pod's network namespace, and a
@@ -1544,12 +1704,13 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 
 		// The environment's own storage is initialized by an init container, so
 		// the pod carries no fsGroup: an fsGroup is Pod-scoped and would chown
-		// every read-write volume in the pod, including a referenced PVC.
+		// every read-write volume in the pod, including a referenced PVC. (What
+		// else the pod-level context holds is the seccomp spec's business.)
 		It("initializes the workspace claim from an init container, without an fsGroup", func() {
 			spec := render(func(env *aiv1alpha1.DevEnvironment) {
 				env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "10Gi"}
 			})
-			Expect(spec.SecurityContext).To(BeNil())
+			Expect(spec.SecurityContext.FSGroup).To(BeNil())
 			Expect(spec.InitContainers).To(HaveLen(1))
 			Expect(spec.InitContainers[0].Name).To(Equal(permissionInitContainerName))
 			Expect(spec.InitContainers[0].Image).To(Equal(permissionInitImage))
@@ -1849,6 +2010,106 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("leaves an environment that does not serve a notebook without NOTEBOOK_ARGS", func() {
 			spec := render(func(e *aiv1alpha1.DevEnvironment) { e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH })
 			Expect(spec.Containers[0].Env).NotTo(ContainElement(HaveField("Name", notebookArgsEnv)))
+		})
+
+		// A root environment has to be startable from spec.runtime.securityContext
+		// alone: the launcher reads the account it serves and the uid/gid to serve it
+		// as from the container's own environment, and exits outright without the root
+		// flag. The declared group is 2000 here, and NB_GID is still 0: these name the
+		// account in the image's passwd database, and docker-stacks rewrites the account
+		// when they disagree with the identity the pod runs as — a rewrite that cannot
+		// succeed for root, which is a container that exits before sshd is reachable
+		// (::withRootLauncherEnv).
+		It("injects the launcher environment a root jupyter environment needs", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{
+					RunAsUser: ptrTo(int64(0)), RunAsGroup: ptrTo(int64(2000)),
+				},
+			}
+			c := (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0]
+			Expect(c.Env).To(ContainElements(
+				corev1.EnvVar{Name: nbUserEnv, Value: "root"},
+				corev1.EnvVar{Name: nbUIDEnv, Value: "0"},
+				corev1.EnvVar{Name: nbGIDEnv, Value: "0"},
+			))
+			// Both flags in the one NOTEBOOK_ARGS the launcher reads.
+			Expect(c.Env).To(ContainElement(corev1.EnvVar{
+				Name:  notebookArgsEnv,
+				Value: notebookBaseURLFlag + webPath(env) + " " + notebookAllowRootFlag,
+			}))
+			// What the pod itself runs as is the spec's, and is unchanged by any of this.
+			Expect(c.SecurityContext.RunAsGroup).To(Equal(ptrTo(int64(2000))))
+		})
+
+		// The account and the flags follow from the security context, which is the
+		// controller's to resolve, so a declared value is dropped rather than merged —
+		// leaving both would put a contradiction in the container's environment
+		// (::withRootLauncherEnv).
+		It("replaces a launcher value the spec declares", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				Env: []corev1.EnvVar{
+					{Name: nbUserEnv, Value: "jovyan"},
+					{Name: nbUIDEnv, Value: "1000"},
+				},
+			}
+			rendered := []corev1.EnvVar{}
+			for _, v := range (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env {
+				switch v.Name {
+				case nbUserEnv, nbUIDEnv, nbGIDEnv:
+					rendered = append(rendered, v)
+				}
+			}
+			// The group is the platform's default here, and NB_GID is 0 all the same:
+			// the one configuration a pod group could have been derived into, and the
+			// one that does not start (::withRootLauncherEnv).
+			Expect(rendered).To(Equal([]corev1.EnvVar{
+				{Name: nbUserEnv, Value: "root"},
+				{Name: nbUIDEnv, Value: "0"},
+				{Name: nbGIDEnv, Value: "0"},
+			}))
+		})
+
+		It("keeps a --allow-root the environment declares instead of repeating it", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				Env: []corev1.EnvVar{
+					{Name: notebookArgsEnv, Value: notebookAllowRootFlag + " --ServerApp.allow_origin=*"},
+				},
+			}
+			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).To(ContainElement(corev1.EnvVar{
+				Name:  notebookArgsEnv,
+				Value: notebookAllowRootFlag + " --ServerApp.allow_origin=* " + notebookBaseURLFlag + webPath(env),
+			}))
+		})
+
+		// The common path: an environment that is not root runs the launcher's stock
+		// account, so none of this may reach it.
+		It("leaves a jupyter environment that does not run as root without the launcher environment", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+			c := (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0]
+			Expect(c.Env).NotTo(ContainElement(HaveField("Name", BeElementOf(nbUserEnv, nbUIDEnv, nbGIDEnv))))
+			Expect(c.Env).To(ContainElement(corev1.EnvVar{
+				Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env),
+			}))
+		})
+
+		// The other axis, with the uid that would otherwise qualify: it is the notebook
+		// launcher that reads any of this, and an ssh environment runs none.
+		It("injects nothing into a root ssh environment", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+			}
+			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).To(BeEmpty())
 		})
 	})
 
@@ -2364,11 +2625,17 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionBrandMatchValid)).To(BeTrue())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
 				g.Expect(got.Status.Phase.Reason).To(Equal(reasonBrandMismatch))
+				// The refusal has to say what the user can change: the condition is
+				// the only place the finding is reported.
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Reason).To(Equal(reasonBrandMismatch))
+				g.Expect(cond.Message).To(ContainSubstring("must be updated"))
 			}, "15s", "200ms").Should(Succeed())
 
 			sts := &appsv1.StatefulSet{}
@@ -2394,15 +2661,18 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
 				g.Expect(got.Status.Phase.Reason).To(Equal(reasonNotebookArgsUnusable))
-				// The message has to name the variable and the flag: it is the only
-				// place the user learns what to change.
-				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)
+				// This refusal used to be reported by Ready alone; the condition is
+				// what now carries it, and the message has to name the variable and
+				// the flag: it is the only place the user learns what to change.
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
 				g.Expect(cond).NotTo(BeNil())
-				g.Expect(cond.Message).To(ContainSubstring(notebookArgsEnv))
+				g.Expect(cond.Reason).To(Equal(reasonNotebookArgsUnusable))
+				g.Expect(cond.Message).To(ContainSubstring("runtime.env[" + notebookArgsEnv + "]: must be updated"))
 				g.Expect(cond.Message).To(ContainSubstring(notebookBaseURLFlag))
 				g.Expect(got.Status.Endpoints).To(BeEmpty())
 			}, "15s", "200ms").Should(Succeed())
@@ -2443,7 +2713,9 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionBrandMatchValid)).To(BeTrue())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(cond.Reason).To(Equal(reasonAccepted))
 			}, "15s", "200ms").Should(Succeed())
 
 			sts := &appsv1.StatefulSet{}
@@ -2462,10 +2734,12 @@ var _ = Describe("DevEnvironment controller", func() {
 			Eventually(func(g Gomega) {
 				got := &aiv1alpha1.DevEnvironment{}
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionBrandMatchValid)
+				// No gpu block is not a finding: there is no brand to disagree with,
+				// which is what this condition reports rather than the exemption.
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
-				g.Expect(cond.Reason).To(Equal(reasonNotApplicable))
+				g.Expect(cond.Reason).To(Equal(reasonAccepted))
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).NotTo(Equal(aiv1alpha1.PhaseFailed))
 			}, "15s", "200ms").Should(Succeed())
@@ -2478,6 +2752,44 @@ var _ = Describe("DevEnvironment controller", func() {
 			Expect(c.Resources.Requests).NotTo(HaveKey(corev1.ResourceName(testGPUResource)))
 			Expect(c.Resources.Limits).NotTo(HaveKey(corev1.ResourceName(testGPUResource)))
 			Expect(c.Resources.Limits).NotTo(HaveKey(corev1.ResourceName("metax-tech.com/gpu")))
+		})
+
+		// The other disposition, end to end: the controller resolves a declared value
+		// rather than refusing it, and the environment runs with the controller's
+		// value. The condition naming every field it replaced is the only place a
+		// user learns that what they wrote is not what is running.
+		It("accepts an environment whose declared values the controller resolves", func() {
+			env := validDevEnvironment("de-accepted-overridden")
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+				User:            "jovyan",
+				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				Env: []corev1.EnvVar{
+					{Name: nbGIDEnv, Value: "1000"},
+					{Name: jupyterTokenEnv, Value: "chosen-by-the-user"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(cond.Reason).To(Equal(reasonOverridden))
+				for _, field := range []string{nbGIDEnv, jupyterTokenEnv} {
+					g.Expect(cond.Message).To(ContainSubstring("spec.runtime.env[" + field + "]: ignored — "))
+				}
+				// The advertised account is the second half of running as root: this
+				// one is a field rather than an env entry, and is reported the same way.
+				g.Expect(cond.Message).To(ContainSubstring("spec.runtime.user: ignored — "))
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).NotTo(Equal(aiv1alpha1.PhaseFailed))
+			}, "15s", "200ms").Should(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
 		})
 
 		It("withdraws compute and routes when a running environment becomes mismatched", func() {
@@ -2640,35 +2952,40 @@ var _ = Describe("DevEnvironment controller", func() {
 		})
 
 		// StorageReady left the API with the workspace claim's lifecycle (the
-		// StatefulSet owns it now), so an environment created by the manager that
-		// still reported it would keep the condition on status forever, with
-		// nothing left that can clear it.
-		It("drops the legacy StorageReady condition", func() {
-			env := validDevEnvironment("de-legacy-condition")
-			Expect(k8sClient.Create(ctx, env)).To(Succeed())
-			defer deleteEnv(env.Name)
+		// StatefulSet owns it now), and BrandMatchValid left it when the brand gate
+		// was folded into Accepted. An environment reconciled by a manager that
+		// still reported either would keep the condition on status forever, with
+		// nothing left that can clear it, so each is dropped during reconcile.
+		DescribeTable("drops a condition the controller no longer reports",
+			func(name, condition string) {
+				env := validDevEnvironment(name)
+				Expect(k8sClient.Create(ctx, env)).To(Succeed())
+				defer deleteEnv(env.Name)
 
-			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
-			}, "15s", "200ms").Should(Succeed())
+				Eventually(func(g Gomega) {
+					got := &aiv1alpha1.DevEnvironment{}
+					g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+					g.Expect(got.Finalizers).To(ContainElement(devEnvFinalizer))
+				}, "15s", "200ms").Should(Succeed())
 
-			// Restore the condition an older manager wrote. The merge patch adds it
-			// by type without touching the conditions already on status.
-			legacy := []byte(`{"status":{"conditions":[{"type":"StorageReady","status":"True","reason":"Bound",` +
-				`"message":"The workspace PVC is bound","lastTransitionTime":"2026-01-01T00:00:00Z"}]}}`)
-			Expect(k8sClient.Status().Patch(ctx, env, client.RawPatch(types.MergePatchType, legacy))).To(Succeed())
+				// Restore the condition an older manager wrote. The merge patch adds it
+				// by type without touching the conditions already on status.
+				legacy := []byte(`{"status":{"conditions":[{"type":"` + condition + `","status":"True","reason":"Bound",` +
+					`"message":"left over from a manager that still reported it","lastTransitionTime":"2026-01-01T00:00:00Z"}]}}`)
+				Expect(k8sClient.Status().Patch(ctx, env, client.RawPatch(types.MergePatchType, legacy))).To(Succeed())
 
-			// The patch is itself a watched update, so it drives the reconcile that
-			// has to drop the condition again.
-			Eventually(func(g Gomega) {
-				got := &aiv1alpha1.DevEnvironment{}
-				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
-				g.Expect(meta.FindStatusCondition(got.Status.Conditions, legacyStorageReadyCondition)).To(BeNil())
-				g.Expect(meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)).NotTo(BeNil())
-			}, "15s", "200ms").Should(Succeed())
-		})
+				// The patch is itself a watched update, so it drives the reconcile that
+				// has to drop the condition again.
+				Eventually(func(g Gomega) {
+					got := &aiv1alpha1.DevEnvironment{}
+					g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+					g.Expect(meta.FindStatusCondition(got.Status.Conditions, condition)).To(BeNil())
+					g.Expect(meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)).NotTo(BeNil())
+				}, "15s", "200ms").Should(Succeed())
+			},
+			Entry("StorageReady", "de-legacy-storage", legacyStorageReadyCondition),
+			Entry("BrandMatchValid", "de-legacy-brand", legacyBrandMatchValidCondition),
+		)
 	})
 
 	Context("lifecycle events", func() {
@@ -2730,7 +3047,7 @@ var _ = Describe("DevEnvironment controller", func() {
 
 		It("records a Warning Failed event on a gpu vendor/image brand mismatch", func() {
 			env := validDevEnvironment("de-ev-fail")
-			env.Spec.Image = testMismatchImage
+			env.Spec.Image = testBaseMacaImage
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
 

@@ -282,6 +282,16 @@ type RuntimeSpec struct {
 	// (spec.storage.mountPath), since the workspace follows the account's home. A
 	// valueFrom HOME and a $(VAR) HOME do not: neither is resolvable when the
 	// workload is rendered.
+	//
+	// Some values are the controller's rather than the spec's on a jupyter
+	// environment, and an entry declaring one is dropped and replaced: JUPYTER_TOKEN;
+	// any --ServerApp.base_url inside NOTEBOOK_ARGS, which has to name the prefix
+	// the route publishes; and — when securityContext.runAsUser is 0 — the launcher
+	// settings a root container needs (NB_USER, NB_UID, NB_GID, and --allow-root
+	// inside NOTEBOOK_ARGS). A root environment therefore declares nothing for any
+	// of them. Each substitution is reported on the Accepted condition, which names
+	// the value the controller applied instead; the one entry it cannot substitute
+	// is a NOTEBOOK_ARGS fed by valueFrom, which refuses the environment instead.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
@@ -293,7 +303,8 @@ type RuntimeSpec struct {
 	// securityContext.runAsUser has to name that same account. An environment
 	// running as root is advertised as "root" whatever this field says: that is
 	// the account its sshd runs as, where which family account a root sshd admits
-	// beside it is the image's to decide.
+	// beside it is the image's to decide. Such an environment has its Accepted
+	// condition report this field as ignored.
 	// +kubebuilder:validation:MaxLength=32
 	// +kubebuilder:validation:Pattern=`^[a-z_][a-z0-9_-]*$`
 	// +optional
@@ -313,7 +324,9 @@ type RuntimeSpec struct {
 // controller also enforces the non-root default based on RunAsUser.
 type RuntimeSecurityContext struct {
 	// RunAsUser is the user ID to run the container as. Non-root by default;
-	// set 0 to run as root.
+	// set 0 to run as root. Running as root is the whole of the request: the
+	// controller supplies whatever the image needs to start as root, so nothing
+	// has to be declared for it in spec.runtime.env.
 	// +optional
 	RunAsUser *int64 `json:"runAsUser,omitempty"`
 
@@ -455,8 +468,8 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
-	// Conditions: PodScheduled / RouteReady / BrandMatchValid / Ready (type
-	// constants below).
+	// Conditions: Accepted / PodScheduled / RouteReady / Ready (type constants
+	// below).
 	// +listType=map
 	// +listMapKey=type
 	// +optional
