@@ -31,6 +31,13 @@ PLATFORMS ?= linux/amd64 linux/arm64
 # are separate flows and neither should quietly change the other's targets.
 PLATFORMS_ARG = $(foreach p,$(PLATFORMS),--platform $(p))
 
+# The MACA image is single-platform by construction, not by preference: its vendor base is
+# published per architecture (`-amd64` is part of the package tag, not a multi-arch index), so
+# there is no arm64 layer to build an arm64 manifest from and asking buildx for one could only
+# fail. It is therefore kept out of PLATFORMS and named here — publishing it is a one-platform
+# push, which buildx supports.
+MACA_PLATFORM ?= linux/amd64
+
 # Buildkit's provenance and SBOM attestations are off. Harbor rejects an index carrying
 # them with a 404 on the manifest PUT — "artifact ... not found" — even when every
 # manifest it references resolves on its own (seen 2026-09-21 publishing
@@ -57,11 +64,13 @@ PIP_INDEX_URL ?=
 # and in operator/Makefile's BASE_MIRRORS (the map the e2e's own builds and the mirror script
 # read — the two must name the same bases), then re-run the mirror script, which fails if a
 # mirrored tag no longer hashes to the digest it is listed under. Pass `BASE_ARGS=` to resolve
-# FROM upstream instead, unpinned. The jupyter date tracks the base in jupyter/Dockerfile; bump
-# both together.
+# FROM upstream instead, unpinned — which covers the CPU bases only: the MACA base has no upstream
+# a build here reaches, so a MACA build needs an explicit `--build-arg MACA_BASE=<ref>` in its
+# place. The jupyter date tracks the base in jupyter/Dockerfile; bump both together.
 BASE_ARGS ?= \
 	--build-arg JUPYTER_BASE=$(REGISTRY)/$(MIRROR_PROJECT)/quay.io/jupyter/minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810 \
-	--build-arg UBUNTU_BASE=$(UBUNTU_BASE)
+	--build-arg UBUNTU_BASE=$(UBUNTU_BASE) \
+	--build-arg MACA_BASE=$(MACA_BASE)
 
 # Base release of the self-authored ssh image. It selects the build base AND names the
 # published repository (decision doc §5), so the name cannot outlive the base. The release is
@@ -78,6 +87,15 @@ UBUNTU_BASE_DIGESTS = 22.04=sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71
 
 UBUNTU_BASE_DIGEST = $(patsubst $(UBUNTU_VERSION)=%,%,$(filter $(UBUNTU_VERSION)=%,$(UBUNTU_BASE_DIGESTS)))
 UBUNTU_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/docker.io/library/ubuntu:$(UBUNTU_VERSION)@$(UBUNTU_BASE_DIGEST)
+
+# The MACA base, pinned the same way and for the same reason: the mirrored tag is movable and
+# the package is rebuilt upstream, so the digest is what the build resolves. It differs from the
+# bases above in one respect — it is not under $(PROJECT). The Metax package was mirrored as it
+# stands, into MIRROR_PROJECT, so there is no suanova/ copy to name; the vendor package keeps
+# its upstream path and the platform owns only the host serving it. Spelled out rather than
+# derived from $(PROJECT) so that stays visible.
+MACA_PACKAGE = maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64
+MACA_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/cr.metax-tech.com/public-library/$(MACA_PACKAGE)@sha256:da5065e441290224914e5643f6cd39e46a927d58eb2d97c865263ddd87c37a49
 
 APT_MIRROR_ARG    = $(if $(APT_MIRROR),--build-arg APT_MIRROR=$(APT_MIRROR))
 PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL))
@@ -108,14 +126,44 @@ SSH_REPO     = $(REGISTRY)/$(PROJECT)/ssh-ubuntu$(UBUNTU_VERSION)
 # UBUNTU_VERSION it does not name the published repository, so the variant is a literal here and
 # the base stays pinned in jupyter/Dockerfile.
 JUPYTER_REPO = $(REGISTRY)/$(PROJECT)/jupyter-minimal
+# The repository is named for the vendor stack it carries, not for its base image: several MACA
+# packages (maca, maca-pytorch, maca-tensorflow) can share one overlay, and the base is the one
+# thing that moves between them — so the name stays and MACA_BASE is what changes.
+MACA_REPO    = $(REGISTRY)/$(PROJECT)/jupyter-maca-pytorch
+# The same vendor base and the same platform layer, split by mode: CUBESTACK_IMAGE is baked at
+# build time, so an ssh-type GPU environment needs its own image rather than a flag on this one.
+# Shares MACA_BASE and MACA_PLATFORM with MACA_REPO above — the pair moves together, since the
+# base is the one thing they have in common.
+SSH_MACA_REPO = $(REGISTRY)/$(PROJECT)/ssh-maca-pytorch
 
-IMG_SSH     ?= $(SSH_REPO):$(TAG)
-IMG_JUPYTER ?= $(JUPYTER_REPO):$(TAG)
+# The MACA pair's tag carries the vendor axes a user picks between (decision doc §5), not only the
+# commit: this is the one base the platform does not choose, and the vendor package version is the
+# compatibility contract of the whole stack, so a deployment naming it should say what it is. Read
+# out of MACA_PACKAGE rather than written twice, the way UBUNTU_VERSION is looked up in
+# UBUNTU_BASE_DIGESTS: 'maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64' becomes
+# '3.9.0.12-py310-torch2.4', so the tag cannot name a base the image was not built from. The
+# vendor's field order is its own — §5 puts the python axis first — and the distro/arch fields are
+# dropped: the vendor's Ubuntu release is not our pin, and the package is amd64-only, which
+# MACA_PLATFORM already states. The commit still ends the tag, so re-building this overlay on an
+# unchanged base moves the reference instead of redefining it.
+MACA_PKG_FIELDS  = $(subst -, ,$(lastword $(subst :, ,$(MACA_PACKAGE))))
+MACA_PKG_VERSION = $(word 1,$(MACA_PKG_FIELDS))
+MACA_PKG_PY      = $(filter py%,$(MACA_PKG_FIELDS))
+MACA_PKG_TORCH   = $(filter torch%,$(MACA_PKG_FIELDS))
+MACA_TAG_AXES    = $(MACA_PKG_VERSION)-$(MACA_PKG_PY)-$(MACA_PKG_TORCH)
+MACA_TAG        ?= $(MACA_TAG_AXES)-$(TAG)
+
+IMG_SSH      ?= $(SSH_REPO):$(TAG)
+IMG_JUPYTER  ?= $(JUPYTER_REPO):$(TAG)
+IMG_MACA     ?= $(MACA_REPO):$(MACA_TAG)
+IMG_SSH_MACA ?= $(SSH_MACA_REPO):$(MACA_TAG)
 
 # The moving publish tag: added by `make push`, never produced by `make build`, so a
 # local :latest means it came from a publish.
-LATEST_SSH     = $(SSH_REPO):latest
-LATEST_JUPYTER = $(JUPYTER_REPO):latest
+LATEST_SSH      = $(SSH_REPO):latest
+LATEST_JUPYTER  = $(JUPYTER_REPO):latest
+LATEST_MACA     = $(MACA_REPO):latest
+LATEST_SSH_MACA = $(SSH_MACA_REPO):latest
 
 # Whether `make push` also moves :latest. A caller that may not move it — CI, which
 # only moves :latest when the run's commit is still the head of main — passes
@@ -124,11 +172,13 @@ LATEST_JUPYTER = $(JUPYTER_REPO):latest
 # whole index a second time. See .github/workflows/ci-images.yml.
 PUSH_LATEST ?= 1
 
-LATEST_ARG_SSH     = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH))
-LATEST_ARG_JUPYTER = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_JUPYTER))
+LATEST_ARG_SSH      = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH))
+LATEST_ARG_JUPYTER  = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_JUPYTER))
+LATEST_ARG_MACA     = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MACA))
+LATEST_ARG_SSH_MACA = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH_MACA))
 
-.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base build build-ssh build-jupyter \
-	smoke smoke-ssh smoke-jupyter push push-ssh push-jupyter retag-latest
+.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base build build-ssh build-jupyter build-maca build-ssh-maca \
+	smoke smoke-ssh smoke-jupyter smoke-maca smoke-ssh-maca push push-ssh push-jupyter push-maca push-ssh-maca retag-latest
 
 .DEFAULT_GOAL := help
 
@@ -188,7 +238,17 @@ check-ubuntu-base:
 		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
 		exit 1; }
 
-build: build-ssh build-jupyter ## Build both images
+# MACA_TAG is read out of MACA_PACKAGE, so a vendor package whose tag carries only one of the two
+# axes would publish a name with an empty field — '4.0--torch2.5-<sha>' — claiming less than the
+# image is (and a vendor rename is the one thing a base bump can bring). Stop instead of publishing
+# it; the fix is the derivation above.
+check-maca-base:
+	@test -n "$(MACA_PKG_VERSION)" && test -n "$(MACA_PKG_PY)" && test -n "$(MACA_PKG_TORCH)" || { \
+		echo "make -C images: cannot read the vendor axes out of MACA_PACKAGE=$(MACA_PACKAGE)." >&2; \
+		echo "                Expected <version>-torch<ver>-py<python>-<distro>-<arch>." >&2; \
+		exit 1; }
+
+build: build-ssh build-jupyter build-maca build-ssh-maca ## Build every image
 
 build-ssh: check-tag check-platform check-ubuntu-base ## Build the self-authored ssh image
 	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
@@ -198,16 +258,33 @@ build-jupyter: check-tag check-platform ## Build the jupyter image
 	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f jupyter/Dockerfile -t $(IMG_JUPYTER) .
 
+# MACA_PLATFORM, not PLATFORM: the MACA images have no arm64 base to build from, so they stay
+# amd64 on every host rather than following the platform the other two build for.
+build-maca: check-tag check-maca-base ## Build the metax MACA image (linux/amd64 only)
+	$(CONTAINER_TOOL) build --platform "$(MACA_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
+		-f jupyter-maca-pytorch/Dockerfile -t $(IMG_MACA) .
+
+# No PIP_INDEX_URL_ARG: this image installs nothing from pip, and the vendor base ships no pip.
+build-ssh-maca: check-tag check-maca-base ## Build the metax MACA ssh image (linux/amd64 only)
+	$(CONTAINER_TOOL) build --platform "$(MACA_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) \
+		-f ssh-maca-pytorch/Dockerfile -t $(IMG_SSH_MACA) .
+
 smoke: build ## Build and run the full local Docker smoke
-	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) hack/smoke.sh
+	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) IMG_MACA=$(IMG_MACA) IMG_SSH_MACA=$(IMG_SSH_MACA) hack/smoke.sh
 
 smoke-ssh: build-ssh ## Build and smoke only the self-authored ssh image
-	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) hack/smoke.sh --ssh
+	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) IMG_MACA=$(IMG_MACA) IMG_SSH_MACA=$(IMG_SSH_MACA) hack/smoke.sh --ssh
 
 smoke-jupyter: build-jupyter ## Build and smoke only the jupyter image
-	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) hack/smoke.sh --jupyter
+	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) IMG_MACA=$(IMG_MACA) IMG_SSH_MACA=$(IMG_SSH_MACA) hack/smoke.sh --jupyter
 
-push: push-ssh push-jupyter ## Publish both images as multi-arch indexes (TAG + :latest)
+smoke-maca: build-maca ## Build and smoke only the metax MACA image
+	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) IMG_MACA=$(IMG_MACA) IMG_SSH_MACA=$(IMG_SSH_MACA) hack/smoke.sh --maca
+
+smoke-ssh-maca: build-ssh-maca ## Build and smoke only the metax MACA ssh image
+	IMG_SSH=$(IMG_SSH) IMG_JUPYTER=$(IMG_JUPYTER) IMG_MACA=$(IMG_MACA) IMG_SSH_MACA=$(IMG_SSH_MACA) hack/smoke.sh --ssh-maca
+
+push: push-ssh push-jupyter push-maca push-ssh-maca ## Publish every image (TAG + :latest)
 
 push-ssh: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the ssh image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
@@ -218,6 +295,16 @@ push-jupyter: check-tag check-platforms check-push-latest ## Publish the jupyter
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f jupyter/Dockerfile -t $(IMG_JUPYTER) $(LATEST_ARG_JUPYTER) --push .
 
+# check-platforms would be checking PLATFORMS, which this target deliberately does not read;
+# MACA_PLATFORM is the whole of what it publishes, and PLATFORMS_ARG is what would break it.
+push-maca: check-tag check-maca-base check-push-latest ## Publish the metax MACA image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
+	$(CONTAINER_TOOL) buildx build --platform "$(MACA_PLATFORM)" $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
+		-f jupyter-maca-pytorch/Dockerfile -t $(IMG_MACA) $(LATEST_ARG_MACA) --push .
+
+push-ssh-maca: check-tag check-maca-base check-push-latest ## Publish the metax MACA ssh image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
+	$(CONTAINER_TOOL) buildx build --platform "$(MACA_PLATFORM)" $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
+		-f ssh-maca-pytorch/Dockerfile -t $(IMG_SSH_MACA) $(LATEST_ARG_SSH_MACA) --push .
+
 # Repoint :latest at a TAG already in the registry rather than rebuilding: imagetools
 # writes an index naming the same manifests, so this cannot publish anything the build
 # did not produce. It is how a caller that withheld :latest from `push` moves it after
@@ -225,6 +312,8 @@ push-jupyter: check-tag check-platforms check-push-latest ## Publish the jupyter
 retag-latest: check-tag ## Repoint :latest at an already-published TAG (no rebuild)
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_SSH) $(IMG_SSH)
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_JUPYTER) $(IMG_JUPYTER)
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MACA) $(IMG_MACA)
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_SSH_MACA) $(IMG_SSH_MACA)
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
