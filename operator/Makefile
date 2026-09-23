@@ -126,8 +126,11 @@ ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 # Envoy Gateway's chart, controller image, and the proxy image its dataplane
 # runs — served from the platform registry rather than Docker Hub. The runner
 # reaches harbor.isuanova.com on the internal network, and Docker Hub's
-# anonymous pull limits are a CI failure this stays clear of. Repos follow the
-# naming already in that project, <upstream-org>-<image>.
+# anonymous pull limits are a CI failure this stays clear of. They live in the
+# shared mirrors project, where a repo is named for its upstream reference with
+# the upstream host as the first path segment — <mirrors>/<host>/<path> — so a
+# reference here reads as its upstream one with harbor.isuanova.com/mirrors/
+# prefixed.
 #
 # The controller's tag is ENVOY_GATEWAY_VERSION itself, so chart and controller
 # cannot disagree. The proxy's is NOT derivable from it: Envoy Gateway compiles
@@ -137,9 +140,9 @@ ENVOY_GATEWAY_NAMESPACE ?= envoy-gateway-system
 #
 # All three are set to a mirrored copy, so moving ENVOY_GATEWAY_VERSION means
 # running hack/mirror-e2e-images.sh before the e2e can pass.
-ENVOY_GATEWAY_CHART ?= oci://harbor.isuanova.com/suanova/envoyproxy-gateway-helm-chart
-ENVOY_GATEWAY_IMAGE ?= harbor.isuanova.com/suanova/envoyproxy-gateway:$(ENVOY_GATEWAY_VERSION)
-ENVOY_PROXY_IMAGE ?= harbor.isuanova.com/suanova/envoyproxy-envoy:distroless-v1.39.1
+ENVOY_GATEWAY_CHART ?= oci://harbor.isuanova.com/mirrors/docker.io/envoyproxy/gateway-helm
+ENVOY_GATEWAY_IMAGE ?= harbor.isuanova.com/mirrors/docker.io/envoyproxy/gateway:$(ENVOY_GATEWAY_VERSION)
+ENVOY_PROXY_IMAGE ?= harbor.isuanova.com/mirrors/docker.io/envoyproxy/envoy:distroless-v1.39.1
 # Split on the LAST colon so registries with a port (reg:5000/img:tag) work, as
 # HELM_E2E_IMAGE_REPO/TAG below do.
 ENVOY_GATEWAY_IMAGE_REPO = $(shell echo '$(ENVOY_GATEWAY_IMAGE)' | sed -E 's/:[^:]*$$//')
@@ -180,7 +183,9 @@ DEV_ENV_PLATFORM ?= linux/$(shell uname -m | sed -e 's/x86_64/amd64/' -e 's/aarc
 PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
 # What the images below are built FROM: `<the Dockerfile's build arg>=<the
 # platform registry's copy, pinned by digest>=<the upstream reference that copy
-# mirrors>`.
+# mirrors>`. The copies live in the shared mirrors project, each repo named for
+# the upstream reference it holds — so the middle field reads as the third with
+# harbor.isuanova.com/mirrors/ prefixed.
 #
 # Every Dockerfile defaults its base to upstream and takes it as a --build-arg,
 # the way APT_MIRROR and PIP_INDEX_URL already work in images/ — a laptop build,
@@ -215,7 +220,7 @@ PERMISSION_INIT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*permissionInitImage[[:sp
 # they are listed so the mirror stays the single account of what an offline build
 # needs. Without them `make -C images build` reaches Docker Hub, which no e2e run
 # would catch.
-BASE_MIRRORS = JUPYTER_BASE=harbor.isuanova.com/suanova/jupyter-minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810=quay.io/jupyter/minimal-notebook:2026-09-07 GOLANG_BASE=harbor.isuanova.com/suanova/golang:1.26@sha256:6c2a5538f964f1c82f97ad14988bf05de100d922d159d0e398b54c7b0ca0c6c9=golang:1.26 DISTROLESS_BASE=harbor.isuanova.com/suanova/distroless-static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3=gcr.io/distroless/static:nonroot PYTHON_BASE=harbor.isuanova.com/suanova/python:3.12-alpine@sha256:c4634f578a412db396771b61b064c6e546c9d6414c7fb5b1b05d5871f1885f7b=python:3.12-alpine UBUNTU_BASE=harbor.isuanova.com/suanova/ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02=ubuntu:22.04
+BASE_MIRRORS = JUPYTER_BASE=harbor.isuanova.com/mirrors/quay.io/jupyter/minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810=quay.io/jupyter/minimal-notebook:2026-09-07 GOLANG_BASE=harbor.isuanova.com/mirrors/docker.io/library/golang:1.26@sha256:6c2a5538f964f1c82f97ad14988bf05de100d922d159d0e398b54c7b0ca0c6c9=golang:1.26 DISTROLESS_BASE=harbor.isuanova.com/mirrors/gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3=gcr.io/distroless/static:nonroot PYTHON_BASE=harbor.isuanova.com/mirrors/docker.io/library/python:3.12-alpine@sha256:c4634f578a412db396771b61b064c6e546c9d6414c7fb5b1b05d5871f1885f7b=python:3.12-alpine UBUNTU_BASE=harbor.isuanova.com/mirrors/docker.io/library/ubuntu:22.04@sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02=ubuntu:22.04
 
 # $(1) = a Dockerfile's build arg name -> the --build-arg flag that points it at
 # the mirror. An image reference never contains '=', so splitting on it yields

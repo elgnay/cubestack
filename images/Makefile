@@ -42,10 +42,13 @@ BUILDX_ATTEST = --provenance=false --sbom=false
 APT_MIRROR    ?=
 PIP_INDEX_URL ?=
 
-# Base-image build args, defaulting to this registry's own mirrored copies of the upstream
+# Base-image build args, defaulting to the platform registry's mirrored copies of the upstream
 # bases. Building from the platform's copy is what keeps the published image descended from
 # the base the platform serves, and it is the only copy that resolves where upstream is
-# unreachable. Each is named by tag *and* digest, and the digest is what the build resolves:
+# unreachable. They live in the shared MIRROR_PROJECT, each under its upstream reference with
+# the upstream host as the first path segment — the same rule hack/mirror-e2e-images.sh
+# mirrors under, and the same refs operator/Makefile's BASE_MIRRORS names. Each is named by
+# tag *and* digest, and the digest is what the build resolves:
 # the mirrored tag is movable — operator/hack/mirror-e2e-images.sh repoints it when someone
 # here re-mirrors — so on the tag alone one commit could publish different base layers on two
 # days under the same TAG, which is the reproducibility that TAG is supposed to carry. The
@@ -57,7 +60,7 @@ PIP_INDEX_URL ?=
 # FROM upstream instead, unpinned. The jupyter date tracks the base in jupyter/Dockerfile; bump
 # both together.
 BASE_ARGS ?= \
-	--build-arg JUPYTER_BASE=$(REGISTRY)/$(PROJECT)/jupyter-minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810 \
+	--build-arg JUPYTER_BASE=$(REGISTRY)/$(MIRROR_PROJECT)/quay.io/jupyter/minimal-notebook:2026-09-07@sha256:f6dc79ec57e05d28fa8f08dbd457c0d46f79e3677083e2eed9fb2d892942d810 \
 	--build-arg UBUNTU_BASE=$(UBUNTU_BASE)
 
 # Base release of the self-authored ssh image. It selects the build base AND names the
@@ -74,7 +77,7 @@ UBUNTU_VERSION ?= 22.04
 UBUNTU_BASE_DIGESTS = 22.04=sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
 
 UBUNTU_BASE_DIGEST = $(patsubst $(UBUNTU_VERSION)=%,%,$(filter $(UBUNTU_VERSION)=%,$(UBUNTU_BASE_DIGESTS)))
-UBUNTU_BASE = $(REGISTRY)/$(PROJECT)/ubuntu:$(UBUNTU_VERSION)@$(UBUNTU_BASE_DIGEST)
+UBUNTU_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/docker.io/library/ubuntu:$(UBUNTU_VERSION)@$(UBUNTU_BASE_DIGEST)
 
 APT_MIRROR_ARG    = $(if $(APT_MIRROR),--build-arg APT_MIRROR=$(APT_MIRROR))
 PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL))
@@ -93,6 +96,11 @@ PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_
 # that reason instead, rather than inventing a non-reproducible tag.
 REGISTRY ?= harbor.isuanova.com
 PROJECT  ?= suanova
+# Where the third-party bases the images are built FROM are mirrored. A project of its
+# own rather than PROJECT, which names the images this workspace publishes: the bases are
+# shared platform-wide — the e2e's builds and this one resolve the same refs — and the
+# project is not this workspace's to own.
+MIRROR_PROJECT ?= mirrors
 TAG      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
 
 SSH_REPO     = $(REGISTRY)/$(PROJECT)/ssh-ubuntu$(UBUNTU_VERSION)
