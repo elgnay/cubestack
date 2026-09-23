@@ -64,6 +64,42 @@ chart, and the Envoy Gateway v1.9.1 CRDs as well: the `ClientTrafficPolicy` that
 ships with the Gateway — from the chart, and from the kustomize base's
 `config/gateway/` — is one of that controller's resources.
 
+## Requirements on the namespaces that host DevEnvironments
+
+The operator neither creates nor labels namespaces: an environment lands in whatever
+namespace its CR was created in. Pod Security Admission has no per-container exemption, so
+the namespace's enforce level decides whether the workload can exist there at all. Measured
+against a 1.36 API server, the strictest level each spec still runs under is:
+
+| spec | strictest level it runs under | because |
+|------|-------------------------------|---------|
+| plain | `restricted` | the environment is a non-root container with no capabilities and a runtime-default seccomp profile |
+| + `storage` | `baseline` | the workspace claim is chowned by a root init container holding `CHOWN`, `FOWNER` and `FSETID`, which `restricted` rejects three ways over |
+| + `runtime.securityContext.runAsUser: 0` | `baseline` | `restricted` requires a non-root user |
+| + `network.rdmaEnabled` | `privileged` | registering a memory region adds `IPC_LOCK`, and a RoCE fabric adds `hostNetwork`; `baseline` refuses both |
+
+`privileged` in that last row names the Pod Security Standard level, not
+`securityContext.privileged` on the container: the operator never sets that, and an RDMA
+environment's container is an ordinary non-root one. What forces the level is the
+namespace's policy, which has no per-container exemption — `baseline` disallows a declared
+`IPC_LOCK` whatever uid the container runs as, and disallows `hostNetwork`. The device
+itself is handed over by the device plugin through the device cgroup, not by either.
+
+`IPC_LOCK` is there because registering an RDMA memory region has to pin pages beyond the
+default `RLIMIT_MEMLOCK`. A node configured to lift that limit for containers would not need
+it, but a node's runtime configuration is not something the platform can assume.
+
+So a plain environment runs in a namespace labelled
+`pod-security.kubernetes.io/enforce=restricted`, and anything with storage needs that label
+relaxed to `baseline`. The DevEnvironment e2e labels its namespace `baseline`
+(`hack/verify-devenv.sh`), which suits the common case.
+
+A namespace enforcing `restricted` cannot host an environment that asks for storage: the
+StatefulSet is created but its pod is refused at admission, so the environment never reaches
+`Running` and the reason is only in the StatefulSet's events, not in the DevEnvironment's
+status. A namespace with no enforce label inherits the API server's cluster-wide default,
+which the operator cannot read — label the namespace explicitly rather than rely on it.
+
 ## Uninstall and cleanup
 
 ```bash
