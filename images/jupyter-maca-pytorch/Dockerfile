@@ -10,8 +10,8 @@
 # layer the self-authored CPU image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
 # openssh-server, the shared entrypoint — on top of the vendor's own python/torch/MACA stack,
 # which is inherited untouched. The account is not a preference: the shared sshd drop-in is a
-# non-root configuration (PermitRootLogin no, Port 2222, UsePAM no), and a non-root sshd can
-# only serve the uid it runs as.
+# non-root configuration (Port 2222, UsePAM no, AllowUsers pinned to that one account), and a
+# non-root sshd can only serve the uid it runs as.
 #
 # No key staging: the operator mounts two Secret entries and sshd reads them in place —
 #   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity, subPath file)
