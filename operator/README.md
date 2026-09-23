@@ -68,37 +68,31 @@ ships with the Gateway — from the chart, and from the kustomize base's
 
 The operator neither creates nor labels namespaces: an environment lands in whatever
 namespace its CR was created in. Pod Security Admission has no per-container exemption, so
-the namespace's enforce level decides whether the workload can exist there at all. Measured
-against a 1.36 API server, the strictest level each spec still runs under is:
+the namespace's enforce level decides whether the workload can exist there at all.
 
-| spec | strictest level it runs under | because |
-|------|-------------------------------|---------|
-| plain | `restricted` | the environment is a non-root container with no capabilities and a runtime-default seccomp profile |
-| + `storage` | `baseline` | the workspace claim is chowned by a root init container holding `CHOWN`, `FOWNER` and `FSETID`, which `restricted` rejects three ways over |
-| + `runtime.securityContext.runAsUser: 0` | `baseline` | `restricted` requires a non-root user |
-| + `network.rdmaEnabled` | `privileged` | registering a memory region adds `IPC_LOCK`, and a RoCE fabric adds `hostNetwork`; `baseline` refuses both |
+A namespace hosting DevEnvironments has to be at **`baseline`**, and a namespace hosting an
+environment with `spec.network.rdmaEnabled` has to be at **`privileged`**: `baseline`
+disallows a declared `IPC_LOCK` whatever uid the container runs as, and disallows
+`hostNetwork`, and an RDMA environment declares both. `privileged` there names the Pod
+Security Standard level, not `securityContext.privileged` on the container — the operator
+never sets that, and an RDMA environment's container is an ordinary non-root one.
 
-`privileged` in that last row names the Pod Security Standard level, not
-`securityContext.privileged` on the container: the operator never sets that, and an RDMA
-environment's container is an ordinary non-root one. What forces the level is the
-namespace's policy, which has no per-container exemption — `baseline` disallows a declared
-`IPC_LOCK` whatever uid the container runs as, and disallows `hostNetwork`. The device
-itself is handed over by the device plugin through the device cgroup, not by either.
+`restricted` is not enough, for any spec. That level is a checklist of what each container
+declares — a non-root user, a seccomp profile, `allowPrivilegeEscalation: false`, and a
+`capabilities.drop` of `ALL` — and an absent field counts against it, because the level
+judges what is declared rather than what the container could do. The platform declares the
+first two of the four and neither of the others, so a DevEnvironment pod is refused admission
+to a namespace enforcing `restricted` whatever the spec asks for, including one with no
+`spec.storage` at all. Nothing here works around that; `baseline` is the requirement.
 
-`IPC_LOCK` is there because registering an RDMA memory region has to pin pages beyond the
-default `RLIMIT_MEMLOCK`. A node configured to lift that limit for containers would not need
-it, but a node's runtime configuration is not something the platform can assume.
+The DevEnvironment e2e labels its namespace `baseline` (`hack/verify-devenv.sh`), which suits
+every environment but the RDMA one.
 
-So a plain environment runs in a namespace labelled
-`pod-security.kubernetes.io/enforce=restricted`, and anything with storage needs that label
-relaxed to `baseline`. The DevEnvironment e2e labels its namespace `baseline`
-(`hack/verify-devenv.sh`), which suits the common case.
-
-A namespace enforcing `restricted` cannot host an environment that asks for storage: the
-StatefulSet is created but its pod is refused at admission, so the environment never reaches
-`Running` and the reason is only in the StatefulSet's events, not in the DevEnvironment's
-status. A namespace with no enforce label inherits the API server's cluster-wide default,
-which the operator cannot read — label the namespace explicitly rather than rely on it.
+A refusal is quiet: the StatefulSet is created but its pod is refused at admission, so the
+environment never reaches `Running` and the reason is only in the StatefulSet's events, not in
+the DevEnvironment's status. A namespace with no enforce label inherits the API server's
+cluster-wide default, which the operator cannot read — label the namespace explicitly rather
+than rely on it.
 
 ## Uninstall and cleanup
 

@@ -253,8 +253,8 @@ const (
 	// (see desiredPodSpec) for the same reason: the seccomp profile is a constant
 	// that stsSpecHash's hand-assembled input cannot see, and a pod only acquires
 	// it at creation. Without a version the hash can see, adding the profile
-	// leaves every environment created before it running unprofiled, and a
-	// namespace enforcing Restricted refusing to admit them on their next restart.
+	// leaves every environment created before it running unprofiled, and nothing
+	// else in the template changes, so no later reconcile would roll them.
 	podSecurityContextVersion = "seccomp-runtime-default-1"
 
 	// rootLauncherEnvVersion names the shape of the launcher environment the
@@ -1295,8 +1295,9 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 // Standard rejects exactly this — root and any capability beyond
 // NET_BIND_SERVICE — so a namespace hosting an environment with spec.storage
 // has to be at Baseline, where these three are among the capabilities that
-// remain allowed. An environment without storage, and so without this init
-// container, runs under Restricted.
+// remain allowed. Dropping the init container would not buy Restricted: an
+// environment without storage is refused there too, for what the main container
+// leaves undeclared (README).
 // An RDMA environment raises that floor to Privileged: IPC_LOCK is outside
 // Baseline's allowed set, and a RoCE one adds hostNetwork, which both Baseline
 // and Restricted forbid outright (spec.network.rdmaEnabled).
@@ -1861,9 +1862,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{container},
 		// Pod-level, so the profile reaches the init container below too. An unset
-		// profile is Unconfined on Kubernetes, where the Restricted Pod Security
-		// Standard refuses it outright — which is the only thing keeping an
-		// environment without spec.storage out of a restricted namespace. The
+		// profile is Unconfined, which the Restricted Pod Security Standard refuses
+		// outright: this is that level's seccomp requirement met, and no more —
+		// a namespace enforcing Restricted refuses the pod anyway (README). The
 		// vendor stacks tolerate it: a MACA kernel launch is unaffected.
 		SecurityContext: &corev1.PodSecurityContext{
 			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
