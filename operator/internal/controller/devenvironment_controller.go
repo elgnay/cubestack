@@ -1538,7 +1538,13 @@ func isRootLauncherEnvName(name string) bool {
 // the launcher dies there ("userdel: user root is currently used by process 1") and
 // takes the container with it. Measured on jupyter-minimal: a pod running as 0:1000
 // with NB_GID=1000 exits before the notebook is up, and the same pod with NB_GID=0
-// serves /home/root. So the pod's group is not a value these may be derived from.
+// starts. So the pod's group is not a value these may be derived from.
+//
+// The shipped images no longer read them: a root container on the CPU image leaves
+// start.sh out of the chain entirely (images/jupyter/start-jupyter.sh), and the MACA
+// launcher expands NOTEBOOK_ARGS alone. They are supplied all the same, because the
+// controller sees only spec.image: a stock docker-stacks image, which is what a
+// bring-your-own jupyter environment is, is served by that launcher and nothing else.
 //
 // An entry the spec declares under one of these names is dropped rather than
 // merged: a value the controller owns is not one the spec may contradict

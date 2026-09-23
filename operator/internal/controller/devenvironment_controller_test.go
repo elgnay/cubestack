@@ -1437,9 +1437,10 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))).To(Equal("/home/jovyan"))
 		})
 
-		// The notebook-root case: a stock-derived image running as root relocates
-		// root's home to /home/root, so a declared HOME has to beat the /root the
-		// identity alone implies — otherwise the claim is left unused.
+		// The root case: a declared HOME beats the /root the identity alone implies.
+		// The declaration is where the claim was mounted and where the launcher looks
+		// — /home/root is the home a stock docker-stacks image relocates root to, so naming
+		// it is how a root environment there keeps its workspace. Otherwise the claim is unused.
 		It("lets a declared HOME override the home root's identity implies", func() {
 			Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
 				s.Runtime = &aiv1alpha1.RuntimeSpec{

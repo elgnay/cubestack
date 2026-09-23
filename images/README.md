@@ -25,18 +25,19 @@ by whose layout they keep:
 | `harbor.isuanova.com/suanova/jupyter-maca-pytorch` | self-authored | `maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64` (mirror of `cr.metax-tech.com/public-library/…`) | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter `8888`, ssh `2222` | `ubuntu` |
 | `harbor.isuanova.com/suanova/ssh-maca-pytorch` | self-authored | *(the same MACA mirror)* | `ubuntu` 1000:1000 | `/home/ubuntu` | ssh `2222` | `ubuntu` |
 
-The `jupyter-minimal` overlay adds **only** `openssh-server` on top of the stock image: same account,
-home, conda stack, launcher (`tini → start.sh → start-notebook.py`), and jupyter settings.
+The `jupyter-minimal` overlay adds **only** `openssh-server` and a launcher on top of the stock image:
+same account, home, conda stack, and jupyter settings, and the stock launch chain
+(`tini → start.sh → start-notebook.py`) for the stock account — the launcher is the root case's.
 
 `jupyter-maca-pytorch` is the same family as `ssh-ubuntu22.04` but not the same size of overlay: a
 vendor GPU base is not a distro, so the platform layer there is the whole of it. The base runs as
 **root** (no `config.User`), has no `ENTRYPOINT` at all (`Cmd: ["/bin/bash"]`, so it exits immediately),
 no sshd, no jupyter, and no non-root account — the account is the platform's even though the base has
 none, because the shared sshd drop-in is a non-root configuration. The base also carries no launcher,
-so the image supplies its own jupyter launch chain (`start-jupyter.sh`), the one piece `jupyter-minimal`
-gets from docker-stacks. And the base publishes one architecture per tag (the `-amd64` suffix is part
-of the package name, not a multi-arch index), so this image is **amd64-only** and is published on its
-own platform variable — see Platform.
+so the image supplies its own jupyter launch chain (`start-jupyter.sh`), the piece `jupyter-minimal`
+still gets from docker-stacks. And the base publishes one architecture per tag (the `-amd64` suffix
+is part of the package name, not a multi-arch index), so this image is **amd64-only** and is published
+on its own platform variable — see Platform.
 
 `ssh-maca-pytorch` is that image's sibling: the identical vendor base and platform layer, with no
 JupyterLab and no launcher. The split is forced by where the mode comes from — `CUBESTACK_IMAGE` is
@@ -73,9 +74,8 @@ always wins.
 
 A **root** environment (`spec.runtime.securityContext.runAsUser: 0`) is the case this table does not
 cover, since the identity comes from the security context rather than from `runtime.user`: the derived
-mount is `/root`, which is the home three of the four images serve as they stand. `jupyter-minimal` is
-the exception — its launcher relocates root's home to `/home/root` and overrides any `HOME` — so an
-environment there states the mount itself (see Runtime behavior above).
+mount is `/root`, and every image serves that home as it stands — a launcher's one job there is to
+leave root with the home the derivation gives it (see Runtime behavior below).
 
 A GPU image additionally has to be requested as one: the brand gate runs only when an environment asks
 for a vendor, and it requires the image's name to carry that vendor's token (`cuda` for `nvidia`,
@@ -102,23 +102,22 @@ for the GPU.
   address names the account to log in as — `spec.runtime.user` when it is set, else the platform default
   `user`, and `root` for a root environment whatever the spec names, since root is the only account the
   platform can promise there.
-- Jupyter is stock-native where the base already is one — `jupyter-minimal` adds no jupyter logic, and
-  the two knobs are honored by its upstream launcher — and platform-launched where it is not:
-  `jupyter-maca-pytorch` supplies `start-jupyter.sh`, standing in for docker-stacks' `start.sh`, because
-  the vendor base has no launcher. Either way the two knobs are `JUPYTER_TOKEN` (token) and
-  `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`). The token is read by jupyter-server
-  itself; `NOTEBOOK_ARGS` is a docker-stacks convention jupyter knows nothing about, which is why a
-  launcher has to expand it — the MACA image's own launcher is that launcher. A **root** environment is
+- Jupyter is stock-native where the base already is one — `jupyter-minimal` keeps docker-stacks' chain,
+  adding only the root branch below — and platform-launched where it is not: the MACA base has no chain
+  to keep, so `jupyter-maca-pytorch`'s `start-jupyter.sh` is the whole launcher. Either way the two knobs
+  are `JUPYTER_TOKEN` (token) and `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`). The token
+  is read by jupyter-server itself; `NOTEBOOK_ARGS` is a docker-stacks convention jupyter knows nothing
+  about, which is why a launcher has to expand it — the MACA image's own launcher is that launcher, while
+  the CPU one hands off to the stock chain that already does. A **root** environment is
   handed more than those two: the controller adds `NB_USER`, `NB_UID`, `NB_GID` and, into the same
   `NOTEBOOK_ARGS`, `--allow-root` (`::withRootLauncherEnv`). A launcher that reads none of the trio may
-  ignore it — the MACA one expands `NOTEBOOK_ARGS` and nothing else — but a Jupyter launcher that
-  ignores `--allow-root` will not start as root at all. The **home** a root environment runs with is a
-  launcher decision as well, and the two jupyter images reach it differently: `jupyter-minimal` keeps
-  docker-stacks' `start.sh`, which relocates root's home to `/home/root` for a root container whatever
-  the environment declares, while `start-jupyter.sh` serves root's own `/root` — the home the controller
-  derives for `runAsUser: 0` — and leaves a declared `HOME` standing. So a root environment on
-  `jupyter-minimal` states `HOME=/home/root` for its workspace to be mounted where its notebooks land,
-  and on the other three images it states nothing.
+  ignore it — neither jupyter launcher consults it at uid 0 — but a Jupyter launcher that ignores
+  `--allow-root` will not start as root at all. The **home** a root environment runs with is a launcher
+  decision as well, and both jupyter images decide it the same way: root's own `/root`, the home the
+  controller derives for `runAsUser: 0` and mounts the claim at, with a declared `HOME` left standing as
+  the one thing that outranks the image. `jupyter-minimal` takes uid 0 out of docker-stacks' `start.sh`
+  to do it — that launcher relocates root's home to `/home/root` whatever the environment declares,
+  which is what a root environment there used to state `HOME=/home/root` for.
 
 ## ssh Secret mount contract
 
@@ -252,7 +251,10 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
 - **jupyter-minimal** — one container running both services at native identity (uid 1000, gid 100):
   token auth returns 200 and lab HTML on the `NOTEBOOK_ARGS` `base_url` path; no token is rejected;
   the path without the prefix is 404; plus key-auth ssh login as `jovyan` (`$HOME=/home/jovyan`) with
-  the served host key equal to the mounted Secret public key.
+  the served host key equal to the mounted Secret public key. Root mode adds the one thing this image
+  does not leave to docker-stacks: a root run serves `/root` — the home the platform derives, and so
+  where the claim is mounted — rather than the `/home/root` the stock `start.sh` relocates to, and a
+  declared `HOME` is served unchanged.
 - **jupyter-maca-pytorch** — the same jupyter and ssh assertions at the platform identity (uid/gid
   1000, `$HOME`/cwd `/home/ubuntu`, login account `ubuntu`), plus that the vendor stack under
   `/opt/maca` is **readable by uid 1000**. That last one is checkable without a GPU and is the risk
@@ -400,7 +402,9 @@ images/
     sshd/10-devenv.conf    sshd_config.d drop-in; @SSH_USER@ login account, @SSH_ENV@ session env
     sshd/install-dropin.sh fills both placeholders in, or fails the build
   ssh-ubuntu-server/Dockerfile
-  jupyter/Dockerfile
+  jupyter/
+    Dockerfile             stock-native overlay
+    start-jupyter.sh       the CMD: the stock chain, and root's own home for uid 0
   jupyter-maca-pytorch/
     Dockerfile             platform layer on the Metax MACA vendor base
     start-jupyter.sh       this image's jupyter launch chain (the base ships none)

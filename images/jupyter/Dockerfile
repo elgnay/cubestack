@@ -4,7 +4,8 @@
 # for the platform (see docs/design/devenv-images/decision.md): everything else
 # stays identical to the stock image. The upstream layout is kept exactly — user
 # 'jovyan' (uid 1000, primary group 'users' gid 100), $HOME=/home/jovyan, and the
-# stock launch chain tini -> start.sh -> start-notebook.py. A DevEnvironment
+# stock launch chain tini -> start.sh -> start-notebook.py, which a root container
+# is the one case to leave (last addition below). A DevEnvironment
 # running this image configures that layout explicitly: spec.runtime.user=jovyan
 # derives the workspace mount /home/jovyan, and securityContext.runAsGroup must
 # be set to 100 (see images/README.md).
@@ -17,6 +18,9 @@
 #     reads them in place.
 #   - Jupyter itself honors JUPYTER_TOKEN and NOTEBOOK_ARGS natively (token,
 #     base_url, ...) — no overlay jupyter logic.
+#   - start-jupyter.sh, the CMD below: the stock chain for the stock account, and
+#     root's own home for uid 0, which is the workspace the platform derives for a
+#     root environment. See the script.
 #
 # Build context MUST be images/ so common/ is COPYable, and the platform must be named: the base
 # is multi-arch, so a bare `docker build` resolves it to the *host* architecture and an arm64 host
@@ -61,6 +65,7 @@ RUN mkdir -p /home/jovyan/.ssh \
     && rm -f /etc/ssh/ssh_host_*
 
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
+COPY jupyter/start-jupyter.sh /usr/local/bin/start-jupyter.sh
 # Shared sshd config (common/), installed by the script that also owns its
 # placeholders: this family's ssh login account (the stock container account
 # 'jovyan' that USER selects below) and the session environment. The stock base
@@ -71,6 +76,7 @@ ARG SSH_USER=jovyan
 COPY common/sshd/10-devenv.conf /etc/ssh/sshd_config.d/10-devenv.conf
 COPY common/sshd/install-dropin.sh /tmp/install-dropin.sh
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
+      /usr/local/bin/start-jupyter.sh \
     && sh /tmp/install-dropin.sh "${SSH_USER}" PATH \
     && rm -f /tmp/install-dropin.sh
 
@@ -82,7 +88,8 @@ EXPOSE 8888 2222
 USER 1000
 
 # Our entrypoint runs first (starts sshd when the Secret is mounted), then hands
-# off to the image CMD, which reproduces the stock launch chain exactly (the base
-# image runs tini + ENTRYPOINT start.sh + CMD start-notebook.py).
+# off to the image CMD: the stock chain for the stock account, and root's own home
+# for uid 0 (start-jupyter.sh — the base image's own is tini + start.sh +
+# start-notebook.py).
 ENTRYPOINT ["tini", "-g", "--", "/usr/local/bin/cubestack-entrypoint.sh"]
-CMD ["/usr/local/bin/start.sh", "start-notebook.py"]
+CMD ["/usr/local/bin/start-jupyter.sh"]

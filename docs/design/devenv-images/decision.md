@@ -97,8 +97,11 @@ and `--allow-root` into `NOTEBOOK_ARGS` for a Jupyter environment at uid 0, so `
 the whole of the request. The trio names the account in the image's own passwd database — `0:0` for
 root — and not the identity the pod runs as: docker-stacks rewrites the account when the two disagree,
 and that rewrite cannot succeed for root, which is measured (a pod running as `0:1000` with
-`NB_GID=1000` exits with `userdel: user root is currently used by process 1`, and starts and serves
-`/home/root` with `NB_GID=0`).
+`NB_GID=1000` exits with `userdel: user root is currently used by process 1`, so only the account's own
+`0:0` may be named). The shipped images no longer read the trio — a root container on the CPU image
+leaves `start.sh` out of the chain entirely — but the injection stays: the controller sees only
+`spec.image`, and a stock docker-stacks image, which is what a bring-your-own jupyter environment is,
+is served by that launcher and nothing else.
 
 ### Gap A — closed: the home mount is writable by uid 1000
 

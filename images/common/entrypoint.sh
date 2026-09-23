@@ -12,8 +12,9 @@
 #
 # Modes:
 #   jupyter  start sshd only when the operator mounted the ssh Secret, then hand
-#            off to the image CMD (the stock-derived jupyter overlay CMD is the
-#            stock launch chain: start.sh start-notebook.py).
+#            off to the image CMD (start-jupyter.sh in both jupyter images: the CPU
+#            one dispatches into docker-stacks' start.sh, the MACA one is the whole
+#            launcher, the vendor base shipping none).
 #   ssh      run sshd in the foreground.
 set -euo pipefail
 

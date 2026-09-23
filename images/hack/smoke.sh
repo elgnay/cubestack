@@ -8,15 +8,16 @@
 #   jupyter-minimal     : stock-native overlay (user 'jovyan', uid 1000 gid 100,
 #                         /home/jovyan) — JupyterLab behind JUPYTER_TOKEN +
 #                         NOTEBOOK_ARGS base_url, plus sshd-as-'jovyan' when the ssh
-#                         Secret is mounted; both services in the same container
+#                         Secret is mounted; both services in the same container, and
+#                         a root run serves the home the platform derives (/root, or
+#                         the one the spec declares) rather than the /home/root
+#                         docker-stacks' own launcher would relocate it to
 #   jupyter-maca-pytorch: platform layer on the Metax MACA base (user 'ubuntu', uid/gid
 #                         1000, /home/ubuntu) — the same two services and the same
 #                         assertions as jupyter-minimal, plus that the vendor stack
 #                         under /opt/maca is readable by the account that runs it, and
-#                         that a root run serves the home the platform derives (/root,
-#                         or the one the spec declares) rather than the account home
-#                         this image bakes — the stock CPU launcher relocates root's
-#                         home for its own image, so this one has to decide it itself
+#                         the same root-home check on an image whose launcher is the
+#                         platform's rather than docker-stacks'
 #   ssh-maca-pytorch    : the same vendor base and platform layer with no JupyterLab at
 #                         all — sshd alone, as CUBESTACK_IMAGE=ssh bakes in. Asserted
 #                         apart from its jupyter sibling precisely on that difference, and
@@ -215,9 +216,9 @@ check_served_host_key() {
 #
 # The login account is the container's, not the image's: root is served whatever
 # account the image was built around. Extra args carry what a family needs to *stay
-# up* as root — the jupyter launcher otherwise drops to its stock account — and are
-# what the controller injects for a root DevEnvironment, which a bare container has
-# to be given by hand (::withRootLauncherEnv).
+# up* as root — a stock jupyter launcher otherwise drops to the account the image
+# was built around — and are what the controller injects for a root DevEnvironment,
+# which a bare container has to be given by hand (::withRootLauncherEnv).
 check_root_ssh() {
   local img=$1 base=$2 cont=$3 label=$4 port out
   shift 4
@@ -358,12 +359,15 @@ check_maca_readable() {
 
 # check_jupyter_home <image> <home> <label> [extra run args...]
 #
-# The home a jupyter container actually runs with, which is the launcher's to decide as much as
-# the image's: jupyter writes its runtime directory *under $HOME* and nothing else on the image
-# chooses that path, so the directory appearing there is the observable, and its absence is a
-# failure rather than a slow start. The run reproduces the shape the operator creates — a writable
-# directory where the workspace claim goes, which is a tmpfs here so that a container running as
-# root writes nothing on the host:
+# The home a jupyter container actually runs with, and the directory its notebook serves — the same
+# directory twice, since jupyter writes its runtime files *under $HOME* and serves its working
+# directory. Both are the launcher's to decide as much as the image's, and both are baked into the
+# one report the server writes at startup, <home>/.local/share/jupyter/runtime/jpserver-<pid>.json:
+# its root_dir is what `jupyter server list` prints. A launcher that moves the home but not the
+# notebook is the failure this catches, so it is asserted on, and neither read of it is enough alone.
+#
+# The run reproduces the shape the operator creates — a writable directory where the workspace claim
+# goes, which is a tmpfs here so that a container running as root writes nothing on the host:
 #
 #   - with no HOME in the environment, the image's baked value is still in place — the underived
 #     case, where the platform mounts the claim at the home the *identity* implies;
@@ -373,10 +377,10 @@ check_maca_readable() {
 # uid 0 throughout, since this is the root branch's check, and no Secret is mounted, so sshd never
 # starts and the run is the launcher alone.
 check_jupyter_home() {
-  local img=$1 home=$2 label=$3 found=""
+  local img=$1 home=$2 label=$3 info=""
   shift 3
   # Named under root_cont like the other root-mode containers, so the EXIT trap owns it too.
-  root_cont="cs-smoke-maca-home-$$"
+  root_cont="cs-smoke-jup-home-$$"
   "$CONTAINER_TOOL" run -d --name "$root_cont" \
     --user 0:0 \
     -e JUPYTER_TOKEN=testtoken \
@@ -384,16 +388,21 @@ check_jupyter_home() {
     --tmpfs "$home" \
     "$@" \
     "$img" >/dev/null
+  # The report lives inside the runtime directory, so waiting for it waits for both: a server that
+  # is still starting has written neither.
   for _ in $(seq 1 120); do
-    found="$("$CONTAINER_TOOL" exec "$root_cont" \
-      sh -c "test -d '$home/.local/share/jupyter/runtime' && echo yes" 2>/dev/null || true)"
-    if [ -n "$found" ]; then break; fi
+    info="$("$CONTAINER_TOOL" exec "$root_cont" \
+      sh -c "cat $home/.local/share/jupyter/runtime/jpserver-*.json 2>/dev/null" || true)"
+    case "$info" in
+      *"\"root_dir\": \"$home\""*) break ;;
+    esac
+    info=""
     sleep 1
   done
-  if [ -n "$found" ]; then
+  if [ -n "$info" ]; then
     ok "$label"
   else
-    bad "$label (no jupyter runtime directory under $home)"
+    bad "$label (jupyter does not report $home as the directory it serves)"
     "$CONTAINER_TOOL" logs "$root_cont" 2>&1 | tail -n 20
   fi
   "$CONTAINER_TOOL" rm -f "$root_cont" >/dev/null 2>&1 || true
@@ -557,16 +566,25 @@ if [ "$run_jupyter" = 1 ]; then
   "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
   jup_cont=""
 
-  # The launcher's own price for running as root, which the controller injects for a root
-  # DevEnvironment (::withRootLauncherEnv) — a bare container has no controller, so the run
-  # has to be handed what the pod would carry. Without them start.sh drops back to the stock
-  # account, and a launcher that exits takes the sshd it started with it, so the login below
-  # would never be attempted against a live container. NB_GID is the account's own gid and
-  # not the pod's: start.sh rewrites the account when the two disagree, and that rewrite
-  # cannot succeed for root.
+  # What the controller injects for a root DevEnvironment (::withRootLauncherEnv), which a bare
+  # container has no controller to receive: the login below is only attempted against a live
+  # container, and a launcher that exits takes the sshd it started with it. This image's launcher
+  # does not consult them — uid 0 leaves the stock start.sh out of the chain entirely (see
+  # images/jupyter/start-jupyter.sh) — but the run carries them because the pod does, and without
+  # them a *stock* jupyter image still drops back to the account it was built around. NB_GID is the
+  # account's own gid and not the pod's: start.sh rewrites the account when the two disagree, and
+  # that rewrite cannot succeed for root.
   check_root_ssh "$IMG_JUPYTER" "$tmp/juproot" "cs-smoke-juproot-$$" "jupyter-minimal as root" \
     -e NB_USER=root -e NB_UID=0 -e NB_GID=0 \
     -e NOTEBOOK_ARGS="--allow-root"
+
+  # The root branch this image's launcher owns: root's own home, which is the one the platform
+  # derives for a root environment and mounts the claim at, and a declared HOME left standing.
+  check_jupyter_home "$IMG_JUPYTER" /root \
+    "jupyter-minimal as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_JUPYTER" /workspace/home \
+    "jupyter-minimal as root: a declared HOME is served instead" \
+    -e HOME=/workspace/home
 fi
 
 # ---------------------------------------------------------------------------
@@ -681,8 +699,7 @@ if [ "$run_maca" = 1 ]; then
   # Running as root costs this image one flag: jupyter-server refuses to start as root without
   # --allow-root. The controller injects it for a root DevEnvironment (::withRootLauncherEnv),
   # and a bare container has no controller, so the run is handed what the pod would carry —
-  # this launcher reads NOTEBOOK_ARGS and none of the NB_* trio, which is why the sibling
-  # image's root run above carries those and this one does not. A launcher that exits takes
+  # this launcher reads NOTEBOOK_ARGS and none of the NB_* trio. A launcher that exits takes
   # the sshd it started with it, so the login below would otherwise never be attempted
   # against a live container.
   check_root_ssh "$IMG_MACA" "$tmp/macaroot" "cs-smoke-macaroot-$$" \
