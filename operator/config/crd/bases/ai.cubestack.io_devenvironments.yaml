@@ -221,8 +221,11 @@ spec:
                       An environment with a workspace claim is told where it is: the controller
                       states the mount path as HOME on the main container, whatever type and
                       whichever account the image runs, so a launcher that serves HOME serves the
-                      workspace without having to know what its own image bakes. An environment
-                      without a claim states no home and keeps the image's.
+                      workspace without having to know what its own image bakes. It states it
+                      ahead of the entries here, so one of them may name it — `PROJECT=$(HOME)/project`
+                      resolves rather than naming that text. An environment without a claim is
+                      told no home of the controller's: a HOME declared here stands as written,
+                      and the image's home applies only where this list declares none.
 
                       Some values are the controller's rather than the spec's on a jupyter
                       environment, and an entry declaring one is dropped and replaced: JUPYTER_TOKEN;

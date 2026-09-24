@@ -1524,15 +1524,27 @@ func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 // the last of several ever applies, so the others are dead entries already, and
 // which one a container takes is not something the render path should have to
 // reproduce to be right.
+//
+// The stated home goes first, ahead of every declared entry. The kubelet
+// expands $(VAR) in a single pass down the list, so a value naming HOME
+// resolves only against a home it has already passed (::declaredHome reads the
+// same expansion the other way, which is why an unexpanded reference is not a
+// usable mount path). Appending would leave a spec's `PROJECT=$(HOME)/project`
+// naming the literal text, while the home itself reads no variable and so is
+// resolved the same wherever it sits. Nothing downstream keeps this order — the
+// kubelet hands the runtime its variables from a map — so this is the only pass
+// it matters to.
 func withWorkspaceHome(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 	envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == homeEnv })
-	return append(envVars, corev1.EnvVar{Name: homeEnv, Value: path})
+	return append([]corev1.EnvVar{{Name: homeEnv, Value: path}}, envVars...)
 }
 
 // resolvedHome is the home the controller states on the container — the path the
 // workspace claim mounts at — and whether it states one at all. Without a claim
-// there is no workspace to name, and the environment keeps the home its image
-// bakes, which is the case both jupyter launchers still guard for.
+// there is no workspace to name and the controller states nothing, so the
+// container keeps whatever the spec's own env list leaves it: the home the spec
+// declares, and only failing that the one its image bakes. A claim-less root
+// environment is the case both jupyter launchers still guard for.
 //
 // The value is the whole derivation rather than its home term, so an explicit
 // spec.storage.mountPath moves HOME with the claim: the claim is the workspace,
@@ -1889,8 +1901,9 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 	// The claim the platform mounts is the environment's home, so the container is
 	// told where it is: a launcher that reads HOME serves the workspace whatever
 	// its image bakes (::resolvedHome). It applies to every type — a claim's path
-	// is no jupyter notion — while an environment with no claim states none and
-	// keeps the home its image bakes.
+	// is no jupyter notion — while an environment with no claim is told nothing
+	// and keeps what its env list leaves: the spec's own home, or the image's
+	// where it declares none.
 	if home, ok := resolvedHome(env); ok {
 		envVars = withWorkspaceHome(envVars, home)
 	}

@@ -2059,9 +2059,27 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
-		// No claim, no workspace to name: the container keeps the home its image
-		// bakes, and the entry the spec declares with it. This is the case the
-		// launchers' own guards still cover.
+		// The kubelet expands $(VAR) in a single pass down the env list, so a
+		// declared value that names HOME resolves only against a HOME it has
+		// already passed: the controller states the home first for that reason.
+		// Asserted on the whole list, since the order is the assertion.
+		It("states the home ahead of the entries that name it", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+					{Name: homeEnv, Value: "/srv/workspace"},
+					{Name: "PROJECT", Value: "$(" + homeEnv + ")/project"},
+				}}
+			})
+			Expect(spec.Containers[0].Env).To(Equal([]corev1.EnvVar{
+				{Name: homeEnv, Value: "/srv/workspace"},
+				{Name: "PROJECT", Value: "$(" + homeEnv + ")/project"},
+			}))
+		})
+
+		// No claim, no workspace to name: the controller states no home, so the
+		// one the spec declares is the one the container runs with. This is the
+		// case the launchers' own guards still cover.
 		It("states no home for an environment with no workspace claim", func() {
 			env := newEnv()
 			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{{Name: homeEnv, Value: testSSHHome}}}
