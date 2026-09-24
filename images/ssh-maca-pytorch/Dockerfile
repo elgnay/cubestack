@@ -11,9 +11,11 @@
 # (config.User is unset, so it would run as root, and its CMD is a bare /bin/bash that exits
 # immediately). So this adds the platform layer the self-authored CPU image defines — account
 # ubuntu 1000:1000 with $HOME=/home/ubuntu, openssh-server, the shared entrypoint — on top of
-# the vendor's own python/torch/MACA stack, which is inherited untouched. The account is not a
-# preference: the shared sshd drop-in is a non-root configuration (Port 2222, UsePAM no,
-# AllowUsers pinned to that one account), and a non-root sshd can only serve the uid it runs as.
+# the vendor's own python/torch/MACA stack, inherited as the base published it except for PATH,
+# which the overlay corrects so that `python3` is the interpreter that owns the vendor torch (see
+# below). The account is not a preference: the shared sshd drop-in is a non-root configuration
+# (Port 2222, UsePAM no, AllowUsers pinned to that one account), and a non-root sshd can only
+# serve the uid it runs as.
 #
 # No key staging: the operator mounts two Secret entries and sshd reads them in place —
 #   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity, subPath file)
@@ -38,7 +40,7 @@ FROM ${MACA_BASE}
 USER root
 
 # Optional apt mirror override for CN/offline builds; empty = upstream. No PIP_INDEX_URL, unlike
-# the jupyter sibling: this image installs nothing from pip, and the base ships no pip anyway.
+# the jupyter sibling: this image installs nothing from pip.
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i -E "s#https?://(archive|ports)\.ubuntu\.com/(ubuntu|ubuntu-ports)#${APT_MIRROR}#g" \
@@ -51,6 +53,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       openssh-server \
       tini \
     && rm -rf /var/lib/apt/lists/*
+
+# Make the VENDOR's python the image's python, before the drop-in below reads PATH out of this
+# environment and bakes it into every ssh session.
+#
+# The base ships two 3.10 interpreters: /opt/conda/bin/python3, which owns the vendor torch, and the
+# system /usr/bin/python3, which does not. It publishes conda only from /etc/profile.d/conda.sh, which
+# prepends it for a *login* shell — and sshd gives one only to an interactive session. So `ssh host`
+# lands on the right interpreter while `ssh host 'python3 ...'`, the shape a script or a CI job uses,
+# silently lands on the other one; a build RUN reads no profile either. Naming it in ENV is what makes
+# both agree, because the drop-in's single SetEnv then carries this PATH verbatim.
+#
+# Prepending is safe against this base in particular: /opt/conda/bin shares no name with any of the
+# MACA toolchain directories and holds no compiler, linker or mpirun, so the tools this image exists to
+# serve are not shadowed (images/README.md, Trade-offs).
+ENV PATH=/opt/conda/bin:$PATH
 
 # Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the identity the
 # self-authored CPU image ships, so one account names both and a DevEnvironment states it once
@@ -91,9 +108,9 @@ RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
          PATH LD_LIBRARY_PATH LIBRARY_PATH MACA_PATH MACA_CLANG_PATH TORCH_ALLOW_TF32_CUBLAS_OVERRIDE \
     && rm -f /tmp/install-dropin.sh
 
-# The vendor's PATH, LD_LIBRARY_PATH and MACA_PATH are inherited from the base: they are what put
-# the MACA stack on the account's search path, which a non-root login needs exactly as the
-# vendor's root shell did.
+# The vendor's LD_LIBRARY_PATH and MACA_PATH are inherited from the base, and its PATH is carried
+# with conda prepended (above): together they are what put the MACA stack on the account's search
+# path, which a non-root login needs exactly as the vendor's root shell did.
 ENV CUBESTACK_IMAGE=ssh \
     HOME=/home/ubuntu
 

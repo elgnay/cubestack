@@ -69,7 +69,9 @@ Every image:
   the installer that fills it in). The drop-in carries two per-family placeholders: the ssh login
   account `@SSH_USER@` (`ARG SSH_USER`) and the session environment `@SSH_ENV@`, which
   `sshd/install-dropin.sh` builds from the variable names each Dockerfile passes it, read out of the
-  build shell's environment — i.e. the base's own. A placeholder is needed because sshd's `SetEnv`
+  build shell's environment — i.e. the image's own by then: the base's, plus whatever the overlay has
+  set, which is how both MACA images get `/opt/conda/bin` onto a session's `PATH`. A placeholder is
+  needed because sshd's `SetEnv`
   *replaces* the session environment, so a fixed literal would hide whichever family's toolchain it did
   not name; and it reaches past `PATH`, since the MACA images need their loader, linker and compiler
   variables there too. A missed `@SSH_USER@` fails *closed* (sshd denies every login, and the smoke says

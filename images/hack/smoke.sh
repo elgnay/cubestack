@@ -15,13 +15,16 @@
 #   jupyter-maca-pytorch: platform layer on the Metax MACA base (user 'ubuntu', uid/gid
 #                         1000, /home/ubuntu) — the same two services and the same
 #                         assertions as jupyter-minimal, plus that the vendor stack
-#                         under /opt/maca is readable by the account that runs it, and
+#                         under /opt/maca is readable by the account that runs it, that
+#                         the default python3 is the vendor's own and imports its torch
+#                         (and that `jupyter` comes from that interpreter), and
 #                         the same root-home check on an image whose launcher is the
 #                         platform's rather than docker-stacks'
 #   ssh-maca-pytorch    : the same vendor base and platform layer with no JupyterLab at
 #                         all — sshd alone, as CUBESTACK_IMAGE=ssh bakes in. Asserted
-#                         apart from its jupyter sibling precisely on that difference, and
-#                         on the ssh session PATH carrying the vendor toolchain.
+#                         apart from its jupyter sibling precisely on that difference, on
+#                         that same vendor python, and on the ssh session PATH carrying
+#                         both the vendor toolchain and the interpreter that owns torch.
 #
 # Every one of them additionally has its ssh session environment compared against the
 # image's own, which is what keeps the shared sshd drop-in's build-time substitution
@@ -357,6 +360,45 @@ check_maca_readable() {
   fi
 }
 
+# check_vendor_python <container> <label> [tool]... — the vendor's python is what these images exist
+# for, for the reason check_maca_readable gives and with the same evidence available: the torch they
+# are built around is importable only by the interpreter the base ships under /opt/conda, and the base
+# publishes that directory nowhere on PATH. Putting it on PATH is the image's job, so what is asserted
+# is that the image's *default* python3 is that interpreter — not that a right one exists somewhere,
+# which is what a login shell would show and is exactly how a wrong default shipped.
+#
+# `docker exec` runs with the image's own config environment, which is also the environment sshd's
+# SetEnv copies into every session, so this is the same value a non-login ssh command gets.
+# Ran without --user: the image's own USER is the account in question.
+#
+# Further names are tools that must resolve onto that same interpreter's bin directory. Which
+# interpreter the launcher came from is a separate fact from PATH — an install that ran before the
+# PATH was corrected leaves the launcher on the system python while the two checks above still pass.
+check_vendor_python() {
+  local name=$1 label=$2
+  shift 2
+  local exe ver tool path
+  exe="$("$CONTAINER_TOOL" exec "$name" sh -c 'command -v python3' 2>/dev/null || true)"
+  case "$exe" in
+    /opt/conda/*) ok "$label default python3 is the vendor's ($exe)" ;;
+    *) bad "$label default python3 is '${exe:-<absent>}', not the vendor interpreter under /opt/conda" ;;
+  esac
+
+  if ver="$("$CONTAINER_TOOL" exec "$name" sh -c 'python3 -c "import torch; print(torch.__version__)"' 2>&1)"; then
+    ok "$label default python3 imports the vendor torch ($ver)"
+  else
+    bad "$label 'python3 -c import torch' failed: $(printf '%s' "$ver" | tail -n 1)"
+  fi
+
+  for tool in "$@"; do
+    path="$("$CONTAINER_TOOL" exec "$name" sh -c "command -v $tool" 2>/dev/null || true)"
+    case "$path" in
+      /opt/conda/bin/*) ok "$label $tool is the vendor interpreter's ($path)" ;;
+      *) bad "$label $tool is '${path:-<absent>}', not /opt/conda/bin/$tool" ;;
+    esac
+  done
+}
+
 # check_jupyter_home <image> <home> <label> [extra run args...]
 #
 # The home a jupyter container actually runs with, and the directory its notebook serves — the same
@@ -658,6 +700,9 @@ if [ "$run_maca" = 1 ]; then
   fi
 
   check_maca_readable "$maca_cont" "maca"
+  # `jupyter` as the third name: this image's launcher is the platform's (`start-jupyter.sh` execs a
+  # bare `jupyter`), so the tool it finds is the interpreter the notebook will run on.
+  check_vendor_python "$maca_cont" "maca" jupyter
 
   # sshd on the same container (ssh Secret mounted -> ssh.enabled).
   wait_ssh "$maca_ssh_port" 30 "$maca_cont" ||
@@ -682,6 +727,12 @@ if [ "$run_maca" = 1 ]; then
   # even under a wrong PATH and would prove nothing.
   check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/maca/bin" \
     "maca ssh session PATH carries the MACA toolchain"
+  # The other half of the same fact, and the one that decides which python a *non-interactive* ssh
+  # command runs: the session PATH has to carry the vendor's conda too. The base publishes it only
+  # from a login profile, so without this an interactive session reaches the vendor torch and
+  # `ssh host 'python3 ...'` reaches the system interpreter that has none.
+  check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/conda/bin" \
+    "maca ssh session PATH carries the vendor python"
 
   check_served_host_key "$maca_ssh_port" "$tmp/macassh/host/ssh_host_ed25519_key.pub" \
     "$maca_cont" "maca served host key == mounted Secret public key"
@@ -764,6 +815,12 @@ if [ "$run_ssh_maca" = 1 ]; then
   # mcclras, macainfo, mxvs, ...) is reachable over ssh.
   check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/maca/bin" \
     "ssh-maca ssh session PATH carries the MACA toolchain"
+  # The half that decides which python a *non-interactive* `ssh host 'python3 ...'` runs, which is
+  # the shape a script or a CI job uses: without the vendor's conda on the session PATH that command
+  # lands on the system interpreter, whose torch does not exist, while an interactive session — which
+  # gets a login shell, and so the base's own conda profile — works and hides it.
+  check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/conda/bin" \
+    "ssh-maca ssh session PATH carries the vendor python"
 
   # The property that makes this a separate image rather than a copy of its sibling. The
   # vendor base ships no JupyterLab and this Dockerfile installs none, so finding one means
@@ -777,6 +834,9 @@ if [ "$run_ssh_maca" = 1 ]; then
   fi
 
   check_maca_readable "$ssh_maca_cont" "ssh-maca"
+  # No tool argument: this image ships no launcher of its own, so its default python3 is the whole
+  # of what a session reaches.
+  check_vendor_python "$ssh_maca_cont" "ssh-maca"
 
   check_served_host_key "$ssh_maca_port" "$tmp/sshmacassh/host/ssh_host_ed25519_key.pub" \
     "$ssh_maca_cont" "ssh-maca served host key == mounted Secret public key"

@@ -449,7 +449,8 @@ root environment too, into the image's own `/home/$USER`, which in root mode is 
 
 The second is `@SSH_ENV@`, the `NAME=value` pairs for the drop-in's single `SetEnv`. Each Dockerfile
 names the variables its session needs and the installer reads their values out of the build shell's
-environment — the **base image's own**. A placeholder is needed at all because sshd's `SetEnv` *replaces*
+environment — the **image's own** by the time it runs, the base's plus whatever the overlay has set,
+which is how the MACA pair gets `/opt/conda/bin` onto a session's `PATH` (see Trade-offs). A placeholder is needed at all because sshd's `SetEnv` *replaces*
 a session's environment rather than adding to it, so a literal does not extend an image's environment,
 it hides it; and no one literal fits every family, since the stock-derived image needs only its
 conda-first `PATH` while the MACA base's session has to carry the whole vendor toolchain (`PATH`,
@@ -484,7 +485,11 @@ container's own variable by variable.
   into the base (`/opt/mxdriver`) while a Metax node may inject its own; which one wins is untested, and
   the local smoke cannot answer it — that needs a node advertising `metax-tech.com/gpu`. And their python
   is the **vendor's**, which is the point: jupyterlab is installed into that interpreter so the torch
-  that imports is the vendor's metax build, never a second interpreter beside it.
+  that imports is the vendor's metax build, never a second interpreter beside it. The base ships that
+  interpreter beside a system python that has none, and names it only from a login profile, so both
+  overlays put `/opt/conda/bin` on `PATH` themselves — without that, a notebook cell or a
+  non-interactive `ssh host 'python3 …'` reaches the interpreter with no torch while an interactive
+  session works.
 - The workspace PVC mounts at the account's home (`/home/ubuntu` self-authored; `/home/jovyan`
   jupyter, both derived from `spec.runtime.user` — an explicit `spec.storage.mountPath` overrides),
   where the notebook root already lives by default. An empty/root-owned PVC is storage-side (Gap A);
