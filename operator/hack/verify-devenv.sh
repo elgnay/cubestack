@@ -108,7 +108,8 @@ echo "== DevEnvironment e2e: ${NS}/${ENV_NAME} on ${CTX} =="
 # The namespace has to sit at Pod Security Baseline, not Restricted: a
 # namespace that declares spec.storage gets a root init container that takes
 # ownership of the workspace claim, and Restricted rejects root outright. That
-# is a property of hosting DevEnvironments, not of this test.
+# is a property of hosting any DevEnvironment, not of this test — no environment
+# is admitted under Restricted, with spec.storage or without (README).
 kubectl_e2e create ns "${NS}" --dry-run=client -o yaml | kubectl_e2e apply -f - >/dev/null
 kubectl_e2e label ns "${NS}" pod-security.kubernetes.io/enforce=baseline --overwrite >/dev/null
 

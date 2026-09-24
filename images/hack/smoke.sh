@@ -3,14 +3,31 @@
 #
 # No cluster required: runs throwaway containers on 127.0.0.1 with ephemeral
 # ports and fake ssh Secrets, then asserts the operator contract:
-#   ssh-ubuntu22.04   : key-auth ssh login as 'ubuntu' (uid/gid 1000, home
-#                       /home/ubuntu), served host key == mounted Secret public key
-#   jupyter-minimal   : stock-native overlay (user 'jovyan', uid 1000 gid 100,
-#                       /home/jovyan) — JupyterLab behind JUPYTER_TOKEN +
-#                       NOTEBOOK_ARGS base_url, plus sshd-as-'jovyan' when the ssh
-#                       Secret is mounted; both services in the same container
+#   ssh-ubuntu22.04     : key-auth ssh login as 'ubuntu' (uid/gid 1000, home
+#                         /home/ubuntu), served host key == mounted Secret public key
+#   jupyter-minimal     : stock-native overlay (user 'jovyan', uid 1000 gid 100,
+#                         /home/jovyan) — JupyterLab behind JUPYTER_TOKEN +
+#                         NOTEBOOK_ARGS base_url, plus sshd-as-'jovyan' when the ssh
+#                         Secret is mounted; both services in the same container, and
+#                         a root run serves the home the platform derives (/root, or
+#                         the one the spec declares) rather than the /home/root
+#                         docker-stacks' own launcher would relocate it to
+#   jupyter-maca-pytorch: platform layer on the Metax MACA base (user 'ubuntu', uid/gid
+#                         1000, /home/ubuntu) — the same two services and the same
+#                         assertions as jupyter-minimal, plus that the vendor stack
+#                         under /opt/maca is readable by the account that runs it, and
+#                         the same root-home check on an image whose launcher is the
+#                         platform's rather than docker-stacks'
+#   ssh-maca-pytorch    : the same vendor base and platform layer with no JupyterLab at
+#                         all — sshd alone, as CUBESTACK_IMAGE=ssh bakes in. Asserted
+#                         apart from its jupyter sibling precisely on that difference, and
+#                         on the ssh session PATH carrying the vendor toolchain.
 #
-# Both images are also run as **root** (uid 0), the shape an environment takes when
+# Every one of them additionally has its ssh session environment compared against the
+# image's own, which is what keeps the shared sshd drop-in's build-time substitution
+# honest (see check_session_env below).
+#
+# Every image is also run as **root** (uid 0), the shape an environment takes when
 # the spec asks for it, where the host key is mounted 0600 and sshd is root itself.
 # The non-root runs additionally assert that this root support is not a widening:
 # the entrypoint admits root only when sshd is root, so a uid-1000 sshd refuses a
@@ -28,24 +45,33 @@
 # /run/ssh is absolute: outside $HOME, which a workspace claim may cover and make
 # unwritable.
 #
-# Reads IMG_SSH / IMG_JUPYTER from the environment (the Makefile sets them).
-# Usage: hack/smoke.sh [--ssh|--jupyter]    (default: both)
+# Reads IMG_SSH / IMG_JUPYTER / IMG_MACA / IMG_SSH_MACA from the environment (the
+# Makefile sets them).
+# Usage: hack/smoke.sh [--ssh|--jupyter|--maca|--ssh-maca]    (default: all)
 set -euo pipefail
 
 cd "$(dirname "$0")/.." # images/ workspace root
 
-# Fallback tags mirror the Makefile default: TAG is the short commit SHA.
+# Fallback tags mirror the Makefile default: TAG is the short commit SHA, and the MACA pair prefixes
+# it with the vendor axes their published tag carries (MACA_TAG in the Makefile — keep the two in
+# step). Only a direct call reaches these: the Makefile passes every ref it built with.
 TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)}"
 IMG_SSH="${IMG_SSH:-harbor.isuanova.com/suanova/ssh-ubuntu22.04:$TAG}"
 IMG_JUPYTER="${IMG_JUPYTER:-harbor.isuanova.com/suanova/jupyter-minimal:$TAG}"
+IMG_MACA="${IMG_MACA:-harbor.isuanova.com/suanova/jupyter-maca-pytorch:3.9.0.12-py310-torch2.4-$TAG}"
+IMG_SSH_MACA="${IMG_SSH_MACA:-harbor.isuanova.com/suanova/ssh-maca-pytorch:3.9.0.12-py310-torch2.4-$TAG}"
 CONTAINER_TOOL="${CONTAINER_TOOL:-docker}"
 
 run_ssh=1
 run_jupyter=1
+run_maca=1
+run_ssh_maca=1
 case "${1:-}" in
-  --ssh) run_jupyter=0 ;;
-  --jupyter) run_ssh=0 ;;
-  -h | --help) sed -n '2,20p' "$0"; exit 0 ;;
+  --ssh) run_jupyter=0; run_maca=0; run_ssh_maca=0 ;;
+  --jupyter) run_ssh=0; run_maca=0; run_ssh_maca=0 ;;
+  --maca) run_ssh=0; run_jupyter=0; run_ssh_maca=0 ;;
+  --ssh-maca) run_ssh=0; run_jupyter=0; run_maca=0 ;;
+  -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
   "") ;;
   *) echo "cubestack smoke: unknown option '$1'" >&2; exit 1 ;;
 esac
@@ -54,11 +80,15 @@ tmp="$(mktemp -d "${TMPDIR:-/tmp}/cubestack-smoke.XXXXXX")"
 ssh_cont=""
 jup_cont=""
 root_cont=""
+maca_cont=""
+ssh_maca_cont=""
 cleanup() {
   local code=$?
   [ -n "$ssh_cont" ] && "$CONTAINER_TOOL" rm -f "$ssh_cont" >/dev/null 2>&1 || true
   [ -n "$jup_cont" ] && "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
   [ -n "$root_cont" ] && "$CONTAINER_TOOL" rm -f "$root_cont" >/dev/null 2>&1 || true
+  [ -n "$maca_cont" ] && "$CONTAINER_TOOL" rm -f "$maca_cont" >/dev/null 2>&1 || true
+  [ -n "$ssh_maca_cont" ] && "$CONTAINER_TOOL" rm -f "$ssh_maca_cont" >/dev/null 2>&1 || true
   rm -rf "$tmp"
   exit $code
 }
@@ -186,8 +216,9 @@ check_served_host_key() {
 #
 # The login account is the container's, not the image's: root is served whatever
 # account the image was built around. Extra args carry what a family needs to *stay
-# up* as root — the jupyter launcher otherwise drops to its stock account, which the
-# platform prevents with the same environment.
+# up* as root — a stock jupyter launcher otherwise drops to the account the image
+# was built around — and are what the controller injects for a root DevEnvironment,
+# which a bare container has to be given by hand (::withRootLauncherEnv).
 check_root_ssh() {
   local img=$1 base=$2 cont=$3 label=$4 port out
   shift 4
@@ -255,6 +286,129 @@ check_no_root_login() {
   check_contains "$out" "Permission denied" "$label"
 }
 
+# check_session_env <container> <ssh-output> <label> — every variable the image's own sshd
+# drop-in declares must reach an ssh session carrying the image's own value. sshd's SetEnv
+# replaces a session's environment rather than adding to it, so the drop-in is the whole of
+# what a session inherits; and it is a template, filled per image at build time. Comparing
+# the two sides catches both halves at once: a placeholder that never got substituted IS the
+# value, and a declared variable that sshd dropped — it keeps only the first SetEnv line and
+# ignores the rest, without complaint — is simply absent from the session.
+#
+# The names come from the image, not from a list here: an image that starts carrying another
+# variable is covered without this script changing, and one that declares none is a failure
+# rather than a vacuous pass.
+#
+# The session side is read from the output of the login assertions rather than a second ssh
+# call, and the non-interactive form is deliberately the one probed: it runs no profile, so
+# what it reports is SetEnv alone, with no shell startup file able to paper over a wrong
+# value. `docker exec` inherits the container's config environment, so its env is the image's.
+check_session_env() {
+  local name=$1 out=$2 label=$3 decl cenv pair var sess cont lost=0
+  decl="$("$CONTAINER_TOOL" exec "$name" sh -c \
+    'sed -n "s/^SetEnv //p" /etc/ssh/sshd_config.d/10-devenv.conf' 2>/dev/null || true)"
+  cenv="$("$CONTAINER_TOOL" exec "$name" sh -c 'env' 2>/dev/null || true)"
+
+  if [ -z "$decl" ]; then
+    bad "$label the image's sshd drop-in declares no session environment"
+    return 0
+  fi
+
+  for pair in $decl; do
+    var="${pair%%=*}"
+    sess="$(printf '%s\n' "$out" | sed -n "s/^envv:$var=//p")"
+    cont="$(printf '%s\n' "$cenv" | sed -n "s/^$var=//p")"
+    if [ -z "$sess" ] || [ "$sess" != "$cont" ]; then
+      lost=1
+      bad "$label ssh session $var differs from the image's"
+      echo "        session: ${sess:-<absent>}"
+      echo "        image:   ${cont:-<unset>}"
+    fi
+  done
+  if [ "$lost" = 0 ]; then
+    ok "$label ssh session environment == the image's own"
+  fi
+}
+
+# check_maca_readable <container> <label> — the vendor stack is what these images exist for,
+# and the base was built as root: a library under /opt/maca that uid 1000 cannot read fails
+# at runtime, on a GPU node, with no build-time signal. Readable-by-the-account is checkable
+# here without a GPU, so it is checked.
+#
+# Two traps this walks around. /opt/maca is a SYMLINK to /opt/maca-<version>, and find does
+# not descend a symlinked start point — hence the trailing slash, without which both checks
+# below find an empty tree, the first failing while the second passes vacuously. And `find
+# -readable` is GNU's; the base is Ubuntu. Ran without --user: `docker exec` then uses the
+# image's own USER, which is the account in question. The two are asserted apart so that an
+# unreadable /opt/maca — which would make the find itself report nothing — cannot pass as a
+# clean tree.
+check_maca_readable() {
+  local name=$1 label=$2 nlibs unreadable
+  nlibs="$("$CONTAINER_TOOL" exec "$name" sh -c 'find /opt/maca/ -name "*.so*" 2>/dev/null | wc -l' 2>/dev/null || echo 0)"
+  if [ "${nlibs:-0}" -gt 0 ]; then
+    ok "$label vendor MACA stack visible to uid 1000 ($nlibs shared objects under /opt/maca)"
+  else
+    bad "$label no shared objects under /opt/maca/ as uid 1000: missing, or not traversable by the account"
+  fi
+  unreadable="$("$CONTAINER_TOOL" exec "$name" sh -c 'find /opt/maca/ -name "*.so*" ! -readable 2>/dev/null | head -n 3' 2>/dev/null || true)"
+  if [ -z "$unreadable" ] && [ "${nlibs:-0}" -gt 0 ]; then
+    ok "$label every MACA shared object readable by uid 1000"
+  else
+    bad "$label MACA shared objects not readable by uid 1000: ${unreadable:-none listed}"
+  fi
+}
+
+# check_jupyter_home <image> <home> <label> [extra run args...]
+#
+# The home a jupyter container actually runs with, and the directory its notebook serves — the same
+# directory twice, since jupyter writes its runtime files *under $HOME* and serves its working
+# directory. Both are the launcher's to decide as much as the image's, and both are baked into the
+# one report the server writes at startup, <home>/.local/share/jupyter/runtime/jpserver-<pid>.json:
+# its root_dir is what `jupyter server list` prints. A launcher that moves the home but not the
+# notebook is the failure this catches, so it is asserted on, and neither read of it is enough alone.
+#
+# The run reproduces the shape the operator creates — a writable directory where the workspace claim
+# goes, which is a tmpfs here so that a container running as root writes nothing on the host:
+#
+#   - with no HOME in the environment, the image's baked value is still in place — the underived
+#     case, where the platform mounts the claim at the home the *identity* implies;
+#   - with HOME passed, that is what the claim was mounted at, and the launcher must not override
+#     it — a home the spec declared is a statement about where the container will look.
+#
+# uid 0 throughout, since this is the root branch's check, and no Secret is mounted, so sshd never
+# starts and the run is the launcher alone.
+check_jupyter_home() {
+  local img=$1 home=$2 label=$3 info=""
+  shift 3
+  # Named under root_cont like the other root-mode containers, so the EXIT trap owns it too.
+  root_cont="cs-smoke-jup-home-$$"
+  "$CONTAINER_TOOL" run -d --name "$root_cont" \
+    --user 0:0 \
+    -e JUPYTER_TOKEN=testtoken \
+    -e NOTEBOOK_ARGS="--allow-root" \
+    --tmpfs "$home" \
+    "$@" \
+    "$img" >/dev/null
+  # The report lives inside the runtime directory, so waiting for it waits for both: a server that
+  # is still starting has written neither.
+  for _ in $(seq 1 120); do
+    info="$("$CONTAINER_TOOL" exec "$root_cont" \
+      sh -c "cat $home/.local/share/jupyter/runtime/jpserver-*.json 2>/dev/null" || true)"
+    case "$info" in
+      *"\"root_dir\": \"$home\""*) break ;;
+    esac
+    info=""
+    sleep 1
+  done
+  if [ -n "$info" ]; then
+    ok "$label"
+  else
+    bad "$label (jupyter does not report $home as the directory it serves)"
+    "$CONTAINER_TOOL" logs "$root_cont" 2>&1 | tail -n 20
+  fi
+  "$CONTAINER_TOOL" rm -f "$root_cont" >/dev/null 2>&1 || true
+  root_cont=""
+}
+
 # ---------------------------------------------------------------------------
 # ssh-ubuntu22.04
 # ---------------------------------------------------------------------------
@@ -283,13 +437,15 @@ if [ "$run_ssh" = 1 ]; then
     -o BatchMode=yes -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
     ubuntu@127.0.0.1 \
-    'printf "uid=%s gid=%s home=%s pwd=%s\n" "$(id -u)" "$(id -gn)" "$HOME" "$PWD"' \
+    'printf "uid=%s gid=%s home=%s pwd=%s\n" "$(id -u)" "$(id -gn)" "$HOME" "$PWD"; env | sed "s/^/envv:/"' \
     2>&1 || true)"
 
   check_contains "$out" "uid=1000" "ssh key-auth login as uid 1000"
   check_contains "$out" "gid=ubuntu" "ssh login primary group 'ubuntu'"
   check_contains "$out" "home=/home/ubuntu" "ssh login HOME=/home/ubuntu"
   check_contains "$out" "pwd=/home/ubuntu" "ssh login cwd=/home/ubuntu"
+
+  check_session_env "$ssh_cont" "$out" "ssh"
 
   check_served_host_key "$ssh_port" "$tmp/ssh/host/ssh_host_ed25519_key.pub" \
     "$ssh_cont" "served host key == mounted Secret public key"
@@ -387,10 +543,12 @@ if [ "$run_jupyter" = 1 ]; then
     -o BatchMode=yes -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
     jovyan@127.0.0.1 \
-    'printf "uid=%s home=%s pwd=%s\n" "$(id -u)" "$HOME" "$PWD"' \
+    'printf "uid=%s home=%s pwd=%s\n" "$(id -u)" "$HOME" "$PWD"; env | sed "s/^/envv:/"' \
     2>&1 || true)"
   check_contains "$out" "uid=1000" "jupyter ssh key-auth login as uid 1000"
   check_contains "$out" "home=/home/jovyan" "jupyter ssh login HOME=/home/jovyan"
+
+  check_session_env "$jup_cont" "$out" "jupyter"
 
   check_served_host_key "$jup_ssh_port" "$tmp/jupssh/host/ssh_host_ed25519_key.pub" \
     "$jup_cont" "jupyter served host key == mounted Secret public key"
@@ -408,13 +566,237 @@ if [ "$run_jupyter" = 1 ]; then
   "$CONTAINER_TOOL" rm -f "$jup_cont" >/dev/null 2>&1 || true
   jup_cont=""
 
-  # The launcher's own price for running as root, which the platform leaves to the
-  # spec (runtime.env) rather than the image. Without them start.sh drops back to the
-  # stock account, and a launcher that exits takes the sshd it started with it, so the
-  # login below would never be attempted against a live container.
+  # What the controller injects for a root DevEnvironment (::withRootLauncherEnv), which a bare
+  # container has no controller to receive: the login below is only attempted against a live
+  # container, and a launcher that exits takes the sshd it started with it. This image's launcher
+  # does not consult them — uid 0 leaves the stock start.sh out of the chain entirely (see
+  # images/jupyter/start-jupyter.sh) — but the run carries them because the pod does, and without
+  # them a *stock* jupyter image still drops back to the account it was built around. NB_GID is the
+  # account's own gid and not the pod's: start.sh rewrites the account when the two disagree, and
+  # that rewrite cannot succeed for root.
   check_root_ssh "$IMG_JUPYTER" "$tmp/juproot" "cs-smoke-juproot-$$" "jupyter-minimal as root" \
     -e NB_USER=root -e NB_UID=0 -e NB_GID=0 \
     -e NOTEBOOK_ARGS="--allow-root"
+
+  # The root branch this image's launcher owns: root's own home, which is the one the platform
+  # derives for a root environment and mounts the claim at, and a declared HOME left standing.
+  check_jupyter_home "$IMG_JUPYTER" /root \
+    "jupyter-minimal as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_JUPYTER" /workspace/home \
+    "jupyter-minimal as root: a declared HOME is served instead" \
+    -e HOME=/workspace/home
+fi
+
+# ---------------------------------------------------------------------------
+# jupyter-maca-pytorch (platform layer on the Metax MACA base: jupyter + sshd)
+#
+# Same contract and the same assertions as jupyter-minimal — the overlay is what differs,
+# not the operator-facing behaviour it has to satisfy: 'ubuntu' 1000:1000 and /home/ubuntu
+# instead of the stock 'jovyan' 1000:100 and /home/jovyan, because the shared sshd drop-in
+# is a non-root configuration and can only serve the uid it runs as.
+# ---------------------------------------------------------------------------
+if [ "$run_maca" = 1 ]; then
+  echo "== smoke: $IMG_MACA (jupyter-maca-pytorch) =="
+  maca_cont="cs-smoke-maca-$$"
+  base="/dev/ns/env"
+  make_secret "$tmp/macassh"
+  ensure_mount_readable "$IMG_MACA" "$tmp/macassh/host/ssh_host_ed25519_key"
+
+  "$CONTAINER_TOOL" run -d --name "$maca_cont" \
+    --user 1000:1000 \
+    -p 127.0.0.1::8888 \
+    -p 127.0.0.1::2222 \
+    -e JUPYTER_TOKEN=testtoken \
+    -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
+    -v "$tmp/macassh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$tmp/macassh/keys:/run/ssh:ro" \
+    "$IMG_MACA" >/dev/null
+  # See the ssh block: a stopped container makes `docker port` fail, which must not
+  # abort the run before the Jupyter checks and the summary.
+  maca_port="$("$CONTAINER_TOOL" port "$maca_cont" 8888 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
+  maca_ssh_port="$("$CONTAINER_TOOL" port "$maca_cont" 2222 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
+
+  printf "  waiting for JupyterLab"
+  up=0
+  for _ in $(seq 1 120); do
+    if curl -fsS -o /dev/null "http://127.0.0.1:$maca_port$base/api/status?token=testtoken" 2>/dev/null; then
+      up=1
+      break
+    fi
+    printf "."
+    sleep 1
+  done
+  echo
+  if [ "$up" = 1 ]; then
+    ok "maca jupyter /api/status with token -> 200"
+  else
+    bad "maca jupyter did not become reachable within 120s"
+    "$CONTAINER_TOOL" logs "$maca_cont" 2>&1 | tail -n 30
+  fi
+
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$maca_port$base/api/status")"
+  case "$code" in
+    401 | 403) ok "maca no token rejected (HTTP $code)" ;;
+    *) bad "maca no-token request expected 401/403, got $code" ;;
+  esac
+
+  code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$maca_port/api/status?token=testtoken")"
+  if [ "$code" = 404 ]; then
+    ok "maca base_url prefix enforced (root path -> 404)"
+  else
+    bad "maca root path without base_url expected 404, got $code"
+  fi
+
+  html="$(curl -fsSL "http://127.0.0.1:$maca_port$base/?token=testtoken" 2>/dev/null || true)"
+  check_contains "$html" "jupyter-config-data" "maca lab HTML served on base_url path"
+
+  id_out="$("$CONTAINER_TOOL" exec "$maca_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
+  if [ "$id_out" = "1000 1000" ]; then
+    ok "maca container runs as uid 1000 gid 1000"
+  else
+    bad "maca expected '1000 1000', got '$id_out'"
+  fi
+
+  check_maca_readable "$maca_cont" "maca"
+
+  # sshd on the same container (ssh Secret mounted -> ssh.enabled).
+  wait_ssh "$maca_ssh_port" 30 "$maca_cont" ||
+    bad "maca sshd served no host key on port $maca_ssh_port within 30s"
+
+  out="$(ssh -i "$tmp/macassh/client/id_ed25519" \
+    -p "$maca_ssh_port" \
+    -o BatchMode=yes -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    ubuntu@127.0.0.1 \
+    'printf "uid=%s gid=%s home=%s pwd=%s\n" "$(id -u)" "$(id -gn)" "$HOME" "$PWD"; env | sed "s/^/envv:/"' \
+    2>&1 || true)"
+  check_contains "$out" "uid=1000" "maca ssh key-auth login as uid 1000"
+  check_contains "$out" "gid=ubuntu" "maca ssh login primary group 'ubuntu'"
+  check_contains "$out" "home=/home/ubuntu" "maca ssh login HOME=/home/ubuntu"
+  check_contains "$out" "pwd=/home/ubuntu" "maca ssh login cwd=/home/ubuntu"
+
+  check_session_env "$maca_cont" "$out" "maca"
+  # The user-facing half of the same fact: the vendor toolchain that exists ONLY under
+  # /opt/maca/bin (mcTracer, mcclras, macainfo, mxvs, ...) is reachable over ssh. mx-smi is
+  # deliberately not the check — the vendor also symlinks it into /usr/bin, so it resolves
+  # even under a wrong PATH and would prove nothing.
+  check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/maca/bin" \
+    "maca ssh session PATH carries the MACA toolchain"
+
+  check_served_host_key "$maca_ssh_port" "$tmp/macassh/host/ssh_host_ed25519_key.pub" \
+    "$maca_cont" "maca served host key == mounted Secret public key"
+
+  if ! case "$out" in *"uid=1000"*) true ;; *) false ;; esac; then
+    echo "  container logs:"
+    "$CONTAINER_TOOL" logs "$maca_cont" 2>&1 | tail -n 20
+    echo "  mounted files as the container sees them:"
+    "$CONTAINER_TOOL" exec --user 0 "$maca_cont" ls -ln \
+      /etc/ssh/ssh_host_ed25519_key /run/ssh/authorized_keys 2>&1 || true
+  fi
+  "$CONTAINER_TOOL" rm -f "$maca_cont" >/dev/null 2>&1 || true
+  maca_cont=""
+
+  # Running as root costs this image one flag: jupyter-server refuses to start as root without
+  # --allow-root. The controller injects it for a root DevEnvironment (::withRootLauncherEnv),
+  # and a bare container has no controller, so the run is handed what the pod would carry —
+  # this launcher reads NOTEBOOK_ARGS and none of the NB_* trio. A launcher that exits takes
+  # the sshd it started with it, so the login below would otherwise never be attempted
+  # against a live container.
+  check_root_ssh "$IMG_MACA" "$tmp/macaroot" "cs-smoke-macaroot-$$" \
+    "jupyter-maca-pytorch as root" \
+    -e NOTEBOOK_ARGS="--allow-root"
+
+  # Where a root environment's workspace is. This image bakes the uid-1000 account's home, so the
+  # launcher has to decide this itself: a root container's own home is /root, the one the platform
+  # derives for runAsUser: 0 and mounts the claim at. Both halves are asserted — the derived home,
+  # and the declared one the launcher must leave standing, since that is where the claim really is
+  # when a spec names it.
+  check_jupyter_home "$IMG_MACA" /root \
+    "maca as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_MACA" /workspace/home \
+    "maca as root: a declared HOME is served instead" \
+    -e HOME=/workspace/home
+fi
+
+# ---------------------------------------------------------------------------
+# ssh-maca-pytorch (the same vendor base and platform layer, with sshd alone)
+#
+# Its jupyter sibling serves both services from one container; this one serves only sshd,
+# because CUBESTACK_IMAGE=ssh is baked in and the entrypoint's ssh branch never reaches
+# the image CMD. That difference is what is asserted here rather than the shared contract
+# again — chiefly that no JupyterLab exists to run.
+# ---------------------------------------------------------------------------
+if [ "$run_ssh_maca" = 1 ]; then
+  echo "== smoke: $IMG_SSH_MACA (ssh-maca-pytorch) =="
+  ssh_maca_cont="cs-smoke-ssh-maca-$$"
+  make_secret "$tmp/sshmacassh"
+  ensure_mount_readable "$IMG_SSH_MACA" "$tmp/sshmacassh/host/ssh_host_ed25519_key"
+
+  # Only 2222 is published: this image declares no 8888, and nothing serves there.
+  "$CONTAINER_TOOL" run -d --name "$ssh_maca_cont" \
+    --user 1000:1000 \
+    -p 127.0.0.1::2222 \
+    -v "$tmp/sshmacassh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$tmp/sshmacassh/keys:/run/ssh:ro" \
+    "$IMG_SSH_MACA" >/dev/null
+  # See the ssh block: a stopped container makes `docker port` fail, which must not abort
+  # the run before the checks below and the summary.
+  ssh_maca_port="$("$CONTAINER_TOOL" port "$ssh_maca_cont" 2222 2>/dev/null | head -n1 | sed 's/^.*://' || true)"
+
+  wait_ssh "$ssh_maca_port" 30 "$ssh_maca_cont" ||
+    bad "ssh-maca sshd served no host key on port $ssh_maca_port within 30s"
+
+  out="$(ssh -i "$tmp/sshmacassh/client/id_ed25519" \
+    -p "$ssh_maca_port" \
+    -o BatchMode=yes -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes \
+    ubuntu@127.0.0.1 \
+    'printf "uid=%s gid=%s home=%s pwd=%s\n" "$(id -u)" "$(id -gn)" "$HOME" "$PWD"; env | sed "s/^/envv:/"' \
+    2>&1 || true)"
+  check_contains "$out" "uid=1000" "ssh-maca ssh key-auth login as uid 1000"
+  check_contains "$out" "gid=ubuntu" "ssh-maca ssh login primary group 'ubuntu'"
+  check_contains "$out" "home=/home/ubuntu" "ssh-maca ssh login HOME=/home/ubuntu"
+  check_contains "$out" "pwd=/home/ubuntu" "ssh-maca ssh login cwd=/home/ubuntu"
+
+  check_session_env "$ssh_maca_cont" "$out" "ssh-maca"
+  # The user-facing half of the same fact, and the reason an ssh-only image on this base
+  # exists at all: the vendor toolchain that lives ONLY under /opt/maca/bin (mcTracer,
+  # mcclras, macainfo, mxvs, ...) is reachable over ssh.
+  check_contains "$(printf '%s\n' "$out" | sed -n 's/^envv:PATH=//p')" "/opt/maca/bin" \
+    "ssh-maca ssh session PATH carries the MACA toolchain"
+
+  # The property that makes this a separate image rather than a copy of its sibling. The
+  # vendor base ships no JupyterLab and this Dockerfile installs none, so finding one means
+  # the jupyter sibling's pip step was copied across — which would silently make an
+  # ssh-type environment run a second, unprobed service.
+  jl="$("$CONTAINER_TOOL" exec "$ssh_maca_cont" sh -c 'command -v jupyter-lab || true' 2>/dev/null || true)"
+  if [ -z "$jl" ]; then
+    ok "no JupyterLab in the image (sshd alone, as its baked mode declares)"
+  else
+    bad "JupyterLab present at $jl: this image is meant to serve sshd alone"
+  fi
+
+  check_maca_readable "$ssh_maca_cont" "ssh-maca"
+
+  check_served_host_key "$ssh_maca_port" "$tmp/sshmacassh/host/ssh_host_ed25519_key.pub" \
+    "$ssh_maca_cont" "ssh-maca served host key == mounted Secret public key"
+
+  if ! case "$out" in *"uid=1000"*) true ;; *) false ;; esac; then
+    echo "  container logs:"
+    "$CONTAINER_TOOL" logs "$ssh_maca_cont" 2>&1 | tail -n 20
+    echo "  mounted files as the container sees them:"
+    "$CONTAINER_TOOL" exec --user 0 "$ssh_maca_cont" ls -ln \
+      /etc/ssh/ssh_host_ed25519_key /run/ssh/authorized_keys 2>&1 || true
+  fi
+  "$CONTAINER_TOOL" rm -f "$ssh_maca_cont" >/dev/null 2>&1 || true
+  ssh_maca_cont=""
+
+  # Same root contract as the CPU ssh image, and the only thing the shared drop-in and the
+  # entrypoint's runtime root entry need in order to work here: /run/sshd, which this Dockerfile
+  # ships. An ssh-only image has no launcher to keep alive either — the entrypoint execs sshd,
+  # which is what the login below reaches.
+  check_root_ssh "$IMG_SSH_MACA" "$tmp/sshmacaroot" "cs-smoke-sshmacaroot-$$" \
+    "ssh-maca-pytorch as root"
 fi
 
 echo

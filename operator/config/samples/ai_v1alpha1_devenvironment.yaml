@@ -101,9 +101,11 @@ spec:
     # The account the container runs as — the one the image's sshd serves, and the
     # account the ssh endpoint advertises. Omit it for the platform default "user";
     # set it to the image's own account: "ubuntu" for the self-authored images
-    # (ssh-ubuntu22.04, base-cuda, base-maca), "jovyan" for the stock-derived
-    # jupyter-minimal (which also needs securityContext.runAsGroup: 100, its stock
-    # gid — the platform default is 1000).
+    # (ssh-ubuntu22.04, base-cuda), "jovyan" for the stock-derived jupyter-minimal
+    # (which also needs securityContext.runAsGroup: 100, its stock gid — the
+    # platform default is 1000). The MACA images use "ubuntu" as well: the vendor
+    # package they are built on ships no account at all, so their overlay creates
+    # that one at 1000:1000.
     user: ubuntu
     env:
       - name: MODEL_REPO

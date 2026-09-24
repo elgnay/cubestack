@@ -129,9 +129,9 @@ const (
 	reasonScheduled              = "Scheduled"
 	reasonNotScheduled           = "NotScheduled"
 	reasonNotCreated             = "PodNotCreated"
-	reasonNotApplicable          = "NotApplicable"
+	reasonAccepted               = "Accepted"
+	reasonOverridden             = "Overridden"
 	reasonBrandMismatch          = "BrandMismatch"
-	reasonBrandValid             = "BrandMatchValid"
 	reasonNotebookArgsUnusable   = "NotebookArgsUnusable"
 	reasonPublished              = "Published"
 	reasonGatewayNotFound        = "GatewayNotFound"
@@ -249,6 +249,23 @@ const (
 	// the template it was rolled onto.
 	sshMountContractVersion = "dir-items-1"
 
+	// podSecurityContextVersion names the shape of the pod-level security context
+	// (see desiredPodSpec) for the same reason: the seccomp profile is a constant
+	// that stsSpecHash's hand-assembled input cannot see, and a pod only acquires
+	// it at creation. Without a version the hash can see, adding the profile
+	// leaves every environment created before it running unprofiled, and nothing
+	// else in the template changes, so no later reconcile would roll them.
+	podSecurityContextVersion = "seccomp-runtime-default-1"
+
+	// rootLauncherEnvVersion names the shape of the launcher environment the
+	// controller injects into a root Jupyter environment (see withRootLauncherEnv),
+	// for the same reason again: what it injects is a constant, so nothing else in
+	// the hash input moves when the injection is added and an environment created
+	// before it would keep a template whose launcher never starts. An environment
+	// that cannot receive the injection contributes nothing (::stsSpecHash), so only
+	// the ones that can are rolled.
+	rootLauncherEnvVersion = "root-launcher-env-1"
+
 	// defaultRuntimeUser is the account an environment logs in as when
 	// spec.runtime.user names none; it is also the account the platform's base
 	// images conventionally use.
@@ -284,6 +301,24 @@ const (
 	notebookArgsEnv     = "NOTEBOOK_ARGS"
 	notebookBaseURLFlag = "--ServerApp.base_url="
 
+	// The launcher settings a Jupyter environment running as root needs, which
+	// the controller supplies rather than the spec (::withRootLauncherEnv):
+	// docker-stacks' start.sh reads the account it should serve from NB_USER and
+	// the uid/gid to serve it as from NB_UID/NB_GID, and Jupyter Server refuses
+	// to start as root without --allow-root.
+	nbUserEnv = "NB_USER"
+	nbUIDEnv  = "NB_UID"
+	nbGIDEnv  = "NB_GID"
+
+	// rootAccountUID and rootAccountGID are root's identity in the image's own
+	// passwd database, and are what NB_UID and NB_GID name. They are deliberately
+	// not the identity the pod runs as, which spec.runtime.securityContext decides
+	// (::withRootLauncherEnv).
+	rootAccountUID = "0"
+	rootAccountGID = "0"
+
+	notebookAllowRootFlag = "--allow-root"
+
 	// jupyterTokenRevisionAnnotationKey records a non-sensitive sha256 digest of
 	// the managed Jupyter token on the StatefulSet pod template. JUPYTER_TOKEN
 	// is read from the Secret at container start, so a refilled token must roll
@@ -316,6 +351,12 @@ const (
 	// any more; an environment created by that manager still carries it, and it
 	// is dropped during reconcile rather than left on status forever.
 	legacyStorageReadyCondition = "StorageReady"
+
+	// legacyBrandMatchValidCondition is the brand gate's own condition before it
+	// was folded into Accepted (::specFindings). It covers one of the findings
+	// Accepted now reports, so it can no longer be set or cleared; an environment
+	// reconciled before the fold still carries it, and it is dropped the same way.
+	legacyBrandMatchValidCondition = "BrandMatchValid"
 )
 
 // DevEnvironmentReconciler provisions the managed StatefulSet (scale 0/1),
@@ -339,8 +380,8 @@ type DevEnvironmentReconciler struct {
 	APIReader client.Reader
 }
 
-// Reconcile runs the DevEnvironment pipeline: brand match gate, SSH secret,
-// core resources, gateway routes (best-effort), then pod/PVC observation and
+// Reconcile runs the DevEnvironment pipeline: spec gate, SSH secret, core
+// resources, gateway routes (best-effort), then pod/PVC observation and
 // status aggregation.
 func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var env aiv1alpha1.DevEnvironment
@@ -377,63 +418,45 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// StorageReady is no longer part of the API (the workspace claim's lifecycle
 	// moved to the StatefulSet), so a condition left on status by the manager
 	// that still reported it would never be updated again. Drop it here, before
-	// any path below writes status.
+	// any path below writes status. BrandMatchValid is retired the same way: the
+	// gate it reported is one of the findings Accepted now carries
+	// (::specFindings), and nothing can set or clear it any more either.
 	meta.RemoveStatusCondition(&desired.Status.Conditions, legacyStorageReadyCondition)
+	meta.RemoveStatusCondition(&desired.Status.Conditions, legacyBrandMatchValidCondition)
 
-	// 1. Brand match gate: the requested GPU vendor must match the image brand. A
-	// mismatch is a hard failure — nothing is provisioned (design §4.2). An
-	// environment that was running before the image or vendor changed is withdrawn
-	// so the Failed phase reflects reality: the workload is stopped and the routes
-	// removed. An environment requesting no GPU is exempt: with no accelerator
-	// there is no brand to match, which is what makes a CPU image usable at all.
-	if reason := brandMismatchReason(&env); reason != "" {
+	// 1. Spec gate: every place the controller resolves a field itself rather
+	// than applying the spec as written (::specFindings). A finding only the user
+	// can clear is a hard failure — nothing is provisioned (design §4.2), and an
+	// environment that was running before its spec changed is withdrawn so the
+	// Failed phase reflects reality: the workload is stopped and the routes
+	// removed. A finding the controller resolved is reported on the same condition
+	// without blocking, because the environment runs with the controller's value.
+	findings := specFindings(&env)
+	if blocking := mustUpdateFindings(findings); len(blocking) > 0 {
 		if err := r.stopCompute(ctx, &env); err != nil {
 			return ctrl.Result{}, err
 		}
 		if err := r.deleteRoutes(ctx, &env); err != nil {
 			return ctrl.Result{}, err
 		}
-		setBrandMatchValidCondition(&desired.Status.Conditions, false, reasonBrandMismatch, reason)
+		// The phase and Ready name the first finding, as each gate did on its own
+		// before they were folded together; Accepted carries every one of them.
+		setAcceptedCondition(&desired.Status.Conditions, metav1.ConditionFalse, blocking[0].reason, findingsMessage(blocking))
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
 		desired.Status.Endpoints = nil
-		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonBrandMismatch)
-		setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonBrandMismatch, reason)
+		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, blocking[0].reason)
+		setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, blocking[0].reason, blocking[0].detail)
 		if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
 			return ctrl.Result{}, err
 		}
 		r.emitLifecycleTransition(&env, desired)
 		return ctrl.Result{}, nil
 	}
-	if _, _, ok := desiredGPU(&env); !ok {
-		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonNotApplicable, "no GPU requested; image brand not checked")
+	if len(findings) == 0 {
+		setAcceptedCondition(&desired.Status.Conditions, metav1.ConditionTrue, reasonAccepted, "every spec field is applied as written")
 	} else {
-		setBrandMatchValidCondition(&desired.Status.Conditions, true, reasonBrandValid, "gpu vendor matches the image brand")
-	}
-
-	// 1b. Notebook path gate: the controller owns the prefix a jupyter
-	// environment's route publishes and has to be able to tell the notebook to
-	// serve it. An environment that hides NOTEBOOK_ARGS behind a valueFrom
-	// source cannot be told, so it is refused like a brand mismatch rather than
-	// published with an address that 404s — nothing is provisioned, and an
-	// environment that was running is withdrawn.
-	if reason := unsupportedNotebookArgsReason(&env); reason != "" {
-		if err := r.stopCompute(ctx, &env); err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := r.deleteRoutes(ctx, &env); err != nil {
-			return ctrl.Result{}, err
-		}
-		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
-		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
-		desired.Status.Endpoints = nil
-		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonNotebookArgsUnusable)
-		setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonNotebookArgsUnusable, reason)
-		if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
-			return ctrl.Result{}, err
-		}
-		r.emitLifecycleTransition(&env, desired)
-		return ctrl.Result{}, nil
+		setAcceptedCondition(&desired.Status.Conditions, metav1.ConditionTrue, reasonOverridden, findingsMessage(findings))
 	}
 
 	// 2. SSH secrets: a managed host keypair and the authorized_keys source when
@@ -908,33 +931,47 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 	return false, err
 }
 
-// brandMarker is the token every image of a vendor must carry in its name
-// (design §4.2). Like vendorResource it is total, so an unresolvable vendor
-// produces a mismatch rather than silently switching the gate off — the two
-// mappings have to agree about which vendors exist.
-func brandMarker(vendor aiv1alpha1.AcceleratorVendor) string {
+// brandRule is vendor's image-naming rule (design §4.2): the predicate an image
+// reference has to satisfy, and the phrase naming it in a mismatch message.
+//
+// The rule is the vendor's own token — "cuda" for nvidia, "maca" for metax —
+// anywhere in the reference. nvidia products are self-built and spell it out in
+// "base-cuda"; metax products are mirrored from the upstream Metax library under
+// each package's own name: maca, maca-pytorch, maca-tensorflow. The two rules are
+// deliberately the same shape, so the gate reads as one question — does the image
+// name its vendor? — rather than a different check per vendor.
+//
+// Like vendorResource it is total, and for the same reason: an unresolvable
+// vendor resolves to the metax rule rather than falling out of the switch and
+// disabling the gate. Along the DevEnvironment path desiredGPU has already
+// resolved the vendor, so only the two literals reach here; the default covers
+// a half-filled or hand-built spec, as vendorResource's does.
+func brandRule(vendor aiv1alpha1.AcceleratorVendor) (matches func(image string) bool, want string) {
 	switch vendor {
 	case aiv1alpha1.AcceleratorVendorNvidia:
-		return "base-cuda"
+		return func(image string) bool { return strings.Contains(image, "cuda") },
+			`an image containing "cuda"`
 	default:
-		return "base-maca"
+		return func(image string) bool { return strings.Contains(image, "maca") },
+			`an image containing "maca"`
 	}
 }
 
 // brandMismatchReason returns a non-empty message when the requested GPU vendor
-// does not match the image brand: nvidia <-> base-cuda and metax <-> base-maca
-// (design §4.2). Custom images must carry their brand marker in the name
-// (P1 baseline). An environment that requests no GPU has no brand to match, so
-// it is exempt — which is what lets a CPU-only environment run a CPU image.
+// does not match the image brand (design §4.2). Custom images must satisfy
+// their vendor's naming rule. An environment that requests no GPU has no brand
+// to match, so it is exempt — which is what lets a CPU-only environment run a
+// CPU image.
 func brandMismatchReason(env *aiv1alpha1.DevEnvironment) string {
 	vendor, _, ok := desiredGPU(env)
 	if !ok {
 		return ""
 	}
-	if marker := brandMarker(vendor); !strings.Contains(strings.ToLower(env.Spec.Image), marker) {
-		return fmt.Sprintf("image %q does not match gpu.vendor %s (expected a %s image); omit spec.resources.gpu for a CPU-only environment", env.Spec.Image, vendor, marker)
+	matches, want := brandRule(vendor)
+	if matches(strings.ToLower(env.Spec.Image)) {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("image %q does not match gpu.vendor %s (expected %s); omit spec.resources.gpu for a CPU-only environment", env.Spec.Image, vendor, want)
 }
 
 // sshExposed reports whether SSH access is exposed: the ssh container type is
@@ -1256,8 +1293,11 @@ func desiredSecurityContext(rt *aiv1alpha1.RuntimeSpec) *corev1.SecurityContext 
 // drops the setgid bit. It is not privileged, cannot escalate, and reaches no
 // host path. Note that a namespace enforcing the Restricted Pod Security
 // Standard rejects exactly this — root and any capability beyond
-// NET_BIND_SERVICE — so a namespace hosting DevEnvironments has to be at
-// Baseline, where these three are among the capabilities that remain allowed.
+// NET_BIND_SERVICE — so a namespace hosting an environment with spec.storage
+// has to be at Baseline, where these three are among the capabilities that
+// remain allowed. Dropping the init container would not buy Restricted: an
+// environment without storage is refused there too, for what the main container
+// leaves undeclared (README).
 // An RDMA environment raises that floor to Privileged: IPC_LOCK is outside
 // Baseline's allowed set, and a RoCE one adds hostNetwork, which both Baseline
 // and Restricted forbid outright (spec.network.rdmaEnabled).
@@ -1419,6 +1459,14 @@ func declaredHome(env *aiv1alpha1.DevEnvironment) string {
 	return home
 }
 
+// isNotebookBaseURLArg reports whether one whitespace-separated NOTEBOOK_ARGS
+// argument carries the prefix flag the controller owns. The render path and the
+// report of what it dropped share it, so the two cannot disagree about which
+// arguments the controller replaces (::withNotebookBaseURL, ::specFindings).
+func isNotebookBaseURLArg(arg string) bool {
+	return strings.HasPrefix(arg, notebookBaseURLFlag)
+}
+
 // withNotebookBaseURL merges notebookBaseURLFlag+path into the environment's
 // NOTEBOOK_ARGS, adding the variable when the environment declares none.
 //
@@ -1442,13 +1490,92 @@ func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 		if v.Name != notebookArgsEnv {
 			continue
 		}
-		kept := slices.DeleteFunc(strings.Fields(v.Value), func(arg string) bool {
-			return strings.HasPrefix(arg, notebookBaseURLFlag)
-		})
+		kept := slices.DeleteFunc(strings.Fields(v.Value), isNotebookBaseURLArg)
 		envVars[i].Value = strings.TrimSpace(strings.Join(append(kept, notebookBaseURLFlag+path), " "))
 		return envVars
 	}
 	return append(envVars, corev1.EnvVar{Name: notebookArgsEnv, Value: notebookBaseURLFlag + path})
+}
+
+// rootLauncherEnvNeeded reports whether the environment is one the controller
+// supplies the launcher's own root settings for (::withRootLauncherEnv). The
+// render path and stsSpecHash share it, so the digest that rolls an environment
+// onto the injected shape covers exactly the environments that receive it.
+func rootLauncherEnvNeeded(env *aiv1alpha1.DevEnvironment) bool {
+	return env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter &&
+		*desiredSecurityContext(env.Spec.Runtime).RunAsUser == 0
+}
+
+// isRootLauncherEnvName reports whether a spec.runtime.env entry names one of
+// the launcher settings the controller supplies on a root environment. The
+// render path and the report of what it dropped share it, so the two cannot
+// disagree about which names the controller owns (::withRootLauncherEnv,
+// ::specFindings).
+func isRootLauncherEnvName(name string) bool {
+	switch name {
+	case nbUserEnv, nbUIDEnv, nbGIDEnv:
+		return true
+	}
+	return false
+}
+
+// withRootLauncherEnv supplies what a Jupyter launcher needs when the container
+// runs as root, so that spec.runtime.securityContext alone decides whether an
+// environment runs as root.
+//
+// docker-stacks' start.sh treats uid 0 as a startup mode: it reads the account to
+// serve from NB_USER and the identity to serve it as from NB_UID/NB_GID, and with
+// the three unset it drops back to the image's stock account — an environment the
+// platform runs as, and advertises as, root would serve jovyan instead. Jupyter
+// Server refuses to start as root without --allow-root, and a launcher that exits
+// takes the sshd the entrypoint started with it, so the environment would never
+// become reachable at all.
+//
+// The three names describe the *account* in the image's passwd database, which for
+// root is 0:0, and not the identity the pod runs as — spec.runtime.securityContext
+// names that one, and the two are deliberately different numbers. start.sh rewrites
+// the account whenever the two disagree, and that rewrite cannot complete for root:
+// the launcher dies there ("userdel: user root is currently used by process 1") and
+// takes the container with it. Measured on jupyter-minimal: a pod running as 0:1000
+// with NB_GID=1000 exits before the notebook is up, and the same pod with NB_GID=0
+// starts. So the pod's group is not a value these may be derived from.
+//
+// The shipped images no longer read them: a root container on the CPU image leaves
+// start.sh out of the chain entirely (images/jupyter/start-jupyter.sh), and the MACA
+// launcher expands NOTEBOOK_ARGS alone. They are supplied all the same, because the
+// controller sees only spec.image: a stock docker-stacks image, which is what a
+// bring-your-own jupyter environment is, is served by that launcher and nothing else.
+//
+// An entry the spec declares under one of these names is dropped rather than
+// merged: a value the controller owns is not one the spec may contradict
+// (::withNotebookBaseURL, JUPYTER_TOKEN). --allow-root is appended only when the
+// environment does not carry it already, so a flag list the user maintains keeps
+// the flags it has.
+//
+// An image whose launcher reads none of this is unaffected: the variables are
+// inert where nothing reads them, and the controller sees only spec.image, so it
+// cannot tell a stock Jupyter image from a vendor one.
+func withRootLauncherEnv(envVars []corev1.EnvVar) []corev1.EnvVar {
+	envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool {
+		return isRootLauncherEnvName(v.Name)
+	})
+	envVars = append(envVars,
+		corev1.EnvVar{Name: nbUserEnv, Value: rootRuntimeUser},
+		corev1.EnvVar{Name: nbUIDEnv, Value: rootAccountUID},
+		corev1.EnvVar{Name: nbGIDEnv, Value: rootAccountGID},
+	)
+	// Into the entry withNotebookBaseURL rewrites and adds when absent, so the
+	// launcher reads one NOTEBOOK_ARGS carrying both the prefix and this flag.
+	for i, v := range envVars {
+		if v.Name != notebookArgsEnv {
+			continue
+		}
+		if !slices.Contains(strings.Fields(v.Value), notebookAllowRootFlag) {
+			envVars[i].Value = strings.TrimSpace(v.Value + " " + notebookAllowRootFlag)
+		}
+		return envVars
+	}
+	return append(envVars, corev1.EnvVar{Name: notebookArgsEnv, Value: notebookAllowRootFlag})
 }
 
 // unsupportedNotebookArgsReason reports a jupyter environment whose
@@ -1470,6 +1597,130 @@ func unsupportedNotebookArgsReason(env *aiv1alpha1.DevEnvironment) string {
 		}
 	}
 	return ""
+}
+
+// specFinding is one place where the controller resolves an environment's spec
+// itself rather than applying it as written.
+type specFinding struct {
+	// reason names the cause, and becomes the Accepted condition's reason when
+	// this is the first finding that must be updated.
+	reason string
+	// field is the spec field the finding is about, without the "spec." prefix
+	// findingsMessage adds.
+	field string
+	// detail says what the controller applies instead, and what the user can do
+	// about it.
+	detail string
+	// mustUpdate separates the two dispositions: true when the controller refuses
+	// to run the spec until the user changes it, false when the controller has
+	// resolved the field and the environment runs anyway.
+	mustUpdate bool
+}
+
+// specFindings reports every disagreement between what an environment's spec
+// states and what the controller applies. The Accepted condition is its only
+// reader (::Reconcile): the findings that must be updated fail the environment,
+// and the rest are reported without blocking.
+//
+// Every check asks the same question the render path asks, through the same
+// predicate, so this can neither describe a substitution that does not happen
+// nor miss one that does. The render path stays the authority on what is
+// applied; read a check as a report on it, not as a second implementation.
+//
+// What is out of scope is as deliberate as what is in it: an environment whose
+// only symptom is cluster state — a storage class nothing provisions, a gateway
+// that is not ready — has not disagreed with the controller about anything, and
+// the conditions that observe that state report it (PodScheduled, RouteReady).
+func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
+	var findings []specFinding
+	// The two refusals come first: a finding that fails the environment decides
+	// the phase and the Accepted reason, so it has to precede the ones that only
+	// report a value the controller resolved.
+	if reason := brandMismatchReason(env); reason != "" {
+		findings = append(findings, specFinding{
+			reason: reasonBrandMismatch, field: "resources.gpu.vendor", detail: reason, mustUpdate: true,
+		})
+	}
+	if reason := unsupportedNotebookArgsReason(env); reason != "" {
+		findings = append(findings, specFinding{
+			reason: reasonNotebookArgsUnusable, field: "runtime.env[" + notebookArgsEnv + "]", detail: reason, mustUpdate: true,
+		})
+	}
+	if env.Spec.Runtime == nil {
+		return findings
+	}
+	for _, v := range env.Spec.Runtime.Env {
+		switch {
+		case env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter && v.Name == jupyterTokenEnv:
+			findings = append(findings, specFinding{
+				field:  "runtime.env[" + jupyterTokenEnv + "]",
+				detail: "the token is generated per environment rather than read from the spec: the controller publishes the one the workload reads in status.jupyterTokenSecret",
+			})
+		case rootLauncherEnvNeeded(env) && isRootLauncherEnvName(v.Name):
+			findings = append(findings, specFinding{
+				field: "runtime.env[" + v.Name + "]",
+				detail: fmt.Sprintf("the environment runs as root, so the launcher account is root's own: the controller sets %s=%s, %s=%s, %s=%s (a launcher told to serve another account rewrites it, and cannot while the container is running as root)",
+					nbUserEnv, rootRuntimeUser, nbUIDEnv, rootAccountUID, nbGIDEnv, rootAccountGID),
+			})
+		}
+	}
+	// Only a jupyter environment goes through withNotebookBaseURL at all, and only
+	// its first NOTEBOOK_ARGS entry — the one that call rewrites, and the one it
+	// adds when the spec declares none. A second entry is left as it is, and is
+	// therefore not reported either.
+	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
+		for _, v := range env.Spec.Runtime.Env {
+			if v.Name != notebookArgsEnv {
+				continue
+			}
+			for arg := range strings.FieldsSeq(v.Value) {
+				if isNotebookBaseURLArg(arg) {
+					findings = append(findings, specFinding{
+						field:  "runtime.env[" + notebookArgsEnv + "]",
+						detail: fmt.Sprintf("%s is replaced by %s%s: the route publishes the notebook under that prefix, so Jupyter has to serve it (every other flag is kept)", arg, notebookBaseURLFlag, webPath(env)),
+					})
+				}
+			}
+			break
+		}
+	}
+	// Derived from runtimeUser rather than re-reading the security context, so the
+	// account the platform advertises and the account this reports as ignored are
+	// decided in one place.
+	if env.Spec.Runtime.User != "" && runtimeUser(env) != env.Spec.Runtime.User {
+		findings = append(findings, specFinding{
+			field:  "runtime.user",
+			detail: fmt.Sprintf("the environment runs as root, and root is the account the controller serves and publishes; a non-root spec.runtime.securityContext.runAsUser serves %s instead", env.Spec.Runtime.User),
+		})
+	}
+	return findings
+}
+
+// mustUpdateFindings returns the findings only the user can clear. They are what
+// makes an environment Failed (::Reconcile); the rest are reported on a passing
+// Accepted condition.
+func mustUpdateFindings(findings []specFinding) []specFinding {
+	var blocking []specFinding
+	for _, f := range findings {
+		if f.mustUpdate {
+			blocking = append(blocking, f)
+		}
+	}
+	return blocking
+}
+
+// findingsMessage renders findings as the Accepted condition's message, one
+// clause per finding, each naming the field it is about and what became of it.
+func findingsMessage(findings []specFinding) string {
+	lines := make([]string, 0, len(findings))
+	for _, f := range findings {
+		disposition := "ignored"
+		if f.mustUpdate {
+			disposition = "must be updated"
+		}
+		lines = append(lines, fmt.Sprintf("spec.%s: %s — %s", f.field, disposition, f.detail))
+	}
+	return strings.Join(lines, "; ")
 }
 
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
@@ -1564,6 +1815,12 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		// Jupyter has to serve under the prefix its route publishes, and the
 		// launcher only learns the prefix from NOTEBOOK_ARGS (design §6.4).
 		envVars = withNotebookBaseURL(envVars, webPath(env))
+		// A root environment needs the launcher's own settings too, and which
+		// ones those are is the platform's to resolve rather than the spec's
+		// (::withRootLauncherEnv).
+		if rootLauncherEnvNeeded(env) {
+			envVars = withRootLauncherEnv(envVars)
+		}
 	}
 	container.Env = envVars
 	if env.Spec.Storage != nil {
@@ -1610,6 +1867,14 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{container},
+		// Pod-level, so the profile reaches the init container below too. An unset
+		// profile is Unconfined, which the Restricted Pod Security Standard refuses
+		// outright: this is that level's seccomp requirement met, and no more —
+		// a namespace enforcing Restricted refuses the pod anyway (README). The
+		// vendor stacks tolerate it: a MACA kernel launch is unaffected.
+		SecurityContext: &corev1.PodSecurityContext{
+			SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
+		},
 	}
 	if hostNetwork {
 		// RoCE GIDs are derived from the interfaces inside the network
@@ -1969,6 +2234,21 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		// means. The host key's source needs no equivalent: its Secret name is
 		// derived from env.Name, so it cannot vary without a new object.
 		SSHMount string
+		// PodSecurityContext is the version of the pod-level security context's
+		// shape (::podSecurityContextVersion), which carries the seccomp profile.
+		// Like SSHMount it is here because the hash is assembled by hand and the
+		// field it stands for is a constant: the profile is not derived from the
+		// spec, so nothing else in this input would move when it was added.
+		PodSecurityContext string
+		// RootLauncherEnv is the version of the launcher environment the controller
+		// injects into a root Jupyter environment (::rootLauncherEnvVersion), and is
+		// empty for every environment that cannot receive it. Like
+		// PodSecurityContext it stands for something the input cannot see: the
+		// injected values are constants, so nothing else in this input moves when the
+		// injection is added. The empty string is omitted rather than hashed (as rdma
+		// is), so the environments that cannot receive the injection digest exactly as
+		// they did before it existed and are not rewritten on upgrade.
+		RootLauncherEnv string `json:"rootLauncherEnv,omitempty"`
 		// RDMA is the *resolved* RDMA request (::rdmaResource) — the resource the
 		// container claims and whether the pod runs on the host network — rather
 		// than spec.network as declared. Both follow from the spec and from the
@@ -1983,6 +2263,13 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 			rdma.Ports = desiredContainerPorts(env)
 		}
 	}
+	// Empty unless the environment is one the injection applies to, so the
+	// environments that cannot receive it — every non-root one, and every one that
+	// serves no notebook — digest exactly as they did before it existed.
+	rootLauncherEnv := ""
+	if rootLauncherEnvNeeded(env) {
+		rootLauncherEnv = rootLauncherEnvVersion
+	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
 		Type:                 env.Spec.Type,
@@ -1995,6 +2282,8 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
 		SSHKeysRevision:      env.Annotations[sshKeysRevisionAnnotationKey],
 		SSHMount:             sshMountKey(env),
+		PodSecurityContext:   podSecurityContextVersion,
+		RootLauncherEnv:      rootLauncherEnv,
 		RDMA:                 rdma,
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
@@ -3457,14 +3746,12 @@ func setPhase(status *aiv1alpha1.DevEnvironmentStatus, name aiv1alpha1.PhaseName
 	status.Phase.Reason = reason
 }
 
-// setBrandMatchValidCondition sets the BrandMatchValid condition.
-func setBrandMatchValidCondition(conditions *[]metav1.Condition, valid bool, reason, message string) {
-	status := metav1.ConditionTrue
-	if !valid {
-		status = metav1.ConditionFalse
-	}
+// setAcceptedCondition sets the Accepted condition: whether the controller
+// applies the spec as written, or has resolved some of it itself
+// (::specFindings).
+func setAcceptedCondition(conditions *[]metav1.Condition, status metav1.ConditionStatus, reason, message string) {
 	meta.SetStatusCondition(conditions, metav1.Condition{
-		Type: aiv1alpha1.ConditionBrandMatchValid, Status: status, Reason: reason, Message: message,
+		Type: aiv1alpha1.ConditionAccepted, Status: status, Reason: reason, Message: message,
 	})
 }
 

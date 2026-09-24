@@ -86,8 +86,12 @@ const (
 	// (DevEnvironment)
 	ConditionPodScheduled ConditionType = "PodScheduled"
 
-	// ConditionBrandMatchValid indicates that the requested GPU vendor matches
-	// the image brand (nvidia<->base-cuda, metax<->base-maca), or that no GPU was
-	// requested and there is no brand to match. (DevEnvironment)
-	ConditionBrandMatchValid ConditionType = "BrandMatchValid"
+	// ConditionAccepted indicates that the controller applies the spec as
+	// written. False means the spec states something the controller refuses to
+	// run and only the user can correct it — today a GPU vendor its image does
+	// not match, or NOTEBOOK_ARGS the controller cannot read; nothing is
+	// provisioned until it is fixed. True with reason Overridden means the
+	// controller resolved one or more spec fields itself and runs the
+	// environment anyway, each one named in the message. (DevEnvironment)
+	ConditionAccepted ConditionType = "Accepted"
 )

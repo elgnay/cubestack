@@ -69,12 +69,17 @@ RUN rm -f /etc/ssh/ssh_host_* \
     && mkdir -p -m 0700 /run/sshd
 
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
-# Shared sshd config (common/), with this family's ssh login account substituted
-# for the @SSH_USER@ placeholder. It must match USER below.
+# Shared sshd config (common/), installed by the script that also owns its
+# placeholders: this family's ssh login account (which must match USER below) and
+# the session environment. This base ships nothing off the default search path, so
+# PATH alone; the installer reads its value from the build environment and fails
+# the build if it is missing (see the drop-in and the script).
 ARG SSH_USER=ubuntu
 COPY common/sshd/10-devenv.conf /etc/ssh/sshd_config.d/10-devenv.conf
+COPY common/sshd/install-dropin.sh /tmp/install-dropin.sh
 RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh \
-    && sed -i "s/@SSH_USER@/${SSH_USER}/" /etc/ssh/sshd_config.d/10-devenv.conf
+    && sh /tmp/install-dropin.sh "${SSH_USER}" PATH \
+    && rm -f /tmp/install-dropin.sh
 
 ENV CUBESTACK_IMAGE=ssh \
     HOME=/home/ubuntu

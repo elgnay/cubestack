@@ -6,10 +6,14 @@ See `docs/design/devenv-images/decision.md` for the sourcing/composition decisio
 
 ## Two image families
 
-Images are **not** all conformed to a single layout. The decision doc splits them into two families:
+Images are **not** all conformed to a single layout. The decision doc splits them into two families,
+by whose layout they keep:
 
 - **Self-authored** images ship the platform default: account `ubuntu` (uid/gid **1000**), home and
-  workdir **`/home/ubuntu`** (where the workspace PVC mounts).
+  workdir **`/home/ubuntu`** (where the workspace PVC mounts). Three members share that layout —
+  `ssh-ubuntu22.04` on `ubuntu:22.04` (CPU, ssh only), `jupyter-maca-pytorch` on a vendor's Metax
+  MACA base (GPU, jupyter and ssh) and `ssh-maca-pytorch` on that same base (GPU, ssh only) — though
+  not the size of the overlay that produces it (below).
 - **Stock-derived** images keep their upstream native layout **unchanged**; the overlay enables only
   ssh. The platform is told about that layout per environment, through the DevEnvironment spec — no
   image metadata is read.
@@ -18,20 +22,42 @@ Images are **not** all conformed to a single layout. The decision doc splits the
 |-------|--------|------|-------------------|------------------|---------|-----------|
 | `harbor.isuanova.com/suanova/ssh-ubuntu22.04` | self-authored | `ubuntu:22.04` | `ubuntu` 1000:1000 | `/home/ubuntu` | ssh `2222` | `ubuntu` |
 | `harbor.isuanova.com/suanova/jupyter-minimal` | stock-derived | `quay.io/jupyter/minimal-notebook:2026-09-07` | `jovyan` 1000:100 | `/home/jovyan` | jupyter `8888`, ssh `2222` | `jovyan` |
+| `harbor.isuanova.com/suanova/jupyter-maca-pytorch` | self-authored | `maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64` (mirror of `cr.metax-tech.com/public-library/…`) | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter `8888`, ssh `2222` | `ubuntu` |
+| `harbor.isuanova.com/suanova/ssh-maca-pytorch` | self-authored | *(the same MACA mirror)* | `ubuntu` 1000:1000 | `/home/ubuntu` | ssh `2222` | `ubuntu` |
 
-The `jupyter-minimal` overlay adds **only** `openssh-server` on top of the stock image: same account,
-home, conda stack, launcher (`tini → start.sh → start-notebook.py`), and jupyter settings.
+The `jupyter-minimal` overlay adds **only** `openssh-server` and a launcher on top of the stock image:
+same account, home, conda stack, and jupyter settings, and the stock launch chain
+(`tini → start.sh → start-notebook.py`) for the stock account — the launcher is the root case's.
+
+`jupyter-maca-pytorch` is the same family as `ssh-ubuntu22.04` but not the same size of overlay: a
+vendor GPU base is not a distro, so the platform layer there is the whole of it. The base runs as
+**root** (no `config.User`), has no `ENTRYPOINT` at all (`Cmd: ["/bin/bash"]`, so it exits immediately),
+no sshd, no jupyter, and no non-root account — the account is the platform's even though the base has
+none, because the shared sshd drop-in is a non-root configuration. The base also carries no launcher,
+so the image supplies its own jupyter launch chain (`start-jupyter.sh`), the piece `jupyter-minimal`
+still gets from docker-stacks. And the base publishes one architecture per tag (the `-amd64` suffix
+is part of the package name, not a multi-arch index), so this image is **amd64-only** and is published
+on its own platform variable — see Platform.
+
+`ssh-maca-pytorch` is that image's sibling: the identical vendor base and platform layer, with no
+JupyterLab and no launcher. The split is forced by where the mode comes from — `CUBESTACK_IMAGE` is
+**baked into the image**, because the operator injects no type (`common/entrypoint.sh`), so one image
+cannot serve both. A `type: ssh` environment pointed at the jupyter image would run JupyterLab beside
+sshd and have nothing probing it; pointed here, it runs sshd alone. The same split already exists on
+the CPU side, as `ssh-ubuntu22.04` against `jupyter-minimal`.
 
 ## Configuring a DevEnvironment for these images
 
-Neither image's layout is discoverable from the cluster: the operator takes the run-as identity, the
+No image's layout is discoverable from the cluster: the operator takes the run-as identity, the
 workspace mount path, and the ssh login account from the **DevEnvironment spec**. Pointing an
-environment at either shipped image therefore means stating what the image already is:
+environment at a shipped image therefore means stating what the image already is:
 
 | Image | `spec.runtime.user` | `spec.runtime.securityContext` | Workspace mount |
 |-------|--------------------|-------------------------------|-----------------|
 | `ssh-ubuntu22.04` | `ubuntu` | *(omit — 1000:1000 is already the platform default)* | `/home/ubuntu` (derived) |
 | `jupyter-minimal` | `jovyan` | `runAsGroup: 100` | `/home/jovyan` (derived) |
+| `jupyter-maca-pytorch` | `ubuntu` | *(omit — 1000:1000)* | `/home/ubuntu` (derived) |
+| `ssh-maca-pytorch` | `ubuntu` | *(omit — 1000:1000)* | `/home/ubuntu` (derived) |
 
 What the controller derives when a field is omitted
 (`operator/internal/controller/devenvironment_controller.go`, `resolveMountPath` / `runtimeUser`):
@@ -41,16 +67,29 @@ What the controller derives when a field is omitted
   account, else `/workspace`.
 - **ssh login** — `spec.runtime.user`, else the platform default `user`.
 
-So `spec.runtime.user` alone yields the right mount for both images. `runAsGroup: 100` has to be set
+So `spec.runtime.user` alone yields the right mount for every image. `runAsGroup: 100` has to be set
 explicitly for `jupyter-minimal`: no other spec field implies the stock `gid 100`, and the default is
 1000. A bring-your-own image whose home is somewhere else pins it with `spec.storage.mountPath`, which
 always wins.
 
-## Runtime behavior common to both images
+A **root** environment (`spec.runtime.securityContext.runAsUser: 0`) is the case this table does not
+cover, since the identity comes from the security context rather than from `runtime.user`: the derived
+mount is `/root`, and every image serves that home as it stands — a launcher's one job there is to
+leave root with the home the derivation gives it (see Runtime behavior below).
+
+A GPU image additionally has to be requested as one: the brand gate runs only when an environment asks
+for a vendor, and it requires the image's name to carry that vendor's token (`cuda` for `nvidia`,
+`maca` for `metax`) — both MACA image names do, so `spec.resources.gpu.vendor: metax` is what makes
+them reachable. The gate is not what keeps a CPU environment off them either: an environment with no
+`gpu` block skips the check, and the reason not to point one at a MACA image is that its stack exists
+for the GPU.
+
+## Runtime behavior common to every image
 
 - Single container, **no command/args** — the image ENTRYPOINT decides what runs
   (`common/entrypoint.sh`): mode `ssh` runs sshd; mode `jupyter` starts sshd alongside jupyter when the
-  host key is mounted, then hands off to the image CMD (the stock launch chain for jupyter).
+  host key is mounted, then hands off to the image CMD (the image's own launch chain, below). The mode
+  comes from `CUBESTACK_IMAGE`, baked into each image; the controller never selects it.
 - Readiness = TCP listening on the image's main port (8888 / 2222).
 - sshd listens on the **unprivileged `2222`**, never `:22`: a non-root process cannot bind a privileged
   port without `CAP_NET_BIND_SERVICE`, so no image needs that capability granted. The platform's
@@ -63,8 +102,22 @@ always wins.
   address names the account to log in as — `spec.runtime.user` when it is set, else the platform default
   `user`, and `root` for a root environment whatever the spec names, since root is the only account the
   platform can promise there.
-- Jupyter is stock-native: the overlay adds no jupyter logic. `JUPYTER_TOKEN` (token) and
-  `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`) are honored by the upstream launcher.
+- Jupyter is stock-native where the base already is one — `jupyter-minimal` keeps docker-stacks' chain,
+  adding only the root branch below — and platform-launched where it is not: the MACA base has no chain
+  to keep, so `jupyter-maca-pytorch`'s `start-jupyter.sh` is the whole launcher. Either way the two knobs
+  are `JUPYTER_TOKEN` (token) and `NOTEBOOK_ARGS` (extra flags, e.g. `--ServerApp.base_url=…`). The token
+  is read by jupyter-server itself; `NOTEBOOK_ARGS` is a docker-stacks convention jupyter knows nothing
+  about, which is why a launcher has to expand it — the MACA image's own launcher is that launcher, while
+  the CPU one hands off to the stock chain that already does. A **root** environment is
+  handed more than those two: the controller adds `NB_USER`, `NB_UID`, `NB_GID` and, into the same
+  `NOTEBOOK_ARGS`, `--allow-root` (`::withRootLauncherEnv`). A launcher that reads none of the trio may
+  ignore it — neither jupyter launcher consults it at uid 0 — but a Jupyter launcher that ignores
+  `--allow-root` will not start as root at all. The **home** a root environment runs with is a launcher
+  decision as well, and both jupyter images decide it the same way: root's own `/root`, the home the
+  controller derives for `runAsUser: 0` and mounts the claim at, with a declared `HOME` left standing as
+  the one thing that outranks the image. `jupyter-minimal` takes uid 0 out of docker-stacks' `start.sh`
+  to do it — that launcher relocates root's home to `/home/root` whatever the environment declares,
+  which is what a root environment there used to state `HOME=/home/root` for.
 
 ## ssh Secret mount contract
 
@@ -180,11 +233,12 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
 ## Build & smoke
 
 ```bash
-make -C images build     # both images, tagged $(REGISTRY)/$(PROJECT)/<image>:$(TAG) (see Publish)
+make -C images build     # every image, tagged $(REGISTRY)/$(PROJECT)/<image>:$(TAG) (see Publish)
 make -C images smoke     # build + local Docker smoke (no cluster)
 ```
 
-Per-image: `make -C images build-ssh` / `smoke-ssh`, `build-jupyter` / `smoke-jupyter`.
+Per-image: `make -C images build-ssh` / `smoke-ssh`, `build-jupyter` / `smoke-jupyter`,
+`build-maca` / `smoke-maca`, `build-ssh-maca` / `smoke-ssh-maca`.
 
 The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Secrets under
 `mktemp -d`) and asserts:
@@ -197,20 +251,42 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
 - **jupyter-minimal** — one container running both services at native identity (uid 1000, gid 100):
   token auth returns 200 and lab HTML on the `NOTEBOOK_ARGS` `base_url` path; no token is rejected;
   the path without the prefix is 404; plus key-auth ssh login as `jovyan` (`$HOME=/home/jovyan`) with
-  the served host key equal to the mounted Secret public key.
+  the served host key equal to the mounted Secret public key. Root mode adds the one thing this image
+  does not leave to docker-stacks: a root run serves `/root` — the home the platform derives, and so
+  where the claim is mounted — rather than the `/home/root` the stock `start.sh` relocates to, and a
+  declared `HOME` is served unchanged.
+- **jupyter-maca-pytorch** — the same jupyter and ssh assertions at the platform identity (uid/gid
+  1000, `$HOME`/cwd `/home/ubuntu`, login account `ubuntu`), plus that the vendor stack under
+  `/opt/maca` is **readable by uid 1000**. That last one is checkable without a GPU and is the risk
+  that would otherwise surface only on a node: the base was built as root, and a library the account
+  cannot read fails at runtime with no build-time signal. Whether the *driver* works on a Metax node
+  is not covered here. Root mode adds one check that is this image's own work and not docker-stacks':
+  a root run serves `/root` — the home the platform derives, and so where the claim is mounted —
+  rather than the `/home/ubuntu` the image bakes, and a declared `HOME` is served unchanged.
+- **ssh-maca-pytorch** — the same ssh assertions at the same identity and the same vendor-stack
+  check, plus the two properties that make it a separate image rather than a copy: **no JupyterLab
+  exists in it** (the guard against its sibling's pip step being copied across, which would silently
+  put an unprobed second service in an ssh-type environment), and its ssh session **environment
+  equals the container's own** — sshd's `SetEnv` replaces the image's rather than extending it, so the
+  smoke reads it back over the session and compares it variable by variable (see the drop-in note
+  under Layout). Also that the MACA toolchain actually resolves on that session's PATH.
 
 ### Publish
 
 Each image has **one name**: `make build` tags it at the reference it is published under,
 `$(REGISTRY)/$(PROJECT)/<image>:$(TAG)`, defaulting to `harbor.isuanova.com/suanova/...` and the short
-commit SHA (decision doc §5). `push` adds `:latest` to that same name rather than introducing a
-second one, and publishes both as **one multi-arch index per image** covering `$(PLATFORMS)`:
+commit SHA — plus, for the MACA pair, the vendor axes their base is chosen on (decision doc §5).
+`push` adds `:latest` to that same name rather than introducing a
+second one, and publishes it as **one multi-arch index per image** covering `$(PLATFORMS)` — except
+`jupyter-maca-pytorch` and `ssh-maca-pytorch`, which publish a single-platform index (see Platform):
 
 ```bash
 docker login harbor.isuanova.com              # once — the Makefile never authenticates
-make -C images push                           # publish both images, every platform
+make -C images push                           # publish every image
 make -C images push-ssh      TAG=20260910
 make -C images push-jupyter  TAG=2026-09-07
+make -C images push-maca     # jupyter-maca-pytorch:3.9.0.12-py310-torch2.4-<sha>
+make -C images push-ssh-maca # ssh-maca-pytorch:3.9.0.12-py310-torch2.4-<sha>
 make -C images push PLATFORMS=linux/amd64     # narrow back to one platform
 ```
 
@@ -228,8 +304,14 @@ publish.
 traceable, non-floating reference. It names the **last commit, not the working tree** — commit before
 publishing, or the tag will not describe the built content — and it is resolved per make invocation, so
 a commit landing after `make smoke` would have `make push` publish a tag nothing accepted; pass an
-explicit TAG. §5 gives the release schemes per image — `ssh-ubuntu22.04:<date>` and
-`jupyter-minimal:<base-date>` — the two families version on different axes, hence the per-target form.
+explicit TAG. §5 gives the release schemes per image — `ssh-ubuntu22.04:<date>`,
+`jupyter-minimal:<base-date>`, and `jupyter-maca-pytorch` / `ssh-maca-pytorch` on
+`<maca-version>-py<python>-torch<ver>` — the families version on different axes, hence the per-target
+form. The MACA pair's axes are not a `TAG` the caller passes: `MACA_TAG` reads them out of
+`MACA_PACKAGE`, so the tag cannot name a base the image was not built from, and `TAG` still ends it —
+re-building this overlay on an unchanged base moves the reference rather than redefining it. Both
+targets refuse to publish (`check-maca-base`) if a base bump lands a package tag the axes cannot be
+read from.
 
 A deployment tracking `:latest` follows the newest publish while a pinned one keeps its SHA/release
 tag; publishing an older commit therefore moves `:latest` backwards, which is expected for a moving
@@ -239,7 +321,7 @@ destination.
 ### Platform
 
 `make build` and `make smoke` work on **one** platform, `$(PLATFORM)`, default `linux/amd64` — the
-architecture the cluster's nodes run. Both Dockerfiles start from a multi-arch base (`ubuntu`,
+architecture the cluster's nodes run. The CPU Dockerfiles start from a multi-arch base (`ubuntu`,
 `quay.io/jupyter`), so without `--platform` `docker build` resolves that base to the **host**
 architecture: a build on an arm64 machine produces an arm64-only image, which every amd64 node then
 refuses to pull (`no match for platform in manifest`). The Makefile passes `--platform` on every build,
@@ -257,6 +339,14 @@ of more than one platform — Docker Desktop's is; on a plain `docker` install r
 the non-native platform. Both flows drop buildx's provenance and SBOM attestations: Harbor rejects an
 index carrying them with a 404 on the manifest PUT even though every manifest it references resolves on
 its own.
+
+`jupyter-maca-pytorch` and `ssh-maca-pytorch` sit outside both flows' platform choice, on the same
+grounds: their vendor base has no arm64 layers to build from, so `build-maca` and `build-ssh-maca`
+always pass `$(MACA_PLATFORM)` (default `linux/amd64`) rather than `$(PLATFORM)`, and their push
+targets publish that one platform rather than `$(PLATFORMS)` — a push of a single-platform index,
+which buildx supports. They are the images whose architecture is a property of the image rather than
+of the host or the platform list; `MACA_PLATFORM=` is what moves them, and `PLATFORMS=` does not reach
+them.
 
 Verify what a registry received rather than assuming the build host's architecture:
 
@@ -281,6 +371,14 @@ re-run the mirror script, which fails if a mirrored tag no longer hashes to the 
 listed under. `BASE_ARGS=` (empty) resolves from upstream instead, unpinned. The jupyter mirror's
 date tracks the base in `jupyter/Dockerfile` — bump both together.
 
+The MACA base rides the same `BASE_ARGS` and is pinned the same way, but differs on two counts, both
+of which follow from its being a **vendor package mirrored as it stands** rather than a base the
+platform re-published: it lives under `$(REGISTRY)/mirrors/cr.metax-tech.com/public-library/…`, not
+under `$(PROJECT)`, so it is named literally in `images/Makefile` and has no entry in
+`operator/Makefile`'s `BASE_MIRRORS`; and `BASE_ARGS=` does not reach an upstream for it — the vendor
+registry is not something a build here resolves — so a MACA build overridden that way needs an explicit
+`--build-arg MACA_BASE=<ref>`. Bumping it stops at `images/Makefile`.
+
 APT and pip still go upstream unless asked otherwise:
 
 ```bash
@@ -289,37 +387,49 @@ PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
 make -C images build
 ```
 
-`IMG_SSH` / `IMG_JUPYTER` override the output tags; `BASE_ARGS` the base images (above);
-`CONTAINER_TOOL` overrides `docker` (e.g. `podman`); `PLATFORM` the build/smoke architecture and
-`PLATFORMS` what `push` publishes (see Platform).
+`IMG_SSH` / `IMG_JUPYTER` / `IMG_MACA` / `IMG_SSH_MACA` override the output tags (`MACA_TAG` the axes
+the two MACA ones derive); `BASE_ARGS` the base images (above); `CONTAINER_TOOL` overrides `docker`
+(e.g. `podman`); `PLATFORM` the build/smoke architecture, `PLATFORMS` what `push` publishes, and
+`MACA_PLATFORM` the one architecture both MACA images build and publish for (see Platform).
 
 ## Layout
 
 ```
 images/
-  common/                  runtime config shared by both images (single source)
+  common/                  runtime config shared by every image (single source)
     entrypoint.sh          mode selection + optional sshd (admits root when it runs as root),
                            then hand-off to the image CMD
-    sshd/10-devenv.conf    sshd_config.d drop-in; AllowUsers is @SSH_USER@
+    sshd/10-devenv.conf    sshd_config.d drop-in; @SSH_USER@ login account, @SSH_ENV@ session env
+    sshd/install-dropin.sh fills both placeholders in, or fails the build
   ssh-ubuntu-server/Dockerfile
-  jupyter/Dockerfile
+  jupyter/
+    Dockerfile             stock-native overlay
+    start-jupyter.sh       the CMD: the stock chain, and root's own home for uid 0
+  jupyter-maca-pytorch/
+    Dockerfile             platform layer on the Metax MACA vendor base
+    start-jupyter.sh       this image's jupyter launch chain (the base ships none)
+  ssh-maca-pytorch/
+    Dockerfile             the same base and platform layer, with sshd alone
   hack/smoke.sh            local acceptance smoke
 ```
 
 The sshd_config drop-in is **shared**: it holds the mount contract's paths (`HostKey`,
-`AuthorizedKeysFile`, the latter `%h`-relative so it follows each image's home) and the login account as
-an `@SSH_USER@` placeholder, which each Dockerfile substitutes from its `ARG SSH_USER` (`ubuntu` /
-`jovyan`). A missed substitution is not a parse error — `AllowUsers` is a valid keyword and the pattern
-simply matches no account — so it fails *closed* for the family account: sshd starts but denies that
-login, and the smoke fails on its login assertion. `root` is admitted **beside** the family account,
-because one image serves both identities (see Requirements on the operator) — but by the entrypoint
-rather than by this file: it writes a second drop-in, `20-allow-root.conf`, only when the container runs
-as `uid 0`. A non-root sshd cannot setuid to root, so admitting it there would buy nothing and cost a
-login that is accepted and then dies at `setresuid` (*Failed to set uids to 0.*) instead of being refused
-at authentication. `AllowUsers` is one of the few sshd options that **accumulate** across files, so that
-drop-in adds to this one rather than replacing it. A missed substitution therefore fails *closed* for
-the family account — but only for it: the entrypoint's file is written from the uid and never consults
-the substitution, so a root environment still serves `root`, and the login a broken substitution costs
+The sshd_config drop-in is **shared**: it holds the mount contract's paths (`HostKey`,
+`AuthorizedKeysFile`, the latter `%h`-relative so it follows each image's home) and two placeholders,
+both filled in at build time by `common/sshd/install-dropin.sh` — which every Dockerfile that copies
+the drop-in also copies in and calls, so the template cannot ship half-filled. The first is the login
+account, `@SSH_USER@`, given as `ARG SSH_USER` (`ubuntu` / `jovyan`). A missed substitution is not a
+parse error — `AllowUsers` is a valid keyword and the pattern simply matches no account — so it fails
+*closed* for the family account: sshd starts but denies that login, and the smoke fails on its login
+assertion. `root` is admitted **beside** the family account, because one image serves both identities
+(see Requirements on the operator) — but by the entrypoint rather than by this file: it writes a
+second drop-in, `20-allow-root.conf`, only when the container runs as `uid 0`. A non-root sshd cannot
+setuid to root, so admitting it there would buy nothing and cost a login that is accepted and then
+dies at `setresuid` (*Failed to set uids to 0.*) instead of being refused at authentication.
+`AllowUsers` is one of the few sshd options that **accumulate** across files, so that drop-in adds to
+this one rather than replacing it. A missed substitution therefore fails *closed* for the family
+account — but only for it: the entrypoint's file is written from the uid and never consults the
+substitution, so a root environment still serves `root`, and the login a broken substitution costs
 you is the family one. The smoke's assertion on that login is what catches it.
 
 In practice the family account is refused whenever the container is root, and the accumulation above is
@@ -331,9 +441,22 @@ refusal is docker-stacks' and not ours: an image whose build account was unlocke
 root environment too, into the image's own `/home/$USER`, which in root mode is not the workspace claim.
 (`passwd -S` reports both accounts as locked and cannot tell you which one sshd will refuse.)
 
-**Build context is `images/`** for every Dockerfile
-— that is why ignore rules live in the single `images/.dockerignore` (deny-by-default) and why shared
-files are `COPY common/...`.
+The second is `@SSH_ENV@`, the `NAME=value` pairs for the drop-in's single `SetEnv`. Each Dockerfile
+names the variables its session needs and the installer reads their values out of the build shell's
+environment — the **base image's own**. A placeholder is needed at all because sshd's `SetEnv` *replaces*
+a session's environment rather than adding to it, so a literal does not extend an image's environment,
+it hides it; and no one literal fits every family, since the stock-derived image needs only its
+conda-first `PATH` while the MACA base's session has to carry the whole vendor toolchain (`PATH`,
+`LD_LIBRARY_PATH`, `LIBRARY_PATH`, `MACA_PATH`, `MACA_CLANG_PATH`) or the MACA tools and compilers a
+user reaches that base over ssh *for* are silently absent. Unlike `@SSH_USER@`, a missed substitution
+here fails *quiet*: the literal itself becomes a value and nothing downstream objects. Hence the
+installer, which fails the build on an unset, empty or whitespace-carrying variable, on a placeholder
+left behind, and on anything but exactly one `SetEnv` line — sshd applies the first and ignores the
+rest without complaint — plus the smoke, which reads the session environment back and compares it to the
+container's own variable by variable.
+
+**Build context is `images/`** for every Dockerfile — that is why ignore rules live in the single
+`images/.dockerignore` (deny-by-default) and why shared files are `COPY common/...`.
 
 ## Trade-offs / notes
 
@@ -350,6 +473,12 @@ files are `COPY common/...`.
 - The jupyter container runs at its native gid 100 while the operator defaults `runAsGroup` to 1000, so
   the environment has to set `securityContext.runAsGroup: 100` — nothing else in the spec implies it.
   Self-authored images stay on the platform uid/gid defaults (1000:1000).
+- Both MACA images inherit two properties of the vendor base worth knowing before they are trusted.
+  Their **driver** is baked
+  into the base (`/opt/mxdriver`) while a Metax node may inject its own; which one wins is untested, and
+  the local smoke cannot answer it — that needs a node advertising `metax-tech.com/gpu`. And their python
+  is the **vendor's**, which is the point: jupyterlab is installed into that interpreter so the torch
+  that imports is the vendor's metax build, never a second interpreter beside it.
 - The workspace PVC mounts at the account's home (`/home/ubuntu` self-authored; `/home/jovyan`
   jupyter, both derived from `spec.runtime.user` — an explicit `spec.storage.mountPath` overrides),
   where the notebook root already lives by default. An empty/root-owned PVC is storage-side (Gap A);

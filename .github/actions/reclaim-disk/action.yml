@@ -1,0 +1,33 @@
+name: Reclaim disk space
+description: Remove the runner's preinstalled SDKs, so a multi-GB image build fits on /.
+
+# The DevEnvironment base images are large: the Metax MACA pair is ~33 GB unpacked
+# each, from a 10.5 GiB vendor base the two of them share, and a standard runner
+# has about 31 GB free on /. None of the jobs that call this uses the SDKs the
+# runner image preinstalls, and the ones removed here are the biggest of them —
+# the Android SDK above all, then the tool cache (CodeQL and the language
+# runtimes `actions/setup-*` would otherwise find preinstalled).
+#
+# Two things this deliberately does not do. It does not uninstall the "large
+# packages" (azure-cli, PowerShell, mono, MySQL, …), which is an `apt` run that
+# costs minutes of the job. And it does not remove the swap file, whose removal
+# reveals itself as a job that dies under memory pressure with nothing pointing
+# back here (see jlumbroso/free-disk-space#12).
+#
+# Free space is printed before and after: how much this recovers is the runner
+# image's business, not this repository's, and the log is where a job that runs
+# out of space can say by how much.
+runs:
+  using: composite
+  steps:
+    - name: Reclaim disk space
+      shell: bash
+      run: |
+        df -h /
+        sudo rm -rf \
+          /usr/local/lib/android \
+          "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" \
+          /opt/ghc \
+          /usr/share/dotnet \
+          /usr/local/share/boost
+        df -h /
