@@ -1534,9 +1534,17 @@ func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 // resolved the same wherever it sits. Nothing downstream keeps this order — the
 // kubelet hands the runtime its variables from a map — so this is the only pass
 // it matters to.
+//
+// That same expansion applies to every EnvVar.Value, and the claim's mount path
+// is not expanded with it: a doubled dollar is reduced to one, and a $(NAME)
+// reference is resolved against the variables already passed. Either one written
+// into a path is therefore stated escaped, so that what the container reads is
+// the path the claim is mounted at rather than an expansion of it. An explicit
+// spec.storage.mountPath needs this most, since ::declaredHome's refusal of a
+// $(NAME) does not reach a path the spec pins directly.
 func withWorkspaceHome(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 	envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == homeEnv })
-	return append([]corev1.EnvVar{{Name: homeEnv, Value: path}}, envVars...)
+	return append([]corev1.EnvVar{{Name: homeEnv, Value: strings.ReplaceAll(path, "$", "$$")}}, envVars...)
 }
 
 // resolvedHome is the home the controller states on the container — the path the

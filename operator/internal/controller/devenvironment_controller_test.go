@@ -2077,6 +2077,25 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
+		// The claim mounts at the path as written, while the kubelet expands
+		// every EnvVar.Value: a doubled dollar is reduced to one, and a $(NAME)
+		// reference is resolved against the other variables. A path containing
+		// either has to be stated escaped, or the container is told to work in a
+		// directory the claim is not mounted at — so both the mount and the
+		// stated value are asserted, the escape being the whole difference.
+		DescribeTable("states a mount path containing a dollar as the claim mounts it",
+			func(mountPath, wantValue string) {
+				spec := render(func(e *aiv1alpha1.DevEnvironment) {
+					e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize, MountPath: mountPath}
+				})
+				c := spec.Containers[0]
+				Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: workspaceClaimName, MountPath: mountPath}))
+				Expect(homes(c.Env)).To(Equal([]corev1.EnvVar{{Name: homeEnv, Value: wantValue}}))
+			},
+			Entry("for a doubled dollar the kubelet reduces to one", "/data/$$work", "/data/$$$$work"),
+			Entry("for a reference the kubelet would resolve", "/data/$(USER)", "/data/$$(USER)"),
+		)
+
 		// No claim, no workspace to name: the controller states no home, so the
 		// one the spec declares is the one the container runs with. This is the
 		// case the launchers' own guards still cover.
