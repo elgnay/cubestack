@@ -211,10 +211,21 @@ spec:
                   env:
                     description: |-
                       Env is the environment variables (name/value or valueFrom: secretKeyRef).
-                      A HOME naming an absolute path outright also moves the workspace mount
-                      (spec.storage.mountPath), since the workspace follows the account's home. A
-                      valueFrom HOME and a $(VAR) HOME do not: neither is resolvable when the
-                      workload is rendered.
+                      HOME is also an input to where the workspace mounts: an absolute path named
+                      outright precedes the home the runtime identity implies, so it decides both
+                      the mount path (spec.storage.mountPath) and what the container is told its
+                      home is. A valueFrom HOME and a $(VAR) HOME are not inputs — neither is
+                      resolvable when the workload is rendered — so the mount follows the identity
+                      instead and the entry is reported on the Accepted condition.
+
+                      An environment with a workspace claim is told where it is: the controller
+                      states the mount path as HOME on the main container, whatever type and
+                      whichever account the image runs, so a launcher that serves HOME serves the
+                      workspace without having to know what its own image bakes. It states it
+                      ahead of the entries here, so one of them may name it — `PROJECT=$(HOME)/project`
+                      resolves rather than naming that text. An environment without a claim is
+                      told no home of the controller's: a HOME declared here stands as written,
+                      and the image's home applies only where this list declares none.
 
                       Some values are the controller's rather than the spec's on a jupyter
                       environment, and an entry declaring one is dropped and replaced: JUPYTER_TOKEN;
@@ -480,14 +491,18 @@ spec:
                 properties:
                   mountPath:
                     description: |-
-                      MountPath is the path where the workspace PVC is mounted. Leave it unset
-                      to derive the path from spec.runtime: HOME from spec.runtime.env when it
-                      names an absolute path outright, else /root when the container runs as
-                      root, else /home/<user> when spec.runtime.user names an account, and
-                      /workspace otherwise. Set it to pin a different path — e.g. for a
-                      bring-your-own image whose home is somewhere else. It should be the
-                      directory the container's home points at, otherwise the workspace does not
-                      follow the user's home.
+                      MountPath is the path where the workspace PVC is mounted, and the HOME the
+                      container is stated: the controller sets the path it mounts at as HOME on the
+                      main container, so where the workspace is and where the container's home is
+                      are one decision rather than two. Leave it unset to derive the path from
+                      spec.runtime: HOME from spec.runtime.env when it names an absolute path
+                      outright, else /root when the container runs as root, else /home/<user> when
+                      spec.runtime.user names an account, and /workspace otherwise. Set it to pin a
+                      different path — e.g. for a bring-your-own image whose home is somewhere else:
+                      the image is told which path that is, so a launcher that serves the home it is
+                      handed serves the workspace. Stating HOME says nothing about the working
+                      directory, which stays the image's. A declared HOME that this outranks is
+                      reported on the Accepted condition.
                     type: string
                   pvcRetention:
                     default: delete
