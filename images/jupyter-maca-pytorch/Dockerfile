@@ -9,9 +9,10 @@
 # its CMD is a bare /bin/bash that exits immediately). So this Dockerfile adds the platform
 # layer the self-authored CPU image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
 # openssh-server, the shared entrypoint — on top of the vendor's own python/torch/MACA stack,
-# which is inherited untouched. The account is not a preference: the shared sshd drop-in is a
-# non-root configuration (Port 2222, UsePAM no, AllowUsers pinned to that one account), and a
-# non-root sshd can only serve the uid it runs as.
+# inherited as the base published it except for PATH, which the overlay corrects so that `python3`
+# is the interpreter that owns the vendor torch (see below). The account is not a preference: the
+# shared sshd drop-in is a non-root configuration (Port 2222, UsePAM no, AllowUsers pinned to that
+# one account), and a non-root sshd can only serve the uid it runs as.
 #
 # No key staging: the operator mounts two Secret entries and sshd reads them in place —
 #   ssh_host_ed25519_key -> /etc/ssh/ssh_host_ed25519_key   (host identity, subPath file)
@@ -49,17 +50,31 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tini \
     && rm -rf /var/lib/apt/lists/*
 
-# JupyterLab on the VENDOR's python (3.10), never a second interpreter: the point of this image
-# is that its torch is the vendor's metax build, importable only by the interpreter the base
-# ships. pip is not guaranteed to be part of the vendor image, so it is added only when missing —
-# `python3 -m pip` then resolves to the same interpreter either way.
+# Make the VENDOR's python the image's python, before anything resolves `python3`.
+#
+# The base ships two 3.10 interpreters: /opt/conda/bin/python3, which owns the vendor torch, and the
+# system /usr/bin/python3, which does not. It publishes conda only from /etc/profile.d/conda.sh, which
+# prepends it for a *login* shell — so an interactive session gets the right interpreter while a build
+# RUN, or the non-login shell sshd gives a one-shot command, silently gets the other. Naming it here is
+# what makes every path agree: this build, the launch chain below, the notebook kernel (jupyter_client
+# rewrites a bare `python` argv[0] to sys.executable, so the kernel runs the server's interpreter), and
+# the ssh session, whose SetEnv carries exactly this PATH (see common/sshd/install-dropin.sh).
+#
+# Prepending is safe against this base in particular: /opt/conda/bin shares no name with any of the
+# MACA toolchain directories and holds no compiler, linker or mpirun, so the vendor's own tools are
+# not shadowed (images/README.md, Trade-offs).
+ENV PATH=/opt/conda/bin:$PATH
+
+# JupyterLab onto that interpreter, never a second one: the point of this image is that the torch a
+# notebook imports is the vendor's metax build, importable only by the interpreter named above. The
+# step deliberately calls bare `python3` rather than an absolute path, so it is also the build-time
+# check of the claim — if the PATH above were ever wrong, this is where it shows.
+#
+# It carries no fallback for a vendor pip that is missing: conda ships pip (24.3.1 on the pinned base),
+# and one would install pip for /usr/bin/python3 while `python3` still resolved to conda's, so it could
+# only ever mask a wrong interpreter rather than repair one. `set -eu` fails the build instead.
 ARG PIP_INDEX_URL=""
 RUN set -eu; \
-    if ! python3 -m pip --version >/dev/null 2>&1; then \
-      apt-get update; \
-      apt-get install -y --no-install-recommends python3-pip; \
-      rm -rf /var/lib/apt/lists/*; \
-    fi; \
     pip_args=""; \
     if [ -n "$PIP_INDEX_URL" ]; then pip_args="--index-url $PIP_INDEX_URL"; fi; \
     python3 -m pip install --no-cache-dir $pip_args jupyterlab
@@ -100,9 +115,9 @@ RUN chmod +x /usr/local/bin/cubestack-entrypoint.sh /usr/local/bin/start-jupyter
          PATH LD_LIBRARY_PATH LIBRARY_PATH MACA_PATH MACA_CLANG_PATH TORCH_ALLOW_TF32_CUBLAS_OVERRIDE \
     && rm -f /tmp/install-dropin.sh
 
-# The vendor's PATH, LD_LIBRARY_PATH and MACA_PATH are inherited from the base: they are what
-# put the MACA stack on the account's search path, which a non-root login needs exactly as the
-# vendor's root shell did.
+# The vendor's LD_LIBRARY_PATH and MACA_PATH are inherited from the base, and its PATH is carried
+# with conda prepended (above): together they are what put the MACA stack on the account's search
+# path, which a non-root login needs exactly as the vendor's root shell did.
 ENV CUBESTACK_IMAGE=jupyter \
     HOME=/home/ubuntu
 

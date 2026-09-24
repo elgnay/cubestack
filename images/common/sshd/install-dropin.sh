@@ -17,8 +17,10 @@
 # published has to be named to survive, and only the image knows what that is — the
 # self-authored CPU image needs little, the MACA base's toolchain (its compilers, MPI and
 # UCX) needs several. The names are therefore the caller's, and the values are read out
-# of THIS process's environment, which is the build shell's — i.e. the base image's ENV,
-# which is what the container runs with.
+# of THIS process's environment, which is the build shell's — the image's ENV by the time
+# this runs, which is the base's plus whatever the overlay has set (both MACA images
+# prepend /opt/conda/bin to PATH here, so a session reaches the interpreter that owns the
+# vendor torch and not merely a login shell). What is read is what the container runs with.
 #
 # Named explicitly rather than harvested from `env`: a session should carry the base's
 # toolchain settings, not its build-time debris (DEBIAN_FRONTEND, HOSTNAME, PWD) or this
