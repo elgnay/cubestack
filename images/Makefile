@@ -178,7 +178,8 @@ LATEST_ARG_MACA     = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MACA))
 LATEST_ARG_SSH_MACA = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_SSH_MACA))
 
 .PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base build build-ssh build-jupyter build-maca build-ssh-maca \
-	smoke smoke-ssh smoke-jupyter smoke-maca smoke-ssh-maca push push-ssh push-jupyter push-maca push-ssh-maca retag-latest
+	smoke smoke-ssh smoke-jupyter smoke-maca smoke-ssh-maca push push-ssh push-jupyter push-maca push-ssh-maca retag-latest \
+	retag-latest-ssh retag-latest-jupyter retag-latest-maca retag-latest-ssh-maca
 
 .DEFAULT_GOAL := help
 
@@ -309,10 +310,21 @@ push-ssh-maca: check-tag check-maca-base check-push-latest ## Publish the metax 
 # writes an index naming the same manifests, so this cannot publish anything the build
 # did not produce. It is how a caller that withheld :latest from `push` moves it after
 # deciding to. Needs no PLATFORMS: nothing is built.
-retag-latest: check-tag ## Repoint :latest at an already-published TAG (no rebuild)
+#
+# RETAG names the images to move. A caller that published only some of them must not move
+# the rest: the ref a skipped image would name is one this run never pushed, so its retag
+# would fail on a missing manifest, and a tag that another run published is that run's to
+# move. Defaults to every image, which is what a human means.
+RETAG ?= ssh jupyter maca ssh-maca
+
+retag-latest: $(addprefix retag-latest-,$(RETAG)) ## Repoint :latest at an already-published TAG (no rebuild; RETAG names the images)
+retag-latest-ssh: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_SSH) $(IMG_SSH)
+retag-latest-jupyter: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_JUPYTER) $(IMG_JUPYTER)
+retag-latest-maca: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MACA) $(IMG_MACA)
+retag-latest-ssh-maca: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_SSH_MACA) $(IMG_SSH_MACA)
 
 help: ## Show this help message
