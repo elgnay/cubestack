@@ -212,14 +212,85 @@ describe("/api/cubepilot/agent/config", () => {
     expect(calls[0][0].body).toEqual([{ op: "add", path: "/spec/selectedModel", value: picked }]);
   });
 
-  it("PUT: a model the gateway does not serve is refused", async () => {
+  it("PUT: a model from an external provider is accepted even though the gateway does not serve it", async () => {
+    // The template's providers are the catalog — an external provider added in
+    // the LLM card is a first-class choice for the assistant. Reading the catalog
+    // from the gateway instead is what made those selections impossible: the
+    // picker had nothing to offer and this refused the ref.
     mockK8s(INSTANCE_CR);
+    patchNamespacedCustomObject.mockResolvedValue(INSTANCE_CR);
     const res = await PUT(
       await authedRequest({ method: "PUT", body: JSON.stringify({ config: { selectedModel: "deepseek/deepseek-chat" } }) }),
       undefined,
     );
+    expect(res.status).toBe(200);
+    const calls = patchNamespacedCustomObject.mock.calls as Array<[{ plural?: string; body?: unknown[] }]>;
+    const instance = calls.find((c) => c[0].plural === "agentinstances");
+    expect(instance?.[0].body).toEqual([{ op: "add", path: "/spec/selectedModel", value: "deepseek/deepseek-chat" }]);
+  });
+
+  it("PUT: a platform id the template still lists but the gateway no longer serves is refused", async () => {
+    // This save rewrites the platform provider's entry from the gateway's list, so
+    // accepting a stale platform ref would store a selection that vanishes from
+    // the template in the same request.
+    const staleTmpl = {
+      ...TEMPLATE_CR,
+      spec: { ...TEMPLATE_CR.spec, providers: [{ ...PLATFORM_PROVIDER, models: ["qwen38-27b", "old-model"] }, TEMPLATE_CR.spec.providers[1]] },
+    };
+    mockK8s(INSTANCE_CR, staleTmpl);
+    const res = await PUT(
+      await authedRequest({ method: "PUT", body: JSON.stringify({ config: { selectedModel: "cubestack/old-model" } }) }),
+      undefined,
+    );
     expect(res.status).toBe(400);
-    expect(((await res.json()) as { error: string }).error).toContain('unknown model "deepseek/deepseek-chat"');
+    expect(((await res.json()) as { error: string }).error).toContain('unknown model "cubestack/old-model"');
+    expect(patchNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("PUT: a prompt-only update leaves the instance's selection alone", async () => {
+    // A caller that sends instructions without a model must not have one derived
+    // for it: with external providers in play that would replace the reader's
+    // model with the first platform id the gateway happens to serve.
+    const external = { metadata: { name: "tester-cubepilot" }, spec: { owner: "tester", selectedModel: "deepseek/deepseek-chat" } };
+    mockK8s(external);
+    patchNamespacedCustomObject.mockResolvedValue(external);
+    const res = await PUT(
+      await authedRequest({ method: "PUT", body: JSON.stringify({ config: { userInstructions: "be terse" } }) }),
+      undefined,
+    );
+    expect(res.status).toBe(200);
+    const calls = patchNamespacedCustomObject.mock.calls as Array<[{ plural?: string; body?: unknown[] }]>;
+    const instance = calls.find((c) => c[0].plural === "agentinstances");
+    expect(instance?.[0].body).toEqual([{ op: "add", path: "/spec/userInstructions", value: "be terse" }]);
+  });
+
+  it("PUT: a gateway id that itself contains a slash is still accepted as a bare id", async () => {
+    // Models are namespaced on some gateways ("meta-llama/Llama-3"). Reading every
+    // slash as a provider separator would refuse an id the gateway serves.
+    gatewayFetch.mockResolvedValue(new Response(JSON.stringify({ data: [{ id: "meta-llama/Llama-3" }] }), { status: 200 }));
+    mockK8s(INSTANCE_CR);
+    patchNamespacedCustomObject.mockResolvedValue(INSTANCE_CR);
+    const res = await PUT(
+      await authedRequest({ method: "PUT", body: JSON.stringify({ config: { selectedModel: "meta-llama/Llama-3" } }) }),
+      undefined,
+    );
+    expect(res.status).toBe(200);
+    const calls = patchNamespacedCustomObject.mock.calls as Array<[{ plural?: string; body?: unknown[] }]>;
+    const instance = calls.find((c) => c[0].plural === "agentinstances");
+    expect(instance?.[0].body).toEqual([
+      { op: "add", path: "/spec/selectedModel", value: "cubestack/meta-llama/Llama-3" },
+    ]);
+  });
+
+  it("PUT: a ref no provider in the template declares is refused", async () => {
+    // Nothing resolves "openai/gpt-4o": storing it would fail every turn.
+    mockK8s(INSTANCE_CR);
+    const res = await PUT(
+      await authedRequest({ method: "PUT", body: JSON.stringify({ config: { selectedModel: "openai/gpt-4o" } }) }),
+      undefined,
+    );
+    expect(res.status).toBe(400);
+    expect(((await res.json()) as { error: string }).error).toContain('unknown model "openai/gpt-4o"');
     expect(patchNamespacedCustomObject).not.toHaveBeenCalled();
   });
 
