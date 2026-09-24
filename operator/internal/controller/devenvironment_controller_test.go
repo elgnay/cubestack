@@ -103,6 +103,11 @@ const (
 	// with spec.runtime.user; testSSHHome is the home it implies.
 	testSSHUser = "ubuntu"
 	testSSHHome = "/home/" + testSSHUser
+	// testWorkspaceSize is the claim every spec that needs a workspace declares,
+	// and testPinnedMountPath the path one of them pins it to. Named rather than
+	// repeated because neither is what those specs are about.
+	testWorkspaceSize   = "1Gi"
+	testPinnedMountPath = "/data/workspace"
 )
 
 // webRootPath is the published web path prefix for environments in the test
@@ -1156,6 +1161,28 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.Runtime.Env = append(env.Spec.Runtime.Env, vars...)
 			return env
 		}
+		// A workspace claim, so the controller states a home at all.
+		claiming := func(env *aiv1alpha1.DevEnvironment) *aiv1alpha1.DevEnvironment {
+			env.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
+			return env
+		}
+		// The derivation prefers a usable declared home, so a pinned mountPath is
+		// the one way a declared home loses.
+		pinned := func(env *aiv1alpha1.DevEnvironment) *aiv1alpha1.DevEnvironment {
+			claiming(env)
+			env.Spec.Storage.MountPath = testPinnedMountPath
+			return env
+		}
+		// A home the derivation cannot use, which is why the claim is what decides
+		// the path here.
+		homeFrom := func(env *aiv1alpha1.DevEnvironment) *aiv1alpha1.DevEnvironment {
+			return declaring(env, corev1.EnvVar{
+				Name: homeEnv,
+				ValueFrom: &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+					LocalObjectReference: corev1.LocalObjectReference{Name: "platform-home"}, Key: "workspace",
+				}},
+			})
+		}
 		// A mismatch needs a gpu block and an image that does not name its vendor.
 		mismatched := func() *aiv1alpha1.DevEnvironment {
 			env := newJupyter()
@@ -1204,6 +1231,15 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Type: aiv1alpha1.DevEnvironmentTypeJupyter, Image: testDevImage,
 					Runtime: &aiv1alpha1.RuntimeSpec{User: testRuntimeUser},
 				}}), 0, []string{"spec.runtime.user: ignored — "}),
+			// The claim is the workspace and the container is told where it is, so a
+			// declared home is not outranked but replaced — by the path the claim
+			// mounts at, which a pinned mountPath has already moved.
+			Entry("a declared home a pinned mountPath outranks",
+				pinned(declaring(newJupyter(), corev1.EnvVar{Name: homeEnv, Value: "/srv/elsewhere"})), 0,
+				[]string{"spec.runtime.env[HOME]: ignored — "}),
+			Entry("a home the derivation cannot use",
+				claiming(homeFrom(newJupyter())), 0,
+				[]string{"spec.runtime.env[HOME]: ignored — "}),
 			// Both dispositions in one spec: the refusal is what the phase follows,
 			// and the resolved value is reported beside it rather than instead of it.
 			Entry("reports a refusal and a resolved value together",
@@ -1231,6 +1267,17 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			// And nothing for a value the render path does not resolve either: a
 			// non-root environment keeps the account it declares.
 			Expect(specFindings(declaring(newJupyter(), corev1.EnvVar{Name: nbGIDEnv, Value: "1000"}))).To(BeEmpty())
+		})
+
+		// The home is the mount path, so a spec naming that path agrees with what
+		// the container is told rather than losing to it — and an environment with
+		// no claim is not resolved at all, home or no home.
+		It("reports nothing for the homes the controller applies as written", func() {
+			Expect(specFindings(claiming(declaring(newJupyter(),
+				corev1.EnvVar{Name: homeEnv, Value: defaultWorkspacePath})))).To(BeEmpty())
+			Expect(specFindings(declaring(newJupyter(),
+				corev1.EnvVar{Name: homeEnv, Value: "/srv/elsewhere"}))).To(BeEmpty())
+			Expect(specFindings(homeFrom(newJupyter()))).To(BeEmpty())
 		})
 
 		It("reports nothing for the values an ssh environment's image never reads", func() {
@@ -1894,7 +1941,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
 				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: testSSHUser}
 				// No mountPath: the claim lands on the account's home.
-				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "1Gi"}
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
 			})
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: workspaceClaimName, MountPath: testSSHHome},
@@ -1924,7 +1971,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		It("mounts the workspace claim at a declared HOME", func() {
 			spec := render(func(e *aiv1alpha1.DevEnvironment) {
 				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
-				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: "1Gi"}
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
 				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
 					User:            rootRuntimeUser,
 					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0)), RunAsGroup: ptrTo(int64(0))},
@@ -1934,6 +1981,93 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(spec.Containers[0].VolumeMounts).To(Equal([]corev1.VolumeMount{
 				{Name: workspaceClaimName, MountPath: "/home/root"},
 			}))
+		})
+
+		// The claim the platform mounts is the environment's workspace, so the
+		// container is told where it is: HOME names the path the claim mounts at,
+		// resolved once, and a launcher that serves HOME serves the workspace
+		// whatever its image bakes (::withWorkspaceHome). Every type gets it — a
+		// claim's path is no jupyter notion.
+		//
+		// The mount and the home are asserted against one literal, so the two
+		// cannot drift apart into two derivations of the same path.
+		homes := func(envVars []corev1.EnvVar) []corev1.EnvVar {
+			found := []corev1.EnvVar{}
+			for _, v := range envVars {
+				if v.Name == homeEnv {
+					found = append(found, v)
+				}
+			}
+			return found
+		}
+		DescribeTable("states the workspace mount as the container's home",
+			func(mut func(*aiv1alpha1.DevEnvironment), wantPath string) {
+				spec := render(func(e *aiv1alpha1.DevEnvironment) {
+					e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
+					mut(e)
+				})
+				c := spec.Containers[0]
+				Expect(c.VolumeMounts).To(ContainElement(corev1.VolumeMount{Name: workspaceClaimName, MountPath: wantPath}))
+				Expect(homes(c.Env)).To(Equal([]corev1.EnvVar{{Name: homeEnv, Value: wantPath}}))
+			},
+			Entry("for an environment running as root", func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
+				}
+			}, "/root"),
+			Entry("for a named account", func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser}
+			}, "/home/"+testRuntimeUser),
+			Entry("for an environment naming no account", func(*aiv1alpha1.DevEnvironment) {}, defaultWorkspacePath),
+			Entry("for a pinned mountPath on another type", func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				e.Spec.Storage.MountPath = testPinnedMountPath
+			}, testPinnedMountPath),
+		)
+
+		// A declared home the derivation resolves to is the value the controller
+		// states, so the container carries one entry and not two.
+		It("keeps a declared home that already names the mount path", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize}
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					User: testRuntimeUser,
+					Env:  []corev1.EnvVar{{Name: homeEnv, Value: "/home/" + testRuntimeUser}},
+				}
+			})
+			Expect(homes(spec.Containers[0].Env)).To(Equal([]corev1.EnvVar{
+				{Name: homeEnv, Value: "/home/" + testRuntimeUser},
+			}))
+		})
+
+		// Only the last of several declared entries ever reaches the container, so
+		// the earlier ones are dead already: the controller states one home rather
+		// than reproducing which of them the container would have taken.
+		It("collapses several declared homes into the one the container applies", func() {
+			spec := render(func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Storage = &aiv1alpha1.StorageSpec{Size: testWorkspaceSize, MountPath: testPinnedMountPath}
+				e.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+					User: testRuntimeUser,
+					Env: []corev1.EnvVar{
+						{Name: homeEnv, Value: "/srv/first"},
+						{Name: homeEnv, Value: "/srv/second"},
+					},
+				}
+			})
+			Expect(homes(spec.Containers[0].Env)).To(Equal([]corev1.EnvVar{
+				{Name: homeEnv, Value: testPinnedMountPath},
+			}))
+		})
+
+		// No claim, no workspace to name: the container keeps the home its image
+		// bakes, and the entry the spec declares with it. This is the case the
+		// launchers' own guards still cover.
+		It("states no home for an environment with no workspace claim", func() {
+			env := newEnv()
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{{Name: homeEnv, Value: testSSHHome}}}
+			c := (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0]
+			Expect(c.Env).To(Equal([]corev1.EnvVar{{Name: homeEnv, Value: testSSHHome}}))
+			Expect(c.VolumeMounts).To(BeEmpty())
 		})
 
 		It("injects JUPYTER_TOKEN from the managed auth secret and drops a user override", func() {

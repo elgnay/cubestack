@@ -74,8 +74,8 @@ always wins.
 
 A **root** environment (`spec.runtime.securityContext.runAsUser: 0`) is the case this table does not
 cover, since the identity comes from the security context rather than from `runtime.user`: the derived
-mount is `/root`, and every image serves that home as it stands — a launcher's one job there is to
-leave root with the home the derivation gives it (see Runtime behavior below).
+mount is `/root`, and the container is told as much — the controller states the mount path as `HOME`
+on every environment with a workspace claim, so no image has to infer it (see Runtime behavior below).
 
 A GPU image additionally has to be requested as one: the brand gate runs only when an environment asks
 for a vendor, and it requires the image's name to carry that vendor's token (`cuda` for `nvidia`,
@@ -112,12 +112,17 @@ for the GPU.
   handed more than those two: the controller adds `NB_USER`, `NB_UID`, `NB_GID` and, into the same
   `NOTEBOOK_ARGS`, `--allow-root` (`::withRootLauncherEnv`). A launcher that reads none of the trio may
   ignore it — neither jupyter launcher consults it at uid 0 — but a Jupyter launcher that ignores
-  `--allow-root` will not start as root at all. The **home** a root environment runs with is a launcher
-  decision as well, and both jupyter images decide it the same way: root's own `/root`, the home the
-  controller derives for `runAsUser: 0` and mounts the claim at, with a declared `HOME` left standing as
-  the one thing that outranks the image. `jupyter-minimal` takes uid 0 out of docker-stacks' `start.sh`
-  to do it — that launcher relocates root's home to `/home/root` whatever the environment declares,
-  which is what a root environment there used to state `HOME=/home/root` for.
+  `--allow-root` will not start as root at all. The **home** is no longer a launcher decision either:
+  the controller states the mount path as `HOME` on every environment with a workspace claim, so a root
+  environment is handed root's own `/root` — the home it derives for `runAsUser: 0` and mounts the
+  claim at — with nothing left for a launcher to work out. What each launcher keeps is a guard for the
+  one environment the controller says nothing about: a jupyter environment with no `spec.storage`, and
+  so no claim to be its home. There the container carries the home the image bakes — and at uid 0 the
+  wrong one — until the spec declares one of its own. `jupyter-minimal` keeps uid 0 out of
+  docker-stacks' `start.sh` for that, since that launcher relocates root's home to `/home/root`
+  whatever the environment declares, which is what a root environment there used to state
+  `HOME=/home/root` for. Either way a `HOME` that is not the image's own is left standing: it is the
+  controller's, or on a claim-less environment the spec's.
 
 ## ssh Secret mount contract
 
@@ -151,9 +156,9 @@ does not read a PKCS#8 Ed25519 key at all, and exits with *invalid format* if ha
 
 Both mount paths are **absolute and outside `$HOME`**, so neither depends on the account an image runs
 as, and the account's own `~/.ssh` is left to the account. `$HOME` is that account's home
-(`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`); the workspace PVC mounts there when the path
-is derived — an explicit `spec.storage.mountPath` is authoritative and may point elsewhere (see above),
-in which case `$HOME` stays on the container's own filesystem and only the workspace is durable. sshd
+(`/home/ubuntu` for `ubuntu`, `/home/jovyan` for `jovyan`), and it is where the workspace PVC mounts:
+the controller states the mount path as `HOME`, so pinning `spec.storage.mountPath` elsewhere (see
+above) moves the container's home with the workspace rather than leaving the two apart. sshd
 reads both files in place via the drop-in's `HostKey` and
 `AuthorizedKeysFile /run/ssh/authorized_keys %h/.ssh/authorized_keys` — the second path is the user's
 own file, so `ssh-copy-id` and similar tools keep working alongside the platform keys. No `.pub` and no
@@ -215,8 +220,9 @@ Implemented in **#173**; the controller code is in `operator/internal/controller
   create it root-owned.
 - **Mount the PVC at the account's home** — the controller derives it from `spec.runtime.user` (see
   above), unless the spec pins an explicit `mountPath`, which wins — so the workspace is durable
-  there. The ssh keys are mounted at absolute paths and so follow no home at all; sshd resolves `%h`
-  from the account's passwd entry for its own `AuthorizedKeysFile` entry.
+  there, and it states that same path as the container's `HOME`, so a launcher that serves `$HOME`
+  serves the workspace. The ssh keys are mounted at absolute paths and so follow no home at all; sshd
+  resolves `%h` from the account's passwd entry for its own `AuthorizedKeysFile` entry.
 - **Initialize the workspace claim's ownership.** A workspace claim mounts `root:root` and a non-root
   account can write nothing in it — no `~/.ssh`, no workspace files at all. The controller runs an init
   container before the environment starts (`::desiredPermissionInitContainer`) that chowns the claim

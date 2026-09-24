@@ -266,6 +266,15 @@ const (
 	// the ones that can are rolled.
 	rootLauncherEnvVersion = "root-launcher-env-1"
 
+	// workspaceHomeVersion names the shape of the home the controller states on a
+	// container that has a workspace claim (see withWorkspaceHome), for the same
+	// reason once more: the value is the mount path, which the hash input already
+	// carries through Storage and Runtime, so an environment whose spec has not
+	// changed would digest exactly as it did before the injection and keep the
+	// template it was rolled onto. An environment with no claim states no home
+	// and contributes nothing (::stsSpecHash), so only the others are rolled.
+	workspaceHomeVersion = "workspace-home-1"
+
 	// defaultRuntimeUser is the account an environment logs in as when
 	// spec.runtime.user names none; it is also the account the platform's base
 	// images conventionally use.
@@ -281,8 +290,9 @@ const (
 	defaultWorkspacePath = "/workspace"
 
 	// homeEnv is the variable spec.runtime.env declares the account's home
-	// through; it is the second input to the workspace mount path
-	// (::resolveMountPath).
+	// through. It is the second input to the workspace mount path
+	// (::resolveMountPath) and the name the controller states that path under
+	// (::withWorkspaceHome).
 	homeEnv = "HOME"
 
 	// Jupyter token: the managed Secret <env>-jupyter-token holds the random token under
@@ -1404,6 +1414,13 @@ func runtimeUser(env *aiv1alpha1.DevEnvironment) string {
 // container account is constrained by the CRD pattern to
 // ^[a-z_][a-z0-9_-]*$, so it cannot inject a path separator.
 //
+// The answer is also the home the controller states on the container, so where
+// the claim mounts and what the container is told are one decision rather than
+// two that happen to agree (::resolvedHome, ::withWorkspaceHome). A launcher that
+// serves HOME therefore serves the workspace with nothing of its own to infer,
+// and an explicit mountPath moves a declared HOME with it rather than leaving the
+// container pointed at a directory the claim is not mounted at.
+//
 // A declared HOME precedes the home the identity implies because it is the more
 // specific statement about where the container will look: an image whose
 // launcher relocates the account's home — stock docker-stacks moves root's to
@@ -1495,6 +1512,40 @@ func withNotebookBaseURL(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
 		return envVars
 	}
 	return append(envVars, corev1.EnvVar{Name: notebookArgsEnv, Value: notebookBaseURLFlag + path})
+}
+
+// withWorkspaceHome states the environment's home on the container. The claim
+// the platform mounts is the environment's workspace, so the path it mounts at
+// is what HOME has to name (::resolveMountPath, ::resolvedHome): a launcher that
+// reads HOME then serves the workspace without having to know what its own image
+// bakes.
+//
+// Every declared HOME entry is dropped rather than the last one replaced. Only
+// the last of several ever applies, so the others are dead entries already, and
+// which one a container takes is not something the render path should have to
+// reproduce to be right.
+func withWorkspaceHome(envVars []corev1.EnvVar, path string) []corev1.EnvVar {
+	envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == homeEnv })
+	return append(envVars, corev1.EnvVar{Name: homeEnv, Value: path})
+}
+
+// resolvedHome is the home the controller states on the container — the path the
+// workspace claim mounts at — and whether it states one at all. Without a claim
+// there is no workspace to name, and the environment keeps the home its image
+// bakes, which is the case both jupyter launchers still guard for.
+//
+// The value is the whole derivation rather than its home term, so an explicit
+// spec.storage.mountPath moves HOME with the claim: the claim is the workspace,
+// and a container told otherwise writes to its filesystem while the claim sits
+// unused — the failure the derivation exists to prevent.
+//
+// The render path and specFindings share it, so a declared HOME the controller
+// replaces is reported by the same predicate that replaces it.
+func resolvedHome(env *aiv1alpha1.DevEnvironment) (string, bool) {
+	if env.Spec.Storage == nil {
+		return "", false
+	}
+	return resolveMountPath(env), true
 }
 
 // rootLauncherEnvNeeded reports whether the environment is one the controller
@@ -1662,6 +1713,19 @@ func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 				detail: fmt.Sprintf("the environment runs as root, so the launcher account is root's own: the controller sets %s=%s, %s=%s, %s=%s (a launcher told to serve another account rewrites it, and cannot while the container is running as root)",
 					nbUserEnv, rootRuntimeUser, nbUIDEnv, rootAccountUID, nbGIDEnv, rootAccountGID),
 			})
+		case v.Name == homeEnv:
+			// A declared home is not outranked here: the claim is the workspace,
+			// and the container is told where it is (::withWorkspaceHome). So a
+			// value that differs from the resolved path is one the container does
+			// not run with, whether the derivation could not use it at all — a
+			// valueFrom source, a relative path, an unexpanded reference — or an
+			// explicit storage.mountPath outranked it.
+			if home, ok := resolvedHome(env); ok && v.Value != home {
+				findings = append(findings, specFinding{
+					field:  "runtime.env[" + homeEnv + "]",
+					detail: fmt.Sprintf("the environment's workspace is mounted at %s, which is the home the controller states on the container, so a launcher that reads HOME serves the workspace from there either way", home),
+				})
+			}
 		}
 	}
 	// Only a jupyter environment goes through withNotebookBaseURL at all, and only
@@ -1821,6 +1885,14 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		if rootLauncherEnvNeeded(env) {
 			envVars = withRootLauncherEnv(envVars)
 		}
+	}
+	// The claim the platform mounts is the environment's home, so the container is
+	// told where it is: a launcher that reads HOME serves the workspace whatever
+	// its image bakes (::resolvedHome). It applies to every type — a claim's path
+	// is no jupyter notion — while an environment with no claim states none and
+	// keeps the home its image bakes.
+	if home, ok := resolvedHome(env); ok {
+		envVars = withWorkspaceHome(envVars, home)
 	}
 	container.Env = envVars
 	if env.Spec.Storage != nil {
@@ -2249,6 +2321,15 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		// is), so the environments that cannot receive the injection digest exactly as
 		// they did before it existed and are not rewritten on upgrade.
 		RootLauncherEnv string `json:"rootLauncherEnv,omitempty"`
+		// WorkspaceHome is the version of the home the controller states on a
+		// container that has a workspace claim (::workspaceHomeVersion), and is empty
+		// for every environment that states none. Like RootLauncherEnv it stands for
+		// something this input cannot see: the injected value is the mount path, which
+		// Storage and Runtime already carry, so nothing else here moves when the
+		// injection is added. The empty string is omitted rather than hashed, so the
+		// environments that state no home digest exactly as they did before it
+		// existed.
+		WorkspaceHome string `json:"workspaceHome,omitempty"`
 		// RDMA is the *resolved* RDMA request (::rdmaResource) — the resource the
 		// container claims and whether the pod runs on the host network — rather
 		// than spec.network as declared. Both follow from the spec and from the
@@ -2270,6 +2351,13 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	if rootLauncherEnvNeeded(env) {
 		rootLauncherEnv = rootLauncherEnvVersion
 	}
+	// Empty unless the environment states a home, so the environments that state
+	// none — every one without a workspace claim — digest exactly as they did before
+	// the injection existed.
+	workspaceHome := ""
+	if _, ok := resolvedHome(env); ok {
+		workspaceHome = workspaceHomeVersion
+	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
 		Type:                 env.Spec.Type,
@@ -2284,6 +2372,7 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		SSHMount:             sshMountKey(env),
 		PodSecurityContext:   podSecurityContextVersion,
 		RootLauncherEnv:      rootLauncherEnv,
+		WorkspaceHome:        workspaceHome,
 		RDMA:                 rdma,
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
