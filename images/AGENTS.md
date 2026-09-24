@@ -151,14 +151,15 @@ one of these images), and each smokes *before* `Set up Buildx` — so `docker bu
 engine's builder, the store `docker run` reads — then drops what it built before pushing, since the
 buildx builder has a store of its own. Nothing pays that cost unless it can change a MACA image, which
 is what splitting the publish into two lanes buys: the `maca` job runs only for a merge that touched
-`common/`, the `Makefile`, `.dockerignore` or one of the two MACA directories, and the `cpu` job only
-for one that touched those first three or a CPU directory. `common/` is in both lists because all four
-Dockerfiles COPY from it, and each list is also that lane's `:latest` gate pathspec — a lane's trigger
-paths, its gate and its `retag-latest` set have to be the same set, or a tag can be withheld that no
-later run would move. Both families are still in the `build` / `smoke` / `push` aggregators, because an
-image that is never built is never checked and a local `make smoke` still means all four; if that cost
-ever outweighs the coverage, the lever is to drop `build-maca` / `build-ssh-maca` from the aggregators
-and run `smoke-maca` / `smoke-ssh-maca` by hand — not to leave their `push-` forms out of `push`, which
-would publish nothing.
+`common/`, the `Makefile`, `.dockerignore`, `ci-images.yml` itself or one of the two MACA directories,
+and the `cpu` job only for that same list with a CPU directory in place of a MACA one. `common/` is in
+both lists because all four Dockerfiles COPY from it, and `ci-images.yml` is in both because it is what
+defines them — so a merge that changes only that file publishes both families. Each list is also that
+lane's `:latest` gate pathspec, and a lane's trigger paths, its gate and its `retag-latest` set have to
+be the same set, or a tag can be withheld that no later run would move. Both families are still in the
+`build` / `smoke` / `push` aggregators, because an image that is never built is never checked and a
+local `make smoke` still means all four; if that cost ever outweighs the coverage, the lever is to drop
+`build-maca` / `build-ssh-maca` from the aggregators and run `smoke-maca` / `smoke-ssh-maca` by hand —
+not to leave their `push-` forms out of `push`, which would publish nothing.
 The two do not each pay for the base: they resolve the same pinned reference, so the second build of a
 run reuses the first's layers rather than pulling again.

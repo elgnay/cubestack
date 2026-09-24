@@ -50,7 +50,9 @@ jobs:
           # the gate pathspecs below spelled the other way round, and they have to stay
           # that way — see the gate.
           #
-          # images/common/** is in both, because all four Dockerfiles COPY from it.
+          # images/common/** is in both, because all four Dockerfiles COPY from it. This workflow
+          # file is in both because it is what defines these lists, so a change to the lanes
+          # republishes both families.
           #
           # Enumerating the paths also drops the two things under images/ that reach no
           # image at all: the markdown (README.md, AGENTS.md) and hack/. A docs edit on

@@ -573,17 +573,17 @@ prepared from the vendor package, not a bare base.
   `ci-operator.yml`'s `images-smoke` job builds and smokes every image on any change under `images/**`
   that is not markdown, on **pull requests** — that is what validates them, and it needs neither a
   cluster nor registry credentials. Publishing is `ci-images.yml`, on a push to `main` that changes
-  `images/**`, in **two jobs split by image family** — `cpu` (ssh + jupyter) and `maca` (the vendor
-  pair). Each smokes what it publishes, pushes the short-SHA tag with `PUSH_LATEST=0`, and moves its own
-  mutable `:latest` only if `main`'s copy of the paths that decide those images still matches that
-  commit. Three properties hold that together, and each is load-bearing: a family's trigger paths, its
-  gate pathspec and its `retag-latest` list are all the same set, so any later commit that could fail
-  its gate has itself started a run of that family to move the tag; a family's `:latest` is moved only
-  by a run that published it; and each family carries its own concurrency group, so only a run that
-  would redo the same work can cancel one in flight. The split is what keeps a merge touching only the
-  CPU pair from pulling the 10.5 GiB vendor base twice on its way to publishing images it could not
-  have changed. A `vX.Y.Z` tag publishes both families at the version it names and moves no `:latest`
-  (§5).
+  `images/**` or the workflow file itself (a change to the lanes starts both jobs), in **two jobs split
+  by image family** — `cpu` (ssh + jupyter) and `maca` (the vendor pair). Each smokes what it publishes,
+  pushes the short-SHA tag with `PUSH_LATEST=0`, and moves its own mutable `:latest` only if `main`'s
+  copy of the paths that decide those images still matches that commit. Three properties hold that
+  together, and each is load-bearing: a family's trigger paths, its gate pathspec and its
+  `retag-latest` list are all the same set, so any later commit that could fail its gate has itself
+  started a run of that family to move the tag; a family's `:latest` is moved only by a run that
+  published it; and each family carries its own concurrency group, so only a run that would redo the
+  same work can cancel one in flight. The split is what keeps a merge touching only the CPU pair from
+  pulling the 10.5 GiB vendor base twice on its way to publishing images it could not have changed. A
+  `vX.Y.Z` tag publishes both families at the version it names and moves no `:latest` (§5).
 - **Still open**: the offline export script (§3.D) — nothing in the repo produces the bundle yet, so
   an offline install is assembled by hand from the published images.
 
