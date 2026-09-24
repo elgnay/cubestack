@@ -36,15 +36,32 @@ jobs:
           # e2e pulls the *published* DevEnvironment image, so an edit under images/
           # changes nothing its cluster assertions can see until that commit is
           # published — running the whole operator suite for it would buy nothing.
-          # What does validate the images is images-smoke below, which builds both
-          # and asserts the operator contract against them.
+          # What does validate the images is images-smoke below, which builds every
+          # image and asserts the operator contract against them.
+          #
+          # Markdown is not a build input — nothing under images/ COPYs or otherwise
+          # reads one, the Dockerfiles taking *.sh and *.conf — so a docs edit on the
+          # image contract should not pay for a ~33 GB build of four images. The
+          # extglob says that directly. The obvious form, listing 'images/**' and then
+          # negating with '!images/**/*.md', is a silent no-op: paths-filter combines
+          # a rule's patterns with `some`, so a pattern that negates a match cannot
+          # subtract the file a positive pattern already matched. `every` would make
+          # negation work, but it applies to the whole rule set and would break the
+          # operator rule above, whose three patterns a file must not have to satisfy
+          # all of. Checked against picomatch with the action's own options
+          # ({dot: true}): every *.sh, *.conf, Dockerfile and Makefile under images/
+          # still matches at any depth, and *.md does not.
+          #
+          # The paths here decide what gets smoked before a merge, not what gets
+          # published — ci-images.yml's own two filters decide that, by enumerating what
+          # reaches a build context instead.
           filters: |
             operator:
               - 'operator/**'
               - 'Makefile'
               - '.github/**'
             images:
-              - 'images/**'
+              - 'images/**/!(*.md)'
 
   lint:
     needs: changes
@@ -86,10 +103,22 @@ jobs:
 
   images-smoke:
     needs: changes
-    if: needs.changes.outputs.images == 'true'
+    # On `main`, a push smokes the tree the pull request already smoked — a squash merge
+    # makes them the same tree — and ci-images.yml smokes it a third time just before
+    # publishing, so the merge was paying for the same 17 minutes on a second runner.
+    # Drop that one. A push to `release-*` is kept: ci-images.yml publishes nothing there,
+    # so this is the only acceptance the images on those branches ever get. The PR run is
+    # what gates `main`: it feeds the required `result` check below, which a skipped need
+    # does not fail.
+    if: >-
+      needs.changes.outputs.images == 'true' &&
+      (github.event_name == 'pull_request' || github.ref != 'refs/heads/main')
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # A full four-image smoke measured 17m02s, so this only ever fires on something stuck.
+    # The bound's job is to release the runner, not to be tight.
+    timeout-minutes: 45
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
