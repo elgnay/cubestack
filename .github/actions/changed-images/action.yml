@@ -58,12 +58,30 @@ runs:
             *) base="${BEFORE:-}" ;;
           esac
 
-          # No base to diff against — a new branch, or a checkout shape this does not
-          # know. Every path under images/ is a candidate then, and the rule answers from
-          # that. An unreadable base would fail the diff instead, and a diff that fails
-          # selects nothing, which is the one answer that is unsafe.
+          # A push to a branch that did not exist before carries all zeros rather than a
+          # sha. That is no base at all, which is what the case below answers — not a base
+          # gone missing, which is the case after it.
+          if [ "${base}" = "0000000000000000000000000000000000000000" ]; then base=""; fi
+
+          # A base that is not a commit in this clone has no diff to take: `git diff`
+          # fails on it with "bad object", and under `set -e` that ends the step rather
+          # than answering it — every job below skipped, and a merge that published
+          # nothing while a run that never happened leaves `:latest` where it was. A push
+          # whose previous head the server no longer holds is how that arises, a force
+          # push being the usual way; both checkouts here fetch full history, so this is
+          # the leftover case rather than the common one. It takes the same answer as no
+          # base at all, because it is the same situation: nothing to diff against.
+          if [ -n "${base}" ] && ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "changed-images: ${base} is not a commit in this clone; selecting from every tracked image path" >&2
+            base=""
+          fi
+
+          # No base to diff against — a new branch, an unreadable one, or a checkout
+          # shape this does not know. Every path under images/ is a candidate then, and
+          # the rule answers from that. Over-selecting costs a rebuild, where the
+          # alternative is a step that fails, which selects nothing and publishes nothing.
           case "${base}" in
-            "" | 0000000000000000000000000000000000000000) changed="$(git ls-files images)" ;;
+            "") changed="$(git ls-files images)" ;;
             *) changed="$(git diff --name-only "${base}" HEAD)" ;;
           esac
 

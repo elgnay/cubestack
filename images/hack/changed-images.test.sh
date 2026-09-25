@@ -70,6 +70,7 @@ check "the Makefile" "$ALL" "$ALL" images/Makefile
 check "the context definition" "$ALL" "$ALL" images/.dockerignore
 check "the publish workflow" "$ALL" "$ALL" .github/workflows/ci-images.yml
 check "the smoke workflow" "$ALL" "$ALL" .github/workflows/ci-operator.yml
+check "the selection action" "$ALL" "$ALL" .github/actions/changed-images/action.yml
 
 # The two selections differ on this path and nowhere else.
 check "the smoke harness" "" "$ALL" images/hack/smoke.sh
@@ -98,19 +99,21 @@ esac
 
 # --- the rule's scope is exactly what it claims ---------------------------------
 
-# Every tracked file outside images/ and the two workflow files must reach no image.
-# One invocation rather than one per file: the selection is a union, so anything these
-# produce would show up here.
+# Every tracked file outside images/ and the CI the rule names — the two workflows and the
+# action both of them delegate to — must reach no image. The list is restated rather than
+# read out of the rule, so the two have to be kept equal by hand; that is the same bargain
+# the table above makes. One invocation rather than one per file: the selection is a union,
+# so anything these produce would show up here.
 outside=()
 while IFS= read -r f; do
   outside+=("$f")
-done < <(git ls-files | grep -v '^images/' | grep -v '^\.github/workflows/ci-\(images\|operator\)\.yml$' || true)
+done < <(git ls-files | grep -v '^images/' | grep -vE '^\.github/(workflows/ci-(images|operator)\.yml|actions/changed-images/action\.yml)$' || true)
 cases=$((cases + 1))
 if [ "$(printf '%s\n' "${outside[@]:-}" | "$SUT" select)" != "" ]; then
   failures=$((failures + 1))
   printf 'FAIL  a path outside the rule reaches an image\n'
 else
-  printf 'ok    no path outside images/ and the workflows reaches an image\n'
+  printf 'ok    no path outside images/ and the CI the rule names reaches an image\n'
 fi
 
 # --- paths == select, exhaustively ----------------------------------------------
@@ -122,7 +125,10 @@ fi
 scope=()
 while IFS= read -r f; do
   scope+=("$f")
-done < <(git ls-files -- images .github/workflows/ci-images.yml .github/workflows/ci-operator.yml)
+done < <(git ls-files -- images \
+  .github/actions/changed-images/action.yml \
+  .github/workflows/ci-images.yml \
+  .github/workflows/ci-operator.yml)
 
 for img in $ALL; do
   read -r -a path_args <<<"$("$SUT" paths "$img" | tr '\n' ' ')"

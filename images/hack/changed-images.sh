@@ -39,9 +39,14 @@ set -euo pipefail
 # name is what a caller wants.
 ALL_IMAGES=(ssh jupyter maca ssh-maca)
 
-# The workflows that decide how these images are built, smoked and published. A change to
-# either republishes every image, so every image's gate watches both.
-WORKFLOW_PATHS=(
+# The CI that decides how these images are built, smoked and published: the two workflows,
+# and the action both of them delegate the selection to. A change to any of them
+# republishes every image, so every image's gate watches all three. The action belongs
+# here as much as the workflows do, and for the same reason: it is what picks the diff
+# base the rule is asked about, and the flags that size each publishing leg — a change to
+# it alone changes what every selection below means.
+CI_PATHS=(
+  .github/actions/changed-images/action.yml
   .github/workflows/ci-images.yml
   .github/workflows/ci-operator.yml
 )
@@ -54,9 +59,9 @@ WORKFLOW_PATHS=(
 # change to any of them is a change to all four, and leaving the checker out would also
 # leave it unrun: ci-operator.yml's `images-check` job is gated on a non-empty selection.
 #
-# This list is read by `select`, and the workflow half of it by `paths`.
+# This list is read by `select`, and the CI half of it by `paths`.
 SHARED_PATHS=(
-  "${WORKFLOW_PATHS[@]}"
+  "${CI_PATHS[@]}"
   images/common
   images/Makefile
   images/.dockerignore
@@ -215,7 +220,7 @@ case "$cmd" in
     # not see such a path would let two merges through it move `:latest` in whichever
     # order they happened to finish. The complement is taken over the same tables below,
     # so the two cannot drift.
-    printf '%s\n' images "${WORKFLOW_PATHS[@]}"
+    printf '%s\n' images "${CI_PATHS[@]}"
     for other in "${ALL_IMAGES[@]}"; do
       if [ "$other" != "$2" ]; then printf ':(exclude)images/%s\n' "$(own_dir "$other")"; fi
     done

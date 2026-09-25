@@ -138,8 +138,10 @@ so it builds a fresh one from the same source.
 `make -C images smoke` is the acceptance gate, and which images it covers is a rule rather than a
 hand-kept list: `hack/changed-images.sh` answers "which images does this diff reach", and
 `ci-operator.yml` asks it — in place of a paths filter — what a pull request must smoke. Each image
-depends on its own directory, on `common/`, on the `Makefile` and `.dockerignore`, and on the two
-workflows; a Dockerfile never `COPY`s from a sibling image's directory, which is what makes the
+depends on its own directory, on `common/`, on the `Makefile` and `.dockerignore`, and on the CI that
+builds, smokes and publishes it — the two workflows and the `changed-images` action both of them
+delegate to, which is what picks the diff base and the flags that size a publishing leg; a Dockerfile
+never `COPY`s from a sibling image's directory, which is what makes the
 answer derivable from a changed path alone, and `make -C images check-deps` is what asserts that
 convention rather than assuming it. A changed path under `images/` the rule does not recognise
 selects **every** image and says so on stderr — over-selecting costs a rebuild, under-selecting

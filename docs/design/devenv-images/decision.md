@@ -575,9 +575,10 @@ prepared from the vendor package, not a bare base.
   needs neither a cluster nor registry credentials. Which images those are is answered by
   `images/hack/changed-images.sh`, the rule the operator workflow asks; `make -C images check-deps
   check-select` asserts the convention that answer is derived from, and runs its fixtures. Publishing
-  is `ci-images.yml`, on a push to `main` that changes `images/**` or the workflows, as **one job per
-  image**, selected by that same rule — the selection *is* the job matrix, so an image the merge did
-  not reach has no job at all rather than a skipped one. Each leg smokes the image it is about to
+  is `ci-images.yml`, on a push to `main` that changes `images/**` or the CI that selects what a
+  change reaches — the workflows and the action they delegate to — as **one job per image**,
+  selected by that same rule — the selection *is* the job matrix, so an image the merge did not
+  reach has no job at all rather than a skipped one. Each leg smokes the image it is about to
   publish, pushes the short-SHA tag with `PUSH_LATEST=0`, and moves its own mutable `:latest` only if
   `main`'s copy of the paths that decide that image still matches that commit. Three properties hold
   that together, and each is load-bearing: an image's trigger paths, its gate pathspec and its
