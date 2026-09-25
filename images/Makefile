@@ -101,15 +101,33 @@ UBUNTU_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/docker.io/library/ubuntu:$(UBUNTU_VE
 # stands, into MIRROR_PROJECT, so there is no suanova/ copy to name; the vendor package keeps
 # its upstream path and the platform owns only the host serving it. Spelled out rather than
 # derived from $(PROJECT) so that stays visible.
+#
+# A table rather than an inline digest, for the reason UBUNTU_BASE_DIGESTS gives: MACA_PACKAGE
+# selects the base *and* is read for the tag, so a package bumped on its own would carry its name
+# onto the previous package's digest — and the digest is what the build resolves, so the published
+# reference would claim a package its layers do not come from. One entry per mirrored package; a
+# package with no entry stops in check-maca-base instead. Nothing mirrors the vendor bases, so the
+# entry is added by hand.
 MACA_PACKAGE = maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64
-MACA_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/cr.metax-tech.com/public-library/$(MACA_PACKAGE)@sha256:da5065e441290224914e5643f6cd39e46a927d58eb2d97c865263ddd87c37a49
+MACA_BASE_DIGESTS = maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64=sha256:da5065e441290224914e5643f6cd39e46a927d58eb2d97c865263ddd87c37a49
+MACA_BASE_DIGEST = $(patsubst $(MACA_PACKAGE)=%,%,$(filter $(MACA_PACKAGE)=%,$(MACA_BASE_DIGESTS)))
+MACA_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/cr.metax-tech.com/public-library/$(MACA_PACKAGE)@$(MACA_BASE_DIGEST)
 
 # The CUDA base, pinned the same way and outside $(PROJECT) for the same reason: NVIDIA's PyTorch
 # package was mirrored as it stands. It differs from MACA_PACKAGE in shape — the upstream host is
 # the first path segment of the *upstream* reference and the tag is nvcr.io's own release name,
 # not a vendor package rebuilt per architecture.
+#
+# A table rather than an inline digest, the way UBUNTU_VERSION is looked up in UBUNTU_BASE_DIGESTS:
+# CUDA_PACKAGE selects the base *and* is read for the tag, so a release bumped on its own would
+# carry its name onto the previous release's digest — and the digest is what the build resolves,
+# so the published reference would claim a release its layers do not come from. One entry per
+# mirrored release; a release with no entry stops in check-cuda-base instead. Nothing mirrors the
+# vendor bases, so the entry is added by hand.
 CUDA_PACKAGE = pytorch:26.08-py3
-CUDA_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/nvcr.io/nvidia/$(CUDA_PACKAGE)@sha256:ee619c9e16df23c5a7f6f79ff9a41ce3c6ea9f23a92a4833b59825bb056002cc
+CUDA_BASE_DIGESTS = pytorch:26.08-py3=sha256:ee619c9e16df23c5a7f6f79ff9a41ce3c6ea9f23a92a4833b59825bb056002cc
+CUDA_BASE_DIGEST = $(patsubst $(CUDA_PACKAGE)=%,%,$(filter $(CUDA_PACKAGE)=%,$(CUDA_BASE_DIGESTS)))
+CUDA_BASE = $(REGISTRY)/$(MIRROR_PROJECT)/nvcr.io/nvidia/$(CUDA_PACKAGE)@$(CUDA_BASE_DIGEST)
 
 APT_MIRROR_ARG    = $(if $(APT_MIRROR),--build-arg APT_MIRROR=$(APT_MIRROR))
 PIP_INDEX_URL_ARG = $(if $(PIP_INDEX_URL),--build-arg PIP_INDEX_URL=$(PIP_INDEX_URL))
@@ -279,20 +297,39 @@ check-ubuntu-base:
 # axes would publish a name with an empty field — '4.0--torch2.5-<sha>' — claiming less than the
 # image is (and a vendor rename is the one thing a base bump can bring). Stop instead of publishing
 # it; the fix is the derivation above.
+#
+# The package also selects the base, so that lookup is checked too — and likewise only for the
+# defaulted BASE_ARGS, since a caller who passed their own chose their own base.
 check-maca-base:
 	@test -n "$(MACA_PKG_VERSION)" && test -n "$(MACA_PKG_PY)" && test -n "$(MACA_PKG_TORCH)" || { \
 		echo "make -C images: cannot read the vendor axes out of MACA_PACKAGE=$(MACA_PACKAGE)." >&2; \
 		echo "                Expected <version>-torch<ver>-py<python>-<distro>-<arch>." >&2; \
+		exit 1; }
+	@test "$(origin BASE_ARGS)" != file || test -n "$(MACA_BASE_DIGEST)" || { \
+		echo "make -C images: MACA_PACKAGE=$(MACA_PACKAGE) has no pinned base in MACA_BASE_DIGESTS." >&2; \
+		echo "                Add '<package>=sha256:<digest>' for the mirror's copy of that package," >&2; \
+		echo "                then verify the digest against the mirror rather than the tag." >&2; \
+		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
 		exit 1; }
 
 # CUDA_TAG is read out of CUDA_PACKAGE too, and its derivation reads only the first field of the
 # tag — so a re-tagged or renamed release whose version cannot be picked out would publish
 # '-<sha>', a name with no vendor release in it at all. Stop instead; the fix is the derivation
 # above.
+#
+# The package also selects the base, so that lookup is checked the way check-ubuntu-base checks
+# its release — and likewise only for the defaulted BASE_ARGS: a caller who passed their own chose
+# their own base, and this file has nothing to check it against.
 check-cuda-base:
 	@test -n "$(CUDA_PKG_VERSION)" || { \
 		echo "make -C images: cannot read the vendor release out of CUDA_PACKAGE=$(CUDA_PACKAGE)." >&2; \
 		echo "                Expected <release>-py<python>, e.g. pytorch:26.08-py3." >&2; \
+		exit 1; }
+	@test "$(origin BASE_ARGS)" != file || test -n "$(CUDA_BASE_DIGEST)" || { \
+		echo "make -C images: CUDA_PACKAGE=$(CUDA_PACKAGE) has no pinned base in CUDA_BASE_DIGESTS." >&2; \
+		echo "                Add '<package>=sha256:<digest>' for the mirror's copy of that release," >&2; \
+		echo "                then verify the digest against the mirror rather than the tag." >&2; \
+		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
 		exit 1; }
 
 build: build-ssh build-jupyter build-maca build-ssh-maca build-cuda build-ssh-cuda ## Build every image

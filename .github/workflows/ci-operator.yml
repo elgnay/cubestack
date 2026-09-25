@@ -143,7 +143,10 @@ jobs:
         run: make -C images smoke-ssh smoke-jupyter smoke-maca smoke-ssh-maca
       - name: Drop what that built
         run: |
+          # The builder's cache is not the image store's, and `docker image prune` does not
+          # reach it: what the MACA pair cached would still be resident under the CUDA base.
           docker image prune -af
+          docker builder prune -af
           df -h /
       - name: Build and smoke the CUDA images
         run: make -C images smoke-cuda smoke-ssh-cuda
