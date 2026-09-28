@@ -35,8 +35,8 @@ The targets are idempotent and safe to re-run; `helm-e2e-verify` re-applies the
 dummy assets and re-asserts them.
 
 The manager image defaults to `harbor.isuanova.com/suanova/cubestack-controller-manager:latest`
-and is deployed with `imagePullPolicy: IfNotPresent` (baked into the chart
-template), so the image loaded into kind wins over the registry even for a
+and is deployed with `imagePullPolicy: IfNotPresent` (the chart's `image.pullPolicy`
+default), so the image loaded into kind wins over the registry even for a
 `:latest` tag. Override the image with `make helm-e2e-install IMG=<registry>/<repo>:<tag>`.
 
 ### What the install provisions

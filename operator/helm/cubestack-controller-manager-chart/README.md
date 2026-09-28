@@ -207,12 +207,18 @@ helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-sy
   --set image.tag=v1.2.3
 ```
 
-The Deployment template bakes `imagePullPolicy: IfNotPresent` into the
-manager container (fixed in the template — it is not a values knob). Local
-kind testing therefore works with the `:latest` default: the built image is
-kind-loaded into the cluster, and `IfNotPresent` makes the loaded image win
-over the registry instead of the kubelet's `Always` default for `latest`
-tags triggering a remote pull.
+`image.pullPolicy` sets the manager container's `imagePullPolicy` and defaults
+to `IfNotPresent`. Local kind testing therefore works with the `:latest`
+default: the built image is kind-loaded into the cluster, and `IfNotPresent`
+makes the loaded image win over the registry instead of the kubelet's `Always`
+default for `latest` tags triggering a remote pull. Set it to `Always` where
+the tag is mutable and a re-pushed image should be picked up without the pod
+being deleted:
+
+```bash
+helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system \
+  --create-namespace --set image.pullPolicy=Always
+```
 
 ### Upgrading from a chart that created the Gateway
 
