@@ -22,6 +22,7 @@ import { Box } from "@mui/material";
 import { useRouter } from "next/navigation";
 import { Fragment, useEffect, useRef, useState } from "react";
 
+import { apiFetch } from "@/lib/base-path";
 import {
   addApproval,
   carryOpenCards,
@@ -236,9 +237,9 @@ export function FloatingChat() {
   async function loadAgentMeta(): Promise<AgentMeta> {
     try {
       const [stRes, cfgRes, skRes] = await Promise.all([
-        fetch("/api/cubepilot/agent/status"),
-        fetch("/api/cubepilot/agent/config"),
-        fetch("/api/cubepilot/skills"),
+        apiFetch("/api/cubepilot/agent/status"),
+        apiFetch("/api/cubepilot/agent/config"),
+        apiFetch("/api/cubepilot/skills"),
       ]);
       const [stBody, cfgBody, skBody] = await Promise.all([
         stRes.json().catch(() => null),
@@ -285,7 +286,7 @@ export function FloatingChat() {
    *  off: a button that might not hold is worse than a button never seen. */
   async function loadConfirmPolicy(): Promise<string> {
     try {
-      const res = await fetch("/api/cubepilot/agent/confirm");
+      const res = await apiFetch("/api/cubepilot/agent/confirm");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { confirmPolicy?: string };
       const policy = body.confirmPolicy ?? "";
@@ -307,7 +308,7 @@ export function FloatingChat() {
   async function loadAgentHistory(key: string): Promise<boolean> {
     const gen = genRef.current;
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/messages`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/messages`);
       // 404 is "this conversation has not started": an ordinary empty thread,
       // NOT a failure.
       if (res.status === 404) return false;
@@ -330,7 +331,7 @@ export function FloatingChat() {
    *  running": the route answers 502 exactly when it could not determine. */
   async function checkTurnElsewhere(key: string, gen: number): Promise<boolean> {
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/turn`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/turn`);
       if (genRef.current !== gen) return false;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { active } = (await res.json()) as { active?: boolean };
@@ -371,7 +372,7 @@ export function FloatingChat() {
       });
     };
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/approvals`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/approvals`);
       // A failed read is thrown so that it is reported rather than folded into
       // "nothing is parked": an empty collection is the ordinary answer for a
       // session that is not parked, and a read that could not be made is not
@@ -406,7 +407,7 @@ export function FloatingChat() {
       }
     }
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/questions`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/questions`);
       // An empty collection is "nothing is pending", and a read that FAILED is
       // thrown so that it is reported rather than folded into "idle".
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -439,7 +440,7 @@ export function FloatingChat() {
   async function refreshHistoryIfChanged(key: string): Promise<void> {
     const gen = genRef.current;
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/messages`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/messages`);
       if (!res.ok) return;
       const body = (await res.json()) as { items?: HistoryMessage[] };
       if (genRef.current !== gen) return;
@@ -579,7 +580,7 @@ export function FloatingChat() {
     const gen = followGenRef.current;
 
     const tickOnce = async (): Promise<void> => {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/turn`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/turn`);
       if (!res.ok || followGenRef.current !== gen) return;
       const { active } = (await res.json()) as { active?: boolean };
       if (followGenRef.current !== gen) return;
@@ -764,7 +765,7 @@ export function FloatingChat() {
     const ctl = new AbortController();
     sendCtlRef.current = ctl;
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/messages`, {
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/messages`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // The conversation is named by the path. Bodies are decoded strictly,
@@ -873,7 +874,7 @@ export function FloatingChat() {
     // look like it landed immediately.
     patchApproval(callId, (a) => ({ ...a, state: "deciding", error: undefined }));
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/approvals/decision`, {
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/approvals/decision`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         // The id is required: a session can hold several pending approvals,
@@ -912,7 +913,7 @@ export function FloatingChat() {
    *  refusal (404/409) does not say WHY, and guessing is what loses an answer. */
   async function reopenOrExpireQuestion(callId: string): Promise<void> {
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/questions`);
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/questions`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const { questions } = (await res.json()) as {
         questions?: Array<{ id?: string; questions?: AgentQuestionItem[]; timeoutSeconds?: number }>;
@@ -940,7 +941,7 @@ export function FloatingChat() {
   async function submitQuestion(callId: string, answers: Record<string, string[]>, cancel: boolean): Promise<void> {
     patchQuestion(callId, (q) => ({ ...q, state: "submitting", answers: cancel ? q.answers : answers, error: undefined }));
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/questions/${cancel ? "cancel" : "answer"}`,
         {
           method: "POST",
@@ -968,7 +969,7 @@ export function FloatingChat() {
   /** Abort the session's turn, reporting the server's own refusal. */
   async function abortTurn(): Promise<{ ok: true } | { ok: false; error: string }> {
     try {
-      const res = await fetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/abort`, { method: "POST" });
+      const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(SESSION_KEY)}/abort`, { method: "POST" });
       if (res.ok) return { ok: true };
       const body = (await res.json().catch(() => null)) as { error?: string } | null;
       return { ok: false, error: body?.error ?? `HTTP ${res.status}` };
