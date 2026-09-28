@@ -169,7 +169,12 @@ nothing while re-verifying everything. `make -C images check-select` runs the ru
 
 `images-smoke` builds and smokes exactly that selection, on a pull request or a `release-*` push —
 the run which gates the content, since on `main` it would smoke the tree the pull request already
-smoked — and a change that reaches no image skips it. A merge is what `ci-images.yml` publishes, as
+smoked — and a change that reaches no image skips it. It runs **one job per base image** rather
+than one over the whole selection: two images built on one base resolve the same base layers, so a
+leg builds both and unpacks that base once where a leg each would unpack it twice, a base the
+change did not reach has no leg at all — a CUDA-only pull request schedules one runner, not three —
+and the two *different* vendor bases never share a leg, because one runner cannot hold both (see
+the disk paragraph below). A merge is what `ci-images.yml` publishes, as
 **one job per image**, and it asks the same rule: the selection *is* the job matrix, so an image the
 merge did not reach has no job at all rather than a skipped one, claims no runner and enters no
 concurrency group. Each leg smokes the image it is about to publish and then withholds `:latest`
@@ -181,29 +186,30 @@ later run would move. A `vX.Y.Z` tag publishes every image at the version it nam
 itself needs no cluster and no registry credentials: every image is built for linux/amd64 and run as
 throwaway containers on 127.0.0.1.
 
-That last point is where the MACA images are expensive: their shared vendor base is a 10.5 GiB pull
-and about **33 GB unpacked**, which is what a runner has to hold — twice over, if the image the smoke
-built and the one `push` builds land in different stores. That is what the steps answer: a vendor leg
-reclaims the runner's preinstalled SDKs first (`.github/actions/reclaim-disk`, because ~31 GB free is
-less than one of these images), and smokes *before* `Set up Buildx`, so `docker build` loads into the
-engine's builder — the store `docker run` reads — and then pushes **out of that same builder**,
-because a MACA build is single-platform and the default `docker` driver both pushes one and builds in
-the engine's store. The push reads back what the smoke just pulled and built instead of repeating
-both (a second pull of that base measured at 590s, and the build it feeds). `Drop what the smoke
-built`, `Set up QEMU` and `Set up Buildx` are the CPU legs' steps and all three are keyed off the
-same `vendor` flag the selector puts on each matrix leg: they exist because the container driver
-`Set up Buildx` installs builds in a store of its own — which the CPU pair needs for its amd64+arm64
-index, and which a vendor leg would need a second ~33 GB of runner disk to keep. Nothing pays that
-cost unless it can
-change a MACA image. One job per image is what keeps it that way: a merge that reaches only a CPU
-image, only the smoke harness or only markdown schedules no vendor build at all, and the two vendor
-images get a whole runner's disk each rather than sharing one. The reclaim and the long timeout are
-the vendor legs' alone too — the CPU pair is a fraction of that base (`ssh-ubuntu22.04` measures 132
-MB). The other side of that split is that the two vendor legs no longer share a runner's layer store,
-so a merge reaching both runs the base's pull on two runners in parallel where one lane ran it twice
-on one; the exchange is the disk, the CPU legs' 1m41s and the fact that a merge reaching one of them
-pays for one. Both families are still in the `build` / `smoke` / `push`
-aggregators, because an image that is never built is never checked and a local `make smoke` still
-means all four; if that cost ever outweighs the coverage, the lever is to drop `build-maca` /
-`build-ssh-maca` from the aggregators and run `smoke-maca` / `smoke-ssh-maca` by hand — not to leave
-their `push-` forms out of `push`, which would publish nothing.
+That last point is where the vendor images are expensive: the MACA pair's shared base is a 10.5 GiB
+pull and about **33 GB unpacked**, the CUDA pair's about **38.6 GB** — that is what a runner has to
+hold, twice over, if the image the smoke built and the one `push` builds land in different stores.
+That is what the steps answer: a vendor leg reclaims the runner's preinstalled SDKs first
+(`.github/actions/reclaim-disk`, because ~31 GB free is less than either of these images), and smokes
+*before* `Set up Buildx`, so `docker build` loads into the engine's builder — the store `docker run`
+reads — and then pushes **out of that same builder**, because a vendor build is single-platform and
+the default `docker` driver both pushes one and builds in the engine's store. The push reads back
+what the smoke just pulled and built instead of repeating both (a second pull of that base measured
+at 590s, and the build it feeds). `Drop what the smoke built`, `Set up QEMU` and `Set up Buildx` are
+the CPU legs' steps and all three are keyed off the same `vendor` flag the selector puts on each
+matrix leg: they exist because the container driver `Set up Buildx` installs builds in a store of its
+own — which the CPU pair needs for its amd64+arm64 index, and which a vendor leg would need a second
+copy of its base, tens of GB, to keep. Nothing pays that cost unless it can change a vendor image. One job
+per image is what keeps it that way: a merge that reaches only a CPU image, only the smoke harness or
+only markdown schedules no vendor build at all, and each vendor image gets a whole runner's disk
+rather than sharing one. The reclaim and the long timeout are the vendor legs' alone too — the CPU
+pair is a fraction of that base (`ssh-ubuntu22.04` measures 132 MB). The other side of that split is
+that the vendor images no longer share a runner's layer store, so a merge reaching two of them runs
+their base's pull on two runners in parallel where one lane ran it twice on one; the exchange is the
+disk, the CPU legs' 1m41s and the fact that a merge reaching one of them pays for one. Every image is
+still in the `build` / `smoke` / `push` aggregators, because an image that is never built is never
+checked and a local `make smoke` still means all six, which is every vendor base unpacked on one
+machine (~72 GB) — if that cost ever outweighs the coverage, the lever is to drop the vendor images'
+`build-` targets from the aggregators and run `smoke-maca` / `smoke-ssh-maca` / `smoke-cuda` /
+`smoke-ssh-cuda` by hand — not to leave their `push-` forms out of `push`, which would publish
+nothing.

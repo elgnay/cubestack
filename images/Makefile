@@ -299,7 +299,11 @@ check-ubuntu-base:
 # it; the fix is the derivation above.
 #
 # The package also selects the base, so that lookup is checked too — and likewise only for the
-# defaulted BASE_ARGS, since a caller who passed their own chose their own base.
+# defaulted BASE_ARGS, since a caller who passed their own chose their own base. Unlike
+# check-ubuntu-base, the message here does not offer `BASE_ARGS=` as the way out: that resolves
+# FROM upstream, and there is no upstream of a vendor base a build here reaches — which is what
+# the BASE_ARGS comment above says of MACA already. It would land the caller on a floating tag
+# in exactly the case this guard exists to stop.
 check-maca-base:
 	@test -n "$(MACA_PKG_VERSION)" && test -n "$(MACA_PKG_PY)" && test -n "$(MACA_PKG_TORCH)" || { \
 		echo "make -C images: cannot read the vendor axes out of MACA_PACKAGE=$(MACA_PACKAGE)." >&2; \
@@ -309,7 +313,6 @@ check-maca-base:
 		echo "make -C images: MACA_PACKAGE=$(MACA_PACKAGE) has no pinned base in MACA_BASE_DIGESTS." >&2; \
 		echo "                Add '<package>=sha256:<digest>' for the mirror's copy of that package," >&2; \
 		echo "                then verify the digest against the mirror rather than the tag." >&2; \
-		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
 		exit 1; }
 
 # CUDA_TAG is read out of CUDA_PACKAGE too, and its derivation reads only the first field of the
@@ -319,7 +322,9 @@ check-maca-base:
 #
 # The package also selects the base, so that lookup is checked the way check-ubuntu-base checks
 # its release — and likewise only for the defaulted BASE_ARGS: a caller who passed their own chose
-# their own base, and this file has nothing to check it against.
+# their own base, and this file has nothing to check it against. The message differs from that
+# guard's in one respect, the same one check-maca-base differs in: `BASE_ARGS=` resolves FROM
+# upstream, and this base is a mirrored copy with no upstream a build here reaches.
 check-cuda-base:
 	@test -n "$(CUDA_PKG_VERSION)" || { \
 		echo "make -C images: cannot read the vendor release out of CUDA_PACKAGE=$(CUDA_PACKAGE)." >&2; \
@@ -329,7 +334,6 @@ check-cuda-base:
 		echo "make -C images: CUDA_PACKAGE=$(CUDA_PACKAGE) has no pinned base in CUDA_BASE_DIGESTS." >&2; \
 		echo "                Add '<package>=sha256:<digest>' for the mirror's copy of that release," >&2; \
 		echo "                then verify the digest against the mirror rather than the tag." >&2; \
-		echo "                Or pass BASE_ARGS= to build FROM upstream, unpinned." >&2; \
 		exit 1; }
 
 # The two assertions the image-selection rule rests on. Neither builds anything — no
