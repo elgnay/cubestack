@@ -79,7 +79,7 @@ jobs:
     timeout-minutes: ${{ matrix.vendor && 300 || 60 }}
     # Scoped to the image and so to the ref. Only another run that publishes this same
     # image may cancel it, because only such a run redoes the work it would be cutting
-    # off. One group for all four would let a CPU-only merge cancel an in-flight vendor
+    # off. One group for every image would let a CPU-only merge cancel an in-flight vendor
     # publish, whose tag no later run would then be left to move. An image this commit did
     # not reach has no job here at all, so it cannot be the victim of a cancellation.
     concurrency:

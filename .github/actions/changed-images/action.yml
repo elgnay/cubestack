@@ -26,6 +26,13 @@ outputs:
       `build` as a JSON array of `{image, vendor}` objects, for the `include` of a
       `fromJSON` matrix.
     value: ${{ steps.rule.outputs.build-json }}
+  smoke-groups-json:
+    description: >-
+      `smoke` grouped by base image, as a JSON array of `{base, images, vendor}` objects for
+      the `include` of a `fromJSON` matrix: one leg per base that has a selected image, and
+      no leg for a base without one. `images` is space-separated, in the rule's order, so a
+      leg loops it exactly as a per-image selection was looped.
+    value: ${{ steps.rule.outputs.smoke-groups-json }}
 
 runs:
   using: composite
@@ -99,26 +106,38 @@ runs:
         # and is appended as a new one otherwise, so a per-image entry duplicates its own
         # leg.
         #
-        # `vendor` is what sizes a leg. The two MACA images are tens of GB unpacked each
-        # against the ~31 GB a standard runner has free, where the CPU pair is a fraction
-        # of that (`ssh-ubuntu22.04` measures 132 MB), so the disk reclaim and the long
-        # timeout belong to them alone. Named here because this is the layer those two
-        # settings live in; an image added tomorrow and not named below gets the CPU leg's
-        # settings, and fails loudly on disk rather than quietly on time.
+        # `vendor` is what sizes a leg: the disk reclaim and the long timeout belong to the
+        # images built on a vendor base, which unpack to tens of GB each against the ~31 GB
+        # a standard runner has free on /, where the CPU pair is a fraction of that
+        # (`ssh-ubuntu22.04` measures 132 MB).
+        #
+        # Asked of the rule rather than compiled in here. `vendor` is exactly "this image is
+        # not built on the CPU base", which the rule already holds in the same row that names
+        # the image's directory — and the smoke side asks it too, to size the same kind of
+        # leg. A `case` in this step would be a second answer to one question, and the
+        # publish half of a disagreement fails quietly: an image read as CPU gets the shorter
+        # leash, skips the reclaim, and takes the container builder, which keeps a store of
+        # its own — a second copy of that base on a runner with no room for one.
         matrix="["
         sep=""
         for img in ${build}; do
-          case "${img}" in
-            maca | ssh-maca) vendor=true ;;
-            *) vendor=false ;;
-          esac
+          vendor="$(images/hack/changed-images.sh vendor "${img}")"
           matrix="${matrix}${sep}{\"image\":\"${img}\",\"vendor\":${vendor}}"
           sep=","
         done
         matrix="${matrix}]"
 
+        # The smoke side groups by base instead. Two images of one base resolve the same base
+        # layers, so one job builds them and unpacks that base once, where per-image legs
+        # would unpack it twice; two *different* vendor bases are what does not fit on one
+        # runner, so they never share a leg. A base this selection does not name has no entry
+        # and so no leg at all — ci-operator.yml tests the selection, not this string, before
+        # expanding it, because an `include` of `[]` fails the job before any step runs.
+        groups="$(images/hack/changed-images.sh groups ${smoke})"
+
         {
           printf 'build=%s\n' "${build}"
           printf 'smoke=%s\n' "${smoke}"
           printf 'build-json=%s\n' "${matrix}"
+          printf 'smoke-groups-json=%s\n' "${groups}"
         } >>"${GITHUB_OUTPUT}"

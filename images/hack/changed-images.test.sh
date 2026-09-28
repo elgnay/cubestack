@@ -20,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.." # repository root: the paths below are the ones CI passes
 SUT=images/hack/changed-images.sh
-ALL="ssh jupyter maca ssh-maca"
+ALL="ssh jupyter maca ssh-maca cuda ssh-cuda"
 
 cases=0
 failures=0
@@ -49,6 +49,23 @@ check() { # check <name> <expected-build> <expected-smoke> <path>...
   fi
 }
 
+# The grouping, compared as exact JSON text rather than as a parsed value: that text is what
+# ci-operator.yml's `matrix.include` expands, so a reordering or a reformat is a change the
+# workflow reads.
+check_groups() { # check_groups <name> <expected-json> <image>...
+  local name="$1" want="$2" got
+  shift 2
+  got="$("$SUT" groups "$@")"
+  cases=$((cases + 1))
+  if [ "$got" != "$want" ]; then
+    failures=$((failures + 1))
+    printf 'FAIL  %s\n' "$name"
+    printf '      want [%s] got [%s]\n' "$want" "$got"
+  else
+    printf 'ok    %s\n' "$name"
+  fi
+}
+
 # --- the table -----------------------------------------------------------------
 #
 # Rows 3 and 4 are the two reasons markdown is checked first and by a pattern that
@@ -62,10 +79,18 @@ check "markdown inside an image directory" "" "" images/jupyter/README.md
 
 check "an image's own file" ssh ssh images/ssh-ubuntu-server/Dockerfile
 check "the jupyter launcher" jupyter jupyter images/jupyter/start-jupyter.sh
-check "the maca launcher" maca maca images/jupyter-maca-pytorch/start-jupyter.sh
+check "the maca image's own file" maca maca images/jupyter-maca-pytorch/Dockerfile
 check "the maca ssh daemon config" ssh-maca ssh-maca images/ssh-maca-pytorch/Dockerfile
+check "the cuda image's own file" cuda cuda images/jupyter-cuda-pytorch/Dockerfile
+check "the cuda ssh daemon config" ssh-cuda ssh-cuda images/ssh-cuda-pytorch/Dockerfile
 
 check "a shared runtime file" "$ALL" "$ALL" images/common/sshd/install-dropin.sh
+# The vendor jupyter launcher lives under common/ because the two vendor jupyter images share
+# it, and check-dockerfile-copies.sh admits nowhere else a file two images can read from. So
+# an edit to one vendor's launcher reaches every image, the CPU pair included — none of which
+# is built from it. That is this rule's over-selecting bargain, and a path that selected
+# `maca` alone until the launcher moved.
+check "the vendor jupyter launcher" "$ALL" "$ALL" images/common/jupyter/start-jupyter.sh
 check "the Makefile" "$ALL" "$ALL" images/Makefile
 check "the context definition" "$ALL" "$ALL" images/.dockerignore
 check "the publish workflow" "$ALL" "$ALL" .github/workflows/ci-images.yml
@@ -75,13 +100,20 @@ check "the selection action" "$ALL" "$ALL" .github/actions/changed-images/action
 # The two selections differ on this path and nowhere else.
 check "the smoke harness" "" "$ALL" images/hack/smoke.sh
 
-check "a new image directory" "$ALL" "$ALL" images/pytorch-cuda/Dockerfile
+# Deliberately a directory no image claims, and named so it reads that way: `cuda` is a real
+# token now, and a fixture calling itself pytorch-cuda would look like a near-miss of an image
+# that exists rather than like the unclaimed path this is testing.
+check "a new image directory" "$ALL" "$ALL" images/rocm-pytorch/Dockerfile
 check "a stray file at images/ root" "$ALL" "$ALL" images/notes.txt
 
 # A selection is a union over the whole diff, not the last path to match, and these two
 # share no input and are not each other's.
 check "two images' own files" "jupyter ssh-maca" "jupyter ssh-maca" \
   images/jupyter/start-jupyter.sh images/ssh-maca-pytorch/Dockerfile
+
+# The same union across bases: one selection, two legs below.
+check "images on different bases" "jupyter ssh-cuda" "jupyter ssh-cuda" \
+  images/jupyter/start-jupyter.sh images/ssh-cuda-pytorch/Dockerfile
 
 # The other half of the unrecognised branch: selecting everything is a guess, so it has
 # to say so. Silence would leave the next person to find the gap by reading the script.
@@ -96,6 +128,57 @@ case "$warned" in
     printf 'FAIL  an unrecognised path must warn on stderr, got [%s]\n' "$warned"
     ;;
 esac
+
+# --- the smoke matrix's legs ----------------------------------------------------
+#
+# One leg per base, which is what ci-operator.yml's `images-smoke` job expands from. Two
+# properties are load-bearing and neither is visible in the selection above: a base the
+# selection does not name contributes no leg at all (so a CUDA-only pull request schedules
+# one job, not three), and the two images of one base are one leg (so they share a runner
+# instead of unpacking that base twice).
+
+check_groups "a selection with no images has no leg" '[]'
+check_groups "the cuda pair is one leg" \
+  '[{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' cuda ssh-cuda
+check_groups "the cpu pair is one leg, and is not a vendor leg" \
+  '[{"base":"ubuntu","images":"ssh jupyter","vendor":false}]' jupyter ssh
+check_groups "a maca-only selection schedules no other base's leg" \
+  '[{"base":"maca","images":"maca ssh-maca","vendor":true}]' maca ssh-maca
+check_groups "one leg per selected base, in the table's order" \
+  '[{"base":"ubuntu","images":"ssh jupyter","vendor":false},{"base":"maca","images":"maca ssh-maca","vendor":true},{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' \
+  ssh jupyter maca ssh-maca cuda ssh-cuda
+check_groups "a repeated name does not repeat a leg" \
+  '[{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' cuda cuda ssh-cuda
+
+# The primitive the action's publish matrix is sized from, asserted apart from the grouping
+# so that a `vendor` gone wrong cannot hide behind a grouping fixture that agrees with it.
+cases=$((cases + 1))
+if [ "$("$SUT" vendor cuda)" = true ] && [ "$("$SUT" vendor jupyter)" = false ]; then
+  printf 'ok    vendor follows the base, not a name list\n'
+else
+  failures=$((failures + 1))
+  printf 'FAIL  vendor must read true for cuda and false for jupyter\n'
+fi
+
+# A name the rule does not know must fail loudly: a group silently dropped here is an image
+# no run would ever smoke, which is the one outcome worse than an over-selection.
+cases=$((cases + 1))
+if grouped="$("$SUT" groups nosuch 2>/dev/null)"; then
+  failures=$((failures + 1))
+  printf 'FAIL  an unknown image must not be grouped, got [%s]\n' "$grouped"
+else
+  printf 'ok    an unknown image is refused rather than dropped from the matrix\n'
+fi
+
+# `list` is a tag publish's selection (the action's tag branch) and the order `groups` emits
+# in, so it is pinned against the fixtures' own expectation rather than against itself.
+cases=$((cases + 1))
+if [ "$("$SUT" list | tr '\n' ' ' | sed 's/ *$//')" = "$ALL" ]; then
+  printf 'ok    list names every image in the table order\n'
+else
+  failures=$((failures + 1))
+  printf 'FAIL  list disagrees with the fixtures\n'
+fi
 
 # --- the rule's scope is exactly what it claims ---------------------------------
 
