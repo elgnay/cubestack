@@ -548,7 +548,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			return []gatewayv1.ParentReference{{
 				Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
 				Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
-				Namespace: ptrTo(gatewayv1.Namespace(systemNamespace)),
+				Namespace: ptrTo(gatewayv1.Namespace(defaultGatewayNamespace)),
 				Name:      gatewayv1.ObjectName(defaultGatewayName),
 			}}
 		}
@@ -612,7 +612,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 					ParentRef: gatewayv1.ParentGatewayReference{
 						Group:     ptrTo(gatewayv1.Group(gatewayAPIGroup)),
 						Kind:      ptrTo(gatewayv1.Kind(gatewayKind)),
-						Namespace: ptrTo(gatewayv1.Namespace(systemNamespace)),
+						Namespace: ptrTo(gatewayv1.Namespace(defaultGatewayNamespace)),
 						Name:      gatewayv1.ObjectName(gw),
 					},
 					Listeners: listeners,
@@ -787,7 +787,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			// from config, and both label the peer.
 			Expect(np.Spec.Ingress[0].From[0].PodSelector.MatchLabels).To(Equal(map[string]string{
 				gatewayDataplaneNameLabel:      defaultGatewayName,
-				gatewayDataplaneNamespaceLabel: systemNamespace,
+				gatewayDataplaneNamespaceLabel: defaultGatewayNamespace,
 			}))
 		})
 
@@ -5082,6 +5082,46 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(cond).NotTo(BeNil())
 				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
 				g.Expect(cond.Reason).To(Equal(reasonGatewayNotReady))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("withdraws the endpoints when the Gateway is deleted", func() {
+			// The platform owns the Gateway, so it can be taken away from under a
+			// published environment — an upgrade that replaces it, a rename, a
+			// re-apply. The dataplane is derived from that object, so the address
+			// in status.endpoints stops connecting the moment it goes; the
+			// condition falling on its own would leave a user holding an address
+			// that does not answer.
+			createGateway(true)
+			defer deleteGateway()
+
+			env := validDevEnvironment("de-gw-deleted")
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				g.Expect(got.Status.Endpoints).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			gw := &gatewayv1.Gateway{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: testDevEnvGatewayName, Namespace: testNamespace}, gw)).To(Succeed())
+			Expect(k8sClient.Delete(ctx, gw)).To(Succeed())
+
+			// What carries the fall is the Gateway watch: nothing else touches the
+			// environment, since the routes themselves are untouched.
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(cond.Reason).To(Equal(reasonGatewayNotFound))
 				g.Expect(got.Status.Endpoints).To(BeEmpty())
 			}, "15s", "200ms").Should(Succeed())
 		})

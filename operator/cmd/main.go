@@ -83,7 +83,9 @@ func main() {
 	flag.StringVar(&gatewayName, "gateway-name", "",
 		"Name of the platform Gateway that published model-catalog AIGatewayRoutes "+
 			"and DevEnvironment ListenerSets attach to.")
-	flag.StringVar(&gatewayNamespace, "gateway-namespace", "cubestack-system", "Namespace of the platform Gateway.")
+	flag.StringVar(&gatewayNamespace, "gateway-namespace", "envoy-gateway-system",
+		"Namespace of the platform Gateway. The default is where Envoy Gateway installs, which is "+
+			"where the platform creates the Gateway unless it is told to put it elsewhere.")
 	flag.StringVar(&gatewayDataplaneNamespace, "gateway-dataplane-namespace", "",
 		"Namespace the platform Gateway's dataplane Service and pods run in; when set, DevEnvironment "+
 			"pods admit ingress from that Gateway, and published endpoints are addressed at the port "+

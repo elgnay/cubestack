@@ -24,7 +24,8 @@ gateway:
   # --gateway-name and looks the object up by, and what DevEnvironment
   # ListenerSets attach to. An empty value omits the flag, which is not a clean
   # off-switch: publishing turns off, but the DevEnvironment controller falls
-  # back to its built-in default (cubestack-gateway in cubestack-system).
+  # back to its built-in default (cubestack-gateway, in whatever namespace
+  # `namespace` below names, since that flag always renders).
   # Leave it set.
   name: cubestack-gateway
   # Namespace the Gateway object itself lives in, rendered as

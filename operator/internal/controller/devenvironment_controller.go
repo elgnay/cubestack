@@ -147,9 +147,14 @@ const (
 	errImagePull     = "ErrImagePull"
 	crashLoopBackOff = "CrashLoopBackOff"
 
-	// defaultGatewayName is the shared Envoy Gateway the routes attach to when
-	// no name is configured.
-	defaultGatewayName = "cubestack-gateway"
+	// Defaults for the shared Envoy Gateway the routes attach to when neither
+	// flag is configured. The namespace is the platform convention — where Envoy
+	// Gateway and its `eg` class are installed, which is where the platform
+	// creates the Gateway for an install that is not told otherwise — rather
+	// than this manager's release namespace, which is where the chart used to
+	// create it and no longer does.
+	defaultGatewayName      = "cubestack-gateway"
+	defaultGatewayNamespace = "envoy-gateway-system"
 
 	// Default RDMA extended resource names. These are the defaults for the
 	// operator's flags, not constants of the platform: the names are declared by
@@ -2842,6 +2847,13 @@ func appendSSHString(b, s []byte) []byte {
 // Gateway that refuses the ListenerSet refuses it above the routes attached to
 // it. The route watches above re-enqueue the environment when the Gateway writes
 // that status.
+//
+// A Gateway that is missing or unserved withholds the endpoints too, and not
+// merely because its condition is false: Envoy Gateway derives the dataplane
+// from the Gateway object, so the published address stops connecting the moment
+// the object goes. The platform owns that object now, which makes its deletion
+// an ordinary event — an upgrade, a rename, a re-apply — rather than a state
+// this install cannot reach.
 func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus) error {
 	cfg := r.defaultedConfig()
 	gw := &gatewayv1.Gateway{}
@@ -2849,9 +2861,11 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 	switch {
 	case meta.IsNoMatchError(err):
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayAPINotInstalled, "Gateway API CRDs are not installed")
+		status.Endpoints = nil
 		return nil
 	case apierrors.IsNotFound(err):
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotFound, fmt.Sprintf("Gateway %s/%s not found", cfg.GatewayNamespace, cfg.GatewayName))
+		status.Endpoints = nil
 		return nil
 	case err != nil:
 		return err
@@ -4015,7 +4029,7 @@ func (r *DevEnvironmentReconciler) defaultedConfig() DevEnvironmentControllerCon
 		cfg.GatewayName = defaultGatewayName
 	}
 	if cfg.GatewayNamespace == "" {
-		cfg.GatewayNamespace = systemNamespace
+		cfg.GatewayNamespace = defaultGatewayNamespace
 	}
 	if cfg.HTTPPort == 0 {
 		cfg.HTTPPort = 80
