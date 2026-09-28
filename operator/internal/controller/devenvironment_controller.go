@@ -998,24 +998,35 @@ func sshExposed(env *aiv1alpha1.DevEnvironment) bool {
 	return env.Spec.SSH != nil && env.Spec.SSH.Enabled
 }
 
+// l4PortNames is the endpoint names this environment draws a port from the pool
+// for: ssh when it is exposed, then every entry of spec.ports that is tcp or
+// udp. It is the one list the allocation loop, the guard below and the
+// recovered-allocation fallback read, so the three cannot disagree on what
+// counts as L4 exposure — which is what the allocation loop used to spell a
+// second time.
+func l4PortNames(env *aiv1alpha1.DevEnvironment) []string {
+	var names []string
+	if sshExposed(env) {
+		names = append(names, sshPortName)
+	}
+	for _, p := range env.Spec.Ports {
+		// tcp and udp are the pool's two protocols and share its numbering: the
+		// allocator keys on the port alone, so one number serves one protocol
+		// for one environment (design §8.3).
+		if p.Type == aiv1alpha1.PortTypeTCP || p.Type == aiv1alpha1.PortTypeUDP {
+			names = append(names, p.Name)
+		}
+	}
+	return names
+}
+
 // l4Exposed reports whether the environment declares any L4 exposure, i.e.
 // whether it draws a port from the pool. It is the guard for every use of the
 // TCPRoute, UDPRoute and ListenerSet kinds: each arrives with its own CRD, and
 // an environment that exposes nothing on L4 must still publish its HTTPRoute in
 // an install that carries none of them.
-//
-// It mirrors the allocation loop in publishRoutes exactly — the two must agree
-// on what counts as L4 exposure, so a change there belongs here too.
 func l4Exposed(env *aiv1alpha1.DevEnvironment) bool {
-	if sshExposed(env) {
-		return true
-	}
-	for _, p := range env.Spec.Ports {
-		if p.Type == aiv1alpha1.PortTypeTCP || p.Type == aiv1alpha1.PortTypeUDP {
-			return true
-		}
-	}
-	return false
+	return len(l4PortNames(env)) > 0
 }
 
 // portProtocol is the transport an extra port is exposed over. http rides the
@@ -3110,6 +3121,10 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		if err != nil {
 			return nil, nil, nil, err
 		}
+		held, err := r.heldPorts(ctx, env)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 		// A listener the platform declares on the Gateway itself outranks every
 		// ListenerSet bound to it: the Gateway API merges the two lists with the
 		// parent first, and a listener that loses a port collision is marked
@@ -3121,25 +3136,12 @@ func (r *DevEnvironmentReconciler) publishRoutes(ctx context.Context, env *aiv1a
 		for _, l := range gw.Spec.Listeners {
 			used[l.Port] = true
 		}
-		if sshExposed(env) {
-			p := r.allocatePort(env, sshPortName, used)
+		for _, name := range l4PortNames(env) {
+			p := r.allocatePort(name, used, held)
 			if p == 0 {
 				return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
 			}
-			ports[sshPortName] = p
-		}
-		for _, sp := range env.Spec.Ports {
-			// tcp and udp are the pool's two protocols and share its numbering:
-			// the allocator keys on the port alone, so one number serves one
-			// protocol for one environment (design §8.3).
-			if sp.Type != aiv1alpha1.PortTypeTCP && sp.Type != aiv1alpha1.PortTypeUDP {
-				continue
-			}
-			p := r.allocatePort(env, sp.Name, used)
-			if p == 0 {
-				return nil, nil, nil, fmt.Errorf("no free port in the L4 port range %d-%d", cfg.L4PortRangeStart, cfg.L4PortRangeEnd)
-			}
-			ports[sp.Name] = p
+			ports[name] = p
 		}
 	}
 
@@ -3385,21 +3387,77 @@ func (r *DevEnvironmentReconciler) usedPorts(ctx context.Context, excludeNS, exc
 	return used, nil
 }
 
-// allocatePort picks a port for the named endpoint, reusing the env's own
-// recorded listener port when it is still free (stable across restarts) and
-// otherwise the lowest free port in the configured range. The record is
-// status.endpoints[].listenerPort rather than the port in that endpoint's
-// address, which says where the endpoint is reachable, not which pool port the
-// environment holds.
-func (r *DevEnvironmentReconciler) allocatePort(env *aiv1alpha1.DevEnvironment, name string, used map[int32]bool) int32 {
-	cfg := r.defaultedConfig()
+// heldPorts is the listener port each endpoint of this environment already
+// holds, for allocatePort to keep. The endpoint list carries it whenever it is
+// published; the environment's own ListenerSet is where it is read from when it
+// is not. That fallback is the difference between a stable address and a moving
+// one: the list is withheld while a route or the Gateway is unaccepted, and a
+// Gateway is an object the platform creates, replaces and deletes underneath an
+// install, so an environment reads as holding nothing at exactly the moment its
+// listeners are still declared. Allocation would then hand out the lowest free
+// port instead of the environment's own, and the SSH address a user was given
+// would stop being the one that answers.
+//
+// The endpoint list wins where both name the same endpoint. They can only
+// disagree after a reconcile that allocated a port, applied the ListenerSet and
+// then failed before writing the endpoints, and settling on the published port
+// is the choice that leaves the address the user was last shown unchanged.
+func (r *DevEnvironmentReconciler) heldPorts(ctx context.Context, env *aiv1alpha1.DevEnvironment) (map[string]int32, error) {
+	names := l4PortNames(env)
+	held := make(map[string]int32, len(names))
 	for _, ep := range env.Status.Endpoints {
-		if ep.Name == name {
-			if p := ep.ListenerPort; p >= cfg.L4PortRangeStart && p <= cfg.L4PortRangeEnd && !used[p] {
-				used[p] = true
-				return p
+		if ep.ListenerPort != 0 {
+			held[ep.Name] = ep.ListenerPort
+		}
+	}
+	unrecorded := false
+	for _, name := range names {
+		if _, ok := held[name]; !ok {
+			unrecorded = true
+			break
+		}
+	}
+	if !unrecorded {
+		return held, nil // every endpoint has a record; the ListenerSet adds nothing
+	}
+	// Read through APIReader for the reason usedPorts does: this read is followed
+	// by the write of the port it returns, and the cache may not have caught up
+	// with the previous reconcile's.
+	var lss gatewayv1.ListenerSetList
+	err := r.APIReader.List(ctx, &lss, client.InNamespace(env.Namespace), client.MatchingLabels(r.envLabels(env.Name)))
+	if err != nil {
+		// No ListenerSet kind means no listener was ever declared, and so nothing
+		// to recover — the same tolerance usedPorts extends to the TCPRoute read.
+		if meta.IsNoMatchError(err) {
+			return held, nil
+		}
+		return nil, err
+	}
+	for i := range lss.Items {
+		for _, listener := range lss.Items[i].Spec.Listeners {
+			name := l4ListenerEndpoint(listener.Name)
+			if name == "" {
+				continue
+			}
+			if _, recorded := held[name]; !recorded {
+				held[name] = listener.Port
 			}
 		}
+	}
+	return held, nil
+}
+
+// allocatePort picks a port for the named endpoint, reusing the port that
+// endpoint already holds when it is still free (stable across restarts) and
+// otherwise the lowest free port in the configured range. The record is the
+// listener port the environment holds, never the port in an endpoint's address:
+// that one says where the endpoint is reachable, not which pool port the
+// environment was given.
+func (r *DevEnvironmentReconciler) allocatePort(name string, used map[int32]bool, held map[string]int32) int32 {
+	cfg := r.defaultedConfig()
+	if p, ok := held[name]; ok && p >= cfg.L4PortRangeStart && p <= cfg.L4PortRangeEnd && !used[p] {
+		used[p] = true
+		return p
 	}
 	for p := cfg.L4PortRangeStart; p <= cfg.L4PortRangeEnd; p++ {
 		if !used[p] {
@@ -3481,7 +3539,7 @@ func (r *DevEnvironmentReconciler) desiredListenerSet(env *aiv1alpha1.DevEnviron
 	for _, name := range names {
 		protocol, routeKind := l4ListenerFor(l4Protocol(env, name))
 		listeners = append(listeners, gatewayv1.ListenerEntry{
-			Name:     gatewayv1.SectionName(l4ListenerName(protocol, ports[name])),
+			Name:     gatewayv1.SectionName(l4ListenerName(name, protocol, ports[name])),
 			Protocol: protocol,
 			Port:     ports[name],
 			AllowedRoutes: &gatewayv1.AllowedRoutes{
@@ -3524,7 +3582,7 @@ func (r *DevEnvironmentReconciler) desiredTCPRoute(env *aiv1alpha1.DevEnvironmen
 		ObjectMeta: metav1.ObjectMeta{Name: tcpRouteName(env, port), Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: gatewayv1.TCPRouteSpec{
 			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
-				listenerSetParentRef(env, corev1.ProtocolTCP, port),
+				listenerSetParentRef(env, name, corev1.ProtocolTCP, port),
 			}},
 			Rules: []gatewayv1.TCPRouteRule{{
 				BackendRefs: []gatewayv1.BackendRef{serviceBackendRef(env.Name, servicePortFor(env, name))},
@@ -3542,7 +3600,7 @@ func (r *DevEnvironmentReconciler) desiredUDPRoute(env *aiv1alpha1.DevEnvironmen
 		ObjectMeta: metav1.ObjectMeta{Name: udpRouteName(env, port), Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: gatewayv1.UDPRouteSpec{
 			CommonRouteSpec: gatewayv1.CommonRouteSpec{ParentRefs: []gatewayv1.ParentReference{
-				listenerSetParentRef(env, corev1.ProtocolUDP, port),
+				listenerSetParentRef(env, name, corev1.ProtocolUDP, port),
 			}},
 			Rules: []gatewayv1.UDPRouteRule{{
 				BackendRefs: []gatewayv1.BackendRef{serviceBackendRef(env.Name, servicePortFor(env, name))},
@@ -3566,14 +3624,32 @@ func listenerSetName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + l4ListenerSetSuffix
 }
 
-// l4ListenerName names one listener within the ListenerSet. Listener names only
-// have to be unique within their ListenerSet, and an allocated port is unique
-// across the whole gateway, so spelling the port keeps them distinct without a
-// second naming scheme; the protocol prefix is there so a reader can tell a
+// l4ListenerName names one listener within the ListenerSet: the endpoint it was
+// declared for, then the protocol and the port, e.g. "ssh-tcp-20000". Listener
+// names only have to be unique within their ListenerSet, and an allocated port
+// is unique across the whole gateway, so spelling the port keeps them distinct
+// without a second naming scheme; the protocol is there so a reader can tell a
 // datagram port from a stream one without checking the listener's protocol
-// field.
-func l4ListenerName(protocol gatewayv1.ProtocolType, port int32) string {
-	return fmt.Sprintf("%s-%d", strings.ToLower(string(protocol)), port)
+// field; and the endpoint leads because the name is also the record the
+// environment's own allocation is read back from when status no longer carries
+// it (::heldPorts).
+func l4ListenerName(name string, protocol gatewayv1.ProtocolType, port int32) string {
+	return fmt.Sprintf("%s-%s-%d", name, strings.ToLower(string(protocol)), port)
+}
+
+// l4ListenerEndpoint recovers the endpoint a ListenerSet listener was declared
+// for from its name (::l4ListenerName). A name this operator did not write — a
+// listener left from before the endpoint was part of it — recovers "", and its
+// port is left to whatever else records the allocation.
+func l4ListenerEndpoint(name gatewayv1.SectionName) string {
+	for _, infix := range []string{"-tcp-", "-udp-"} {
+		if i := strings.LastIndex(string(name), infix); i > 0 {
+			if _, err := strconv.Atoi(string(name)[i+len(infix):]); err == nil {
+				return string(name)[:i]
+			}
+		}
+	}
+	return ""
 }
 
 // listenerSetParentRef points a route at one listener of the environment's
@@ -3581,14 +3657,14 @@ func l4ListenerName(protocol gatewayv1.ProtocolType, port int32) string {
 // gatewayParentRef this resolves without fetching anything. As there, the
 // explicit defaults are set so the stored spec compares equal across
 // reconciles.
-func listenerSetParentRef(env *aiv1alpha1.DevEnvironment, protocol corev1.Protocol, port int32) gatewayv1.ParentReference {
+func listenerSetParentRef(env *aiv1alpha1.DevEnvironment, name string, protocol corev1.Protocol, port int32) gatewayv1.ParentReference {
 	listenerProtocol, _ := l4ListenerFor(protocol)
 	return gatewayv1.ParentReference{
 		Group:       ptr(gatewayv1.Group(gatewayAPIGroup)),
 		Kind:        ptr(gatewayv1.Kind(listenerSetKind)),
 		Namespace:   ptr(gatewayv1.Namespace(env.Namespace)),
 		Name:        gatewayv1.ObjectName(listenerSetName(env)),
-		SectionName: ptr(gatewayv1.SectionName(l4ListenerName(listenerProtocol, port))),
+		SectionName: ptr(gatewayv1.SectionName(l4ListenerName(name, listenerProtocol, port))),
 	}
 }
 
