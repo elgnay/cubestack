@@ -80,6 +80,14 @@ const (
 	testMetricsPortName           = "metrics"
 	// testSyslogPortName is the extra udp port the UDP specs expose.
 	testSyslogPortName = "syslog"
+	// testDevEnvKind is the kind as the API server writes it into an
+	// ownerReference.
+	testDevEnvKind = "DevEnvironment"
+	// testSSHListenerName is a listener named the current way, which carries the
+	// endpoint it was declared for, and testLegacyListenerName one named the way
+	// before that — the shape an upgrade reads ports back from.
+	testSSHListenerName    = "ssh-tcp-20001"
+	testLegacyListenerName = "tcp-20000"
 	// testL4PortRangeStart is the lowest listener port the suite's reconciler
 	// allocates (suite_test.go), so it is the port a fresh environment takes
 	// from an empty pool.
@@ -624,6 +632,120 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(l4ListenerEndpoint("tcp-20000")).To(BeEmpty())
 			Expect(l4ListenerEndpoint("ssh")).To(BeEmpty())
 			Expect(l4ListenerEndpoint("ssh-tcp-")).To(BeEmpty())
+		})
+	})
+
+	// A ListenerSet written before the endpoint became part of the listener name
+	// attributes nothing on its own (::l4ListenerEndpoint), so the endpoint list
+	// is the only record of which endpoint holds which pool port — and the
+	// withdrawal takes that list away. These specs are the moment before it goes.
+	Describe("migrateListenerNames", func() {
+		const envName = "env-migrate"
+		cfg := DevEnvironmentControllerConfig{
+			GatewayName: testDevEnvGatewayName, GatewayNamespace: testNamespace,
+			L4PortRangeStart: 20000, L4PortRangeEnd: 20002,
+		}
+		legacyListener := func(name string, protocol gatewayv1.ProtocolType, port int32) gatewayv1.ListenerEntry {
+			return gatewayv1.ListenerEntry{Name: gatewayv1.SectionName(name), Protocol: protocol, Port: port}
+		}
+		// The labels the controller writes, which the read back is selected on.
+		labels := (&DevEnvironmentReconciler{}).envLabels(envName)
+		// The environment's own ListenerSet as an earlier build left it: named by
+		// port alone, owned by the environment.
+		ownListenerSet := func(listeners ...gatewayv1.ListenerEntry) *gatewayv1.ListenerSet {
+			return &gatewayv1.ListenerSet{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      envName + l4ListenerSetSuffix,
+					Namespace: testNamespace,
+					Labels:    labels,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: aiv1alpha1.GroupVersion.String(),
+						Kind:       testDevEnvKind,
+						Name:       envName,
+						UID:        "uid-migrate",
+						Controller: ptrTo(true),
+					}},
+				},
+				Spec: gatewayv1.ListenerSetSpec{Listeners: listeners},
+			}
+		}
+		env := func(endpoints ...aiv1alpha1.Endpoint) *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: envName, Namespace: testNamespace, UID: "uid-migrate"},
+				Spec:       aiv1alpha1.DevEnvironmentSpec{Type: aiv1alpha1.DevEnvironmentTypeSSH},
+				Status:     aiv1alpha1.DevEnvironmentStatus{Endpoints: endpoints},
+			}
+		}
+		// The Gateway is absent: the fake client holds no Gateway, which is the
+		// state this migration is for.
+		newReconciler := func(objs ...client.Object) (client.Client, *DevEnvironmentReconciler) {
+			scheme := runtime.NewScheme()
+			Expect(gatewayv1.Install(scheme)).To(Succeed())
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+			return live, &DevEnvironmentReconciler{Client: live, Config: cfg}
+		}
+		listenerNames := func(live client.Client) []string {
+			got := &gatewayv1.ListenerSet{}
+			Expect(live.Get(context.Background(), client.ObjectKey{Name: envName + l4ListenerSetSuffix, Namespace: testNamespace}, got)).To(Succeed())
+			names := make([]string, 0, len(got.Spec.Listeners))
+			for _, l := range got.Spec.Listeners {
+				names = append(names, string(l.Name))
+			}
+			return names
+		}
+
+		It("names a listener for the endpoint its recorded port belongs to", func() {
+			// Otherwise the environment comes back from the Gateway's absence on
+			// whatever port is free at the bottom of the pool, and answers at an
+			// address its user was never given.
+			live, r := newReconciler(ownListenerSet(
+				legacyListener("tcp-20001", gatewayv1.TCPProtocolType, 20001),
+				legacyListener("udp-20002", gatewayv1.UDPProtocolType, 20002),
+			))
+			e := env(
+				aiv1alpha1.Endpoint{Name: sshPortName, ListenerPort: 20001},
+				aiv1alpha1.Endpoint{Name: "metrics", ListenerPort: 20002},
+			)
+
+			Expect(r.reconcileGatewayRoutes(context.Background(), e, &e.Status)).To(Succeed())
+
+			Expect(listenerNames(live)).To(Equal([]string{testSSHListenerName, "metrics-udp-20002"}))
+			Expect(e.Status.Endpoints).To(BeEmpty())
+		})
+
+		It("leaves a listener alone that no endpoint records a port for", func() {
+			// Nothing to migrate from: the name is left as it was rather than
+			// guessed at, and the allocation stays whatever the routes hold.
+			live, r := newReconciler(ownListenerSet(
+				legacyListener(testLegacyListenerName, gatewayv1.TCPProtocolType, 20000),
+				legacyListener("tcp-20001", gatewayv1.TCPProtocolType, 20001),
+			))
+			e := env(aiv1alpha1.Endpoint{Name: sshPortName, ListenerPort: 20001})
+
+			Expect(r.reconcileGatewayRoutes(context.Background(), e, &e.Status)).To(Succeed())
+
+			Expect(listenerNames(live)).To(Equal([]string{testLegacyListenerName, testSSHListenerName}))
+		})
+
+		It("leaves a name that already carries its endpoint alone", func() {
+			live, r := newReconciler(ownListenerSet(
+				legacyListener(testSSHListenerName, gatewayv1.TCPProtocolType, 20001),
+			))
+			e := env(aiv1alpha1.Endpoint{Name: sshPortName, ListenerPort: 20001})
+
+			Expect(r.reconcileGatewayRoutes(context.Background(), e, &e.Status)).To(Succeed())
+
+			Expect(listenerNames(live)).To(Equal([]string{testSSHListenerName}))
+		})
+
+		It("migrates nothing where the environment never published a listener", func() {
+			live, r := newReconciler()
+
+			e := env()
+			Expect(r.reconcileGatewayRoutes(context.Background(), e, &e.Status)).To(Succeed())
+
+			Expect(e.Status.Endpoints).To(BeEmpty())
+			Expect(apierrors.IsNotFound(live.Get(context.Background(), client.ObjectKey{Name: envName + l4ListenerSetSuffix, Namespace: testNamespace}, &gatewayv1.ListenerSet{}))).To(BeTrue())
 		})
 	})
 

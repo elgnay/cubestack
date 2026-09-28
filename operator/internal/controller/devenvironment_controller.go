@@ -2876,6 +2876,15 @@ func (r *DevEnvironmentReconciler) reconcileGatewayRoutes(ctx context.Context, e
 		return nil
 	case apierrors.IsNotFound(err):
 		setDevEnvironmentRouteReadyCondition(&status.Conditions, false, reasonGatewayNotFound, fmt.Sprintf("Gateway %s/%s not found", cfg.GatewayNamespace, cfg.GatewayName))
+		// The list withdrawn below is the only record of which endpoint holds
+		// which pool port, and a ListenerSet written by an earlier build carries
+		// no such record of its own (::migrateListenerNames). An environment that
+		// upgrades while the Gateway is away — the upgrade path deletes the
+		// Gateway an earlier release owned, so this is that moment — would
+		// otherwise come back on a new port, at an address no one was given.
+		if err := r.migrateListenerNames(ctx, env, status.Endpoints); err != nil {
+			return err
+		}
 		status.Endpoints = nil
 		return nil
 	case err != nil:
@@ -3445,6 +3454,57 @@ func (r *DevEnvironmentReconciler) heldPorts(ctx context.Context, env *aiv1alpha
 		}
 	}
 	return held, nil
+}
+
+// migrateListenerNames rewrites the environment's listeners under the naming
+// scheme that records the endpoint in the name (::l4ListenerName), pairing each
+// one with the endpoint that the given endpoint list records its port against.
+// It exists for the one moment where that is still possible: a ListenerSet
+// written before the endpoint was part of the name reads back as attributing
+// nothing (::l4ListenerEndpoint), so on its own it would leave the allocation
+// with no record — and it is called on the way to withdrawing the list that is
+// the last one (::reconcileGatewayRoutes).
+//
+// A listener whose name already carries its endpoint is left alone, as is one
+// whose port no endpoint records: the first has nothing to migrate to, the
+// second nothing to migrate from.
+func (r *DevEnvironmentReconciler) migrateListenerNames(ctx context.Context, env *aiv1alpha1.DevEnvironment, endpoints []aiv1alpha1.Endpoint) error {
+	endpointsByPort := make(map[int32]string, len(endpoints))
+	for _, ep := range endpoints {
+		if ep.ListenerPort != 0 {
+			endpointsByPort[ep.ListenerPort] = ep.Name
+		}
+	}
+	lss := &gatewayv1.ListenerSet{}
+	err := r.Get(ctx, client.ObjectKey{Name: listenerSetName(env), Namespace: env.Namespace}, lss)
+	if err != nil {
+		// No ListenerSet kind is an install with no L4 in it, and no such object
+		// is an environment that never published a listener: neither has one to
+		// migrate.
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
+			return nil
+		}
+		return err
+	}
+	migrated := false
+	for i, listener := range lss.Spec.Listeners {
+		if l4ListenerEndpoint(listener.Name) != "" {
+			continue
+		}
+		name, recorded := endpointsByPort[listener.Port]
+		if !recorded {
+			continue
+		}
+		lss.Spec.Listeners[i].Name = gatewayv1.SectionName(l4ListenerName(name, listener.Protocol, listener.Port))
+		migrated = true
+	}
+	if !migrated {
+		return nil
+	}
+	if err := ensureDevEnvOwned(lss, env); err != nil {
+		return err
+	}
+	return r.Update(ctx, lss)
 }
 
 // allocatePort picks a port for the named endpoint, reusing the port that
