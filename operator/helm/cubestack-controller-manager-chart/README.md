@@ -330,16 +330,17 @@ Gateway API object, because the chart writes none:
 
 - **The one flag that always renders** — `namespace`. A Gateway is identified by
   name *and* namespace, but the two do not behave alike when empty: an omitted
-  `--gateway-namespace` falls back inside the manager to `cubestack-system`, a
-  namespace neither install path configured, so the chart always renders it and
-  defaults it to `envoy-gateway-system`.
+  `--gateway-namespace` falls back inside the manager to `envoy-gateway-system`,
+  which is the convention but not necessarily where this platform put the
+  Gateway, so the chart always renders it, under a `| default` guard — a release
+  that rendered a bare flag is still pointed at `gateway.namespace`.
 - **Flags an empty value omits** — `name`, `catalogHostname`,
   `dataplaneNamespace`. Omitting `catalogHostname` just leaves publishing off;
   omitting `name` is not a switch either (see the table) — leave `name` set.
 
 | Key | Manager flag | Default | Notes |
 |---|---|---|---|
-| `gateway.name` | `--gateway-name` | `cubestack-gateway` | Names the platform's Gateway — the object the operator publishes through and attaches ListenerSets to. Leave it set. Empty = flag omitted, and the two controllers then disagree: publishing is off (`RouteReady=False`, `GatewayNotConfigured`), while the DevEnvironment controller falls back to the manager's own built-in default — `cubestack-gateway` in `cubestack-system`, whatever `gateway.namespace` says. |
+| `gateway.name` | `--gateway-name` | `cubestack-gateway` | Names the platform's Gateway — the object the operator publishes through and attaches ListenerSets to. Leave it set. Empty = flag omitted, and the two controllers then disagree: publishing is off (`RouteReady=False`, `GatewayNotConfigured`), while the DevEnvironment controller falls back to the manager's own built-in name, `cubestack-gateway` — looked for in whatever namespace `gateway.namespace` gave it, since that flag renders either way. |
 | `gateway.namespace` | `--gateway-namespace` | `envoy-gateway-system` | Namespace of that Gateway object — **not** where its dataplane pods run (`dataplaneNamespace`). Always rendered. Must match where the platform created the Gateway; `envoy-gateway-system` is where Envoy Gateway and the `eg` class live, so it is the conventional home unless the Gateway was put elsewhere. |
 | `gateway.catalogHostname` | `--gateway-catalog-hostname` | `""` | Empty = flag omitted. **Set this to enable publishing**: the shared hostname the model catalog answers on. Every published service is one model of that single catalog entry, addressed by the model name in the request body. |
 | `gateway.dataplaneNamespace` | `--gateway-dataplane-namespace` | `envoy-gateway-system` | Names the namespace the Gateway's dataplane pods run in. **Not** a publishing switch. Two things read it: environment pods admit ingress from that Gateway, and the controller looks up the dataplane Service there to learn which port each listener is reachable on. Empty = flag omitted: environments stay default-deny inbound, and endpoint addresses fall back to assuming the listener port is the reachable one — true of a LoadBalancer or ClusterIP dataplane, not of a NodePort one. |

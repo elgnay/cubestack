@@ -89,9 +89,10 @@ sed -i 's|namespace: cubestack-system|namespace: {{ .Release.Namespace }}|g' "${
 # guard. The namespace is not a switch like the catalog hostname — it names the
 # namespace the platform put the Gateway in, which this manager is pointed at —
 # and an omitted flag does not mean "unconfigured": cmd/main.go defaults it to
-# cubestack-system and devenvironment_controller.go's defaultedConfig falls back
-# to the same, so a release that rendered no flag at all would silently aim
-# every environment at a namespace nobody configured. `| default` is also what
+# envoy-gateway-system and devenvironment_controller.go's defaultedConfig falls
+# back to the same, so a release that rendered no flag at all would aim every
+# environment at that convention rather than at the namespace its own values
+# name. `| default` is also what
 # keeps an emptied value — or a release upgraded with --reuse-values, whose
 # stored values carry no gateway.namespace key — from rendering a bare
 # --gateway-namespace= and reaching that same fallback. The default is where the
@@ -210,9 +211,9 @@ rm -f "${OUT}"
 # --gateway-catalog-hostname, no --gateway-dataplane-namespace (RouteReady=False,
 # GatewayNotConfigured, and environments left default-deny inbound). The
 # namespace is not in that set: it always renders, from .Values.gateway.namespace,
-# because an omitted flag would leave the manager's own cubestack-system default
-# in force. A silent no-op here would ship a chart whose publish feature cannot
-# be enabled by values.
+# because an omitted flag would leave the manager's own envoy-gateway-system
+# default in force. A silent no-op here would ship a chart whose publish feature
+# cannot be enabled by values.
 #
 # The Gateway and the ClientTrafficPolicy are asserted ABSENT below: both belong
 # to the platform now. A stray resource added back under config/default, or a
@@ -269,10 +270,10 @@ expect_render all-empty absent '^[[:space:]]*- --gateway-(name|catalog-hostname|
 expect_render all-empty present '^[[:space:]]*- --gateway-namespace=envoy-gateway-system$' \
   --set gateway.name= --set gateway.catalogHostname= --set gateway.dataplaneNamespace=
 # The namespace follows its value verbatim, and an emptied value must NOT drop
-# the flag: an omitted flag falls back to cubestack-system inside the manager,
-# a namespace neither install path configured. These two pin the `| default`
-# choice — the first proves a custom value reaches the manager, the second
-# proves an empty one cannot silently re-point it.
+# the flag: an omitted flag falls back to envoy-gateway-system inside the
+# manager. These two pin the `| default` choice — the first proves a custom
+# value reaches the manager, the second proves an empty one cannot silently
+# re-point it.
 expect_render gw-ns-custom present '^[[:space:]]*- --gateway-namespace=platform-gateway$' --set gateway.namespace=platform-gateway
 expect_render gw-ns-empty present '^[[:space:]]*- --gateway-namespace=envoy-gateway-system$' --set gateway.namespace=
 # The retired gateway.className is inert, like gateway.domain above: the value
