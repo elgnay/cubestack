@@ -221,6 +221,30 @@ kubectl logs -n <project>-system deployment/<project>-controller-manager -c mana
 - **Watch secondary resources**: Use `.Owns()` or `.Watches()`, not just `RequeueAfter`
 - **Finalizers**: Clean up external resources (buckets, VMs, DNS entries)
 
+### DevEnvironment Activity Agent
+
+A DevEnvironment with `spec.lifecycle.idleTimeout > 0` carries a second container,
+the `activity-agent` sidecar (`cmd/activity-agent`, judgement in `internal/activity/`).
+It reports activity by writing the pod annotation `ai.cubestack.io/last-activity`.
+Two things about it are easy to get wrong:
+
+- **The sidecar must never fail.** `podFailed` iterates *every* container status, so
+  a sidecar in `CrashLoopBackOff` or `ImagePullBackOff` marks the whole environment
+  `Failed` and stops the user's work — and `podReady` requires the pod's Ready
+  condition, which a restarting sidecar breaks. Hence: no probes, exit 0, log and
+  continue on every API error. This is a hard requirement, not a preference, and it
+  is why the agent does not use the codebase's usual error-return idiom.
+- **Under `hostNetwork` the connection dimension is meaningless.** The sidecar reads
+  `/proc/net/tcp{,6}`, and a host-network pod shares the *node's* network namespace,
+  so it sees the node's sockets rather than the environment's — including another
+  host-network pod's, if that pod happens to hold one of the watched ports. An
+  environment in that state can therefore look busy while nobody is using it, and
+  never idle out. This errs toward "never stops" rather than "stops too early", but
+  it is a real limitation and not something the agent can correct for. The process
+  dimension is unaffected: CPU and IO counters come from `/proc/<pid>`, which is
+  namespaced by pid rather than by net. RDMA environments (`spec.network`) are the
+  host-network case.
+
 ### Logging
 
 **Follow Kubernetes logging message style guidelines:**

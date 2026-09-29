@@ -29,6 +29,9 @@ limitations under the License.
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=udproutes,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=gateways,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=listenersets,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=rolebindings,verbs=get;list;watch;create;update;patch;delete
 
 package controller
 
@@ -45,6 +48,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -52,6 +56,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -520,7 +525,12 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		desired.Status.JupyterTokenSecret = nil
 	}
 
-	// 3. Core resources.
+	// 3. Core resources. The sidecar's authorization comes first: a pod naming a
+	// ServiceAccount that does not exist yet never schedules, and the StatefulSet
+	// below names one for every idle-enabled environment.
+	if err := r.reconcileActivityAgentRBAC(ctx, &env); err != nil {
+		return ctrl.Result{}, err
+	}
 	if err := r.applyService(ctx, &env); err != nil {
 		return ctrl.Result{}, err
 	}
@@ -1348,7 +1358,7 @@ func desiredPermissionInitContainer(env *aiv1alpha1.DevEnvironment) corev1.Conta
 			Privileged:               ptr(false),
 			AllowPrivilegeEscalation: ptr(false),
 			Capabilities: &corev1.Capabilities{
-				Drop: []corev1.Capability{"ALL"},
+				Drop: []corev1.Capability{allCapabilities},
 				Add:  []corev1.Capability{"CHOWN", "FOWNER", "FSETID"},
 			},
 		},
@@ -1869,10 +1879,33 @@ func desiredWhenDeleted(env *aiv1alpha1.DevEnvironment) appsv1.PersistentVolumeC
 	return appsv1.DeletePersistentVolumeClaimRetentionPolicyType
 }
 
+// activityAgentEnabled reports whether this environment carries the idle-timeout
+// sidecar. It is the whole of the condition: the annotation the agent writes is
+// read only to stop an environment that asked to be stopped, so an environment
+// that never asked must not be given an agent to write one — and, because
+// spec.lifecycle defaults to absent and idleTimeout to 0, that is every
+// environment that existed before this feature did, which is what keeps them
+// from rolling when it lands.
+func activityAgentEnabled(env *aiv1alpha1.DevEnvironment) bool {
+	return env.Spec.Lifecycle != nil && env.Spec.Lifecycle.IdleTimeout > 0
+}
+
+// activityAgentServiceAccountName is the account an environment that carries the
+// sidecar runs under, and names the Role and RoleBinding that go with it. It is
+// the name of an object that exists only while the environment asks for one, so
+// the pod template and stsSpecHash ask ::activityAgentEnabled before using it:
+// an environment that carries no sidecar must name no account, or it would
+// reference one that is never created and never schedule.
+func activityAgentServiceAccountName(env *aiv1alpha1.DevEnvironment) string {
+	return env.Name + activityAgentNameSuffix
+}
+
 // desiredPodSpec renders the pod spec: compute-pool nodeSelector, the main
 // container with the workspace and data volume mounts, the SSH keys volume, and —
 // when the environment has its own storage — the init container that makes that
-// storage writable (::desiredPermissionInitContainer).
+// storage writable (::desiredPermissionInitContainer). An environment that asks
+// for an idle timeout carries the activity agent as a second container
+// (::desiredActivityAgent).
 func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment) corev1.PodSpec {
 	mainPort := mainContainerPort(env.Spec.Type)
 	rdma, hostNetwork := r.rdmaResource(env)
@@ -2057,7 +2090,112 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 			},
 		)
 	}
+	if activityAgentEnabled(env) {
+		// Appended last, so Containers[0] stays the environment's own container:
+		// the main port, the readiness probe and the init container all describe
+		// it, and nothing about the sidecar may come to be read as the workload.
+		podSpec.Containers = append(podSpec.Containers, r.desiredActivityAgent(env))
+		// The agent reports on the environment's processes by reading /proc, and
+		// the pod's PID namespace is the only thing that decides whether the
+		// user's work is in there to read: without this, /proc inside a container
+		// holds that container's processes alone and the agent would see nothing
+		// but itself. The pod already shares one network namespace, which is what
+		// makes /proc/net/tcp the environment's sockets.
+		podSpec.ShareProcessNamespace = ptr(true)
+		// The account is scoped to this one environment: it can read and annotate
+		// exactly this pod and nothing else (::desiredActivityAgentRBAC).
+		podSpec.ServiceAccountName = activityAgentServiceAccountName(env)
+	}
 	return podSpec
+}
+
+// desiredActivityAgent renders the idle-timeout sidecar: the container that
+// watches the environment's own processes and sockets and records when it was
+// last used, by annotating this pod.
+//
+// It reports and decides nothing. Whether a mark is old enough to stop the
+// environment is the controller's to read and act on, and this container cannot
+// act on it even if it wanted to: its account can read and patch one pod and
+// nothing else.
+//
+// The watched ports are given rather than discovered because the agent cannot
+// guess them: they are the ports the environment's own services bind inside the
+// pod, which is mainContainerPort plus sshContainerPort when ssh is exposed —
+// sshContainerPort and not the port the Service publishes it on, since the
+// published one is bound by a proxy outside the pod and never appears in the
+// pod's own socket table. Ports an environment declares through spec.ports are
+// deliberately not among them: those are the tenant's own services rather than
+// the platform's, and making them part of the sidecar's arguments would make
+// every edit to a user's exposure part of the pod template, rolling the workload
+// — and losing a running session — to change what an agent watches.
+//
+// The container is also not allowed to fail. Kubernetes reports a pod's
+// readiness and failure over every container it holds, so a sidecar in
+// CrashLoopBackOff marks the whole environment Failed and stops the user's work;
+// that is why it has no probes, why the agent exits 0 however it is ended, and
+// why the resource limits below are hard ones rather than requests: an agent
+// that is throttled skips a sample, and one that is evicted for asking for more
+// memory than the node has takes the environment with it.
+func (r *DevEnvironmentReconciler) desiredActivityAgent(env *aiv1alpha1.DevEnvironment) corev1.Container {
+	ports := []int32{mainContainerPort(env.Spec.Type)}
+	if sshExposed(env) && env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
+		ports = append(ports, sshContainerPort)
+	}
+	watched := make([]string, 0, len(ports))
+	for _, port := range ports {
+		watched = append(watched, strconv.Itoa(int(port)))
+	}
+	// The identity is the environment's own, not this image's: reading another
+	// process's /proc/<pid>/io is a ptrace permission check, and a process may
+	// only trace one of its own uid. A sidecar on a uid of its own would come up,
+	// report CPU progress, and silently lose the IO dimension — the one that
+	// catches work waiting on storage or on a GPU rather than on a core.
+	securityContext := desiredSecurityContext(env.Spec.Runtime)
+	securityContext.AllowPrivilegeEscalation = ptr(false)
+	securityContext.ReadOnlyRootFilesystem = ptr(true)
+	// Added rather than defaulted: the runtime's own default set is the image's
+	// entrypoint to keep, and this container has no entrypoint but the binary.
+	securityContext.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{allCapabilities}}
+	return corev1.Container{
+		Name:  activityAgentContainerName,
+		Image: activityAgentImage,
+		// Always, because the reference above is not guaranteed to be immutable:
+		// a manager built without one names the agent's default `latest` tag, and
+		// a cached layer under a mutable tag is a rebuilt agent that no node ever
+		// picks up. Pulling every time costs a manifest request next to the image
+		// layers the node already holds.
+		ImagePullPolicy: corev1.PullAlways,
+		Args:            []string{"--ports=" + strings.Join(watched, ",")},
+		// The pod's own identity, so the agent needs no flag and no guess about
+		// which pod it is in. Both come from the downward API rather than from
+		// the controller, which would otherwise have to name a pod that does not
+		// exist until this template creates it.
+		Env: []corev1.EnvVar{
+			{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: podNameFieldPath},
+				},
+			},
+			{
+				Name: "POD_NAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+				},
+			},
+		},
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("10m"),
+				corev1.ResourceMemory: resource.MustParse("32Mi"),
+			},
+			Limits: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("50m"),
+				corev1.ResourceMemory: resource.MustParse("64Mi"),
+			},
+		},
+		SecurityContext: securityContext,
+	}
 }
 
 // desiredVolumeClaimTemplates renders the workspace claim template, creating
@@ -2121,8 +2259,10 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 
 // desiredNetworkPolicy enforces default-deny ingress — widened by exactly one
 // rule when the platform Gateway's dataplane is configured — with DNS egress
-// whitelisted (design §9.1).
-func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvironment) *networkingv1.NetworkPolicy {
+// whitelisted (design §9.1). agentEgress is the activity agent's allowance,
+// resolved by applyNetworkPolicy, and is empty for an environment that carries
+// no agent.
+func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvironment, agentEgress []networkingv1.NetworkPolicyEgressRule) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
 	dnsPort := intstr.FromInt32(53)
@@ -2169,7 +2309,7 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     ingress,
-			Egress: []networkingv1.NetworkPolicyEgressRule{
+			Egress: append([]networkingv1.NetworkPolicyEgressRule{
 				{
 					To: []networkingv1.NetworkPolicyPeer{{
 						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{namespaceNameLabel: "kube-system"}},
@@ -2180,9 +2320,81 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 						{Protocol: &tcp, Port: &dnsPort},
 					},
 				},
-			},
+			}, agentEgress...),
 		},
 	}
+}
+
+// apiserverEgress is the egress rule that admits the activity agent's calls to
+// the apiserver, and is empty for an environment that carries no agent.
+//
+// It is not optional. The policy above is default-deny egress with a single
+// DNS allowance, and a NetworkPolicy admits traffic per pod rather than per
+// container — so without this rule the sidecar's PATCH is dropped by any
+// enforcing CNI, and the agent deploys, runs, looks healthy and never writes an
+// annotation, with nothing anywhere reporting an error. The environment is then
+// stopped out from under whoever is using it, which is the failure this whole
+// feature exists to avoid.
+//
+// The allowance names the apiserver's address rather than widening to
+// 0.0.0.0/0: there is no per-container selector to scope it to the sidecar, so
+// a rule that opened 443 to the world would open it for the environment's own
+// container too, turning every default-deny namespace into an egress-open one
+// for its tenant. The address is the kubernetes Service's ClusterIP, which is
+// where egress policy has to name the apiserver — policy matches the
+// destination before the service translation that would otherwise rewrite it to
+// a node's address, and that ClusterIP is both what the pod's
+// KUBERNETES_SERVICE_HOST says and what its client library dials.
+//
+// Every conformant cluster keeps that Service at default/kubernetes; there is
+// no API that reports where it is, so the convention is what this reads. A
+// failure to read it fails the reconcile rather than being skipped: the object
+// is either there or the cluster is not one this platform can run on, and
+// carrying on regardless would leave the one failure this rule exists to
+// prevent, silently.
+func (r *DevEnvironmentReconciler) apiserverEgress(ctx context.Context, env *aiv1alpha1.DevEnvironment) ([]networkingv1.NetworkPolicyEgressRule, error) {
+	if !activityAgentEnabled(env) {
+		return nil, nil
+	}
+	svc := &corev1.Service{}
+	if err := r.Get(ctx, client.ObjectKey{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault}, svc); err != nil {
+		return nil, fmt.Errorf("reading the apiserver endpoint for the activity agent: %w", err)
+	}
+	// spec.clusterIPs is the dual-stack form and always carries the primary
+	// address first; spec.clusterIP is what a server older than 1.20 writes and
+	// is the whole of the address on a single-stack cluster either way. A
+	// headless Service — "None" — has no address to admit and matches this
+	// platform's apiserver nowhere.
+	addresses := svc.Spec.ClusterIPs
+	if len(addresses) == 0 {
+		addresses = []string{svc.Spec.ClusterIP}
+	}
+	var peers []networkingv1.NetworkPolicyPeer
+	for _, address := range addresses {
+		// The prefix length is the address's own, so a v4 ClusterIP is admitted
+		// as /32 and a v6 one as /128: an IPBlock names a CIDR and would
+		// otherwise round a single address out to the range that contains it.
+		ip, err := netip.ParseAddr(address)
+		if err != nil {
+			continue
+		}
+		peers = append(peers, networkingv1.NetworkPolicyPeer{
+			IPBlock: &networkingv1.IPBlock{CIDR: netip.PrefixFrom(ip, ip.BitLen()).String()},
+		})
+	}
+	if len(peers) == 0 {
+		return nil, fmt.Errorf("the kubernetes Service at %s/%s publishes no address", metav1.NamespaceDefault, kubernetesServiceName)
+	}
+	// The port is the Service's, not the literal 443: the agent dials
+	// KUBERNETES_SERVICE_PORT, which is exactly what this Service publishes, and
+	// a rule naming a different port would admit nothing while looking correct.
+	var ports []networkingv1.NetworkPolicyPort
+	for i := range svc.Spec.Ports {
+		tcp := corev1.ProtocolTCP
+		port := intstr.FromInt32(svc.Spec.Ports[i].Port)
+		ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &port})
+	}
+	return []networkingv1.NetworkPolicyEgressRule{{To: peers, Ports: ports}}, nil
 }
 
 // applyService creates or updates the Service. The server assigns ClusterIP,
@@ -2213,12 +2425,16 @@ func (r *DevEnvironmentReconciler) applyService(ctx context.Context, env *aiv1al
 
 // applyNetworkPolicy creates or updates the NetworkPolicy.
 func (r *DevEnvironmentReconciler) applyNetworkPolicy(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
-	np := r.desiredNetworkPolicy(env)
+	agentEgress, err := r.apiserverEgress(ctx, env)
+	if err != nil {
+		return err
+	}
+	np := r.desiredNetworkPolicy(env, agentEgress)
 	if err := ctrl.SetControllerReference(env, np, r.Scheme); err != nil {
 		return err
 	}
 	existing := &networkingv1.NetworkPolicy{}
-	err := r.Get(ctx, client.ObjectKey{Name: np.Name, Namespace: np.Namespace}, existing)
+	err = r.Get(ctx, client.ObjectKey{Name: np.Name, Namespace: np.Namespace}, existing)
 	if apierrors.IsNotFound(err) {
 		return r.Create(ctx, np)
 	}
@@ -2233,6 +2449,149 @@ func (r *DevEnvironmentReconciler) applyNetworkPolicy(ctx context.Context, env *
 	}
 	np.ResourceVersion = existing.ResourceVersion
 	return r.Update(ctx, np)
+}
+
+// reconcileActivityAgentRBAC ensures the ServiceAccount, Role and RoleBinding
+// that authorize an environment's activity agent, and removes them once the
+// environment stops asking for one — the grant is worth having only while the
+// sidecar exists to use it, and an account that can still annotate a pod after
+// the feature is off is one nobody is watching.
+func (r *DevEnvironmentReconciler) reconcileActivityAgentRBAC(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
+	enabled := activityAgentEnabled(env)
+	for _, obj := range r.desiredActivityAgentRBAC(env) {
+		if !enabled {
+			if err := r.removeOwnedObject(ctx, env, obj); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := ctrl.SetControllerReference(env, obj, r.Scheme); err != nil {
+			return err
+		}
+		// Decoded into an empty object of the desired kind, not into a copy of the
+		// desired object: a field the server omits — an emptied RoleBinding's
+		// subjects serialize as absent — would survive a decode into a populated
+		// one and read as "already correct".
+		existing := activityAgentRBACBlank(obj)
+		err := r.Get(ctx, client.ObjectKeyFromObject(obj), existing)
+		if apierrors.IsNotFound(err) {
+			if err := r.Create(ctx, obj); err != nil {
+				return err
+			}
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if err := ensureDevEnvOwned(existing, env); err != nil {
+			return err
+		}
+		if !activityAgentRBACDrifted(existing, obj) {
+			continue
+		}
+		obj.SetResourceVersion(existing.GetResourceVersion())
+		if err := r.Update(ctx, obj); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// desiredActivityAgentRBAC renders the three objects that let an environment's
+// activity agent record that the environment is in use: a ServiceAccount of its
+// own, a Role that may read and patch exactly that one pod, and the binding
+// between them.
+//
+// Per environment rather than one platform-wide account, and scoped by
+// resourceNames rather than by namespace, because the sidecar runs inside the
+// tenant's own pod with the tenant's own images beside it: a shared account
+// would let any environment's agent annotate any other environment's pod, and a
+// namespace-wide one would let a container that can read its own projected token
+// relabel every environment in the namespace — including the
+// ai.cubestack.io/dev-environment label the controller finds them by.
+//
+// get is needed as well as patch: the agent reads the mark it is about to
+// overwrite, so that a restart does not move an idle environment's activity
+// clock backwards (see the agent's Recorder). update and delete are not granted
+// — an annotation is all this ever writes, and a merge patch on the pod's
+// annotations expresses that without being able to replace the object.
+func (r *DevEnvironmentReconciler) desiredActivityAgentRBAC(env *aiv1alpha1.DevEnvironment) []client.Object {
+	name := activityAgentServiceAccountName(env)
+	labels := r.envLabels(env.Name)
+	objectMeta := metav1.ObjectMeta{Name: name, Namespace: env.Namespace, Labels: labels}
+	return []client.Object{
+		&corev1.ServiceAccount{ObjectMeta: objectMeta},
+		&rbacv1.Role{
+			ObjectMeta: objectMeta,
+			Rules: []rbacv1.PolicyRule{{
+				APIGroups:     []string{""},
+				Resources:     []string{"pods"},
+				ResourceNames: []string{podName(env)},
+				Verbs:         []string{"get", "patch"},
+			}},
+		},
+		&rbacv1.RoleBinding{
+			ObjectMeta: objectMeta,
+			RoleRef: rbacv1.RoleRef{
+				APIGroup: rbacv1.GroupName,
+				Kind:     "Role",
+				Name:     name,
+			},
+			Subjects: []rbacv1.Subject{{
+				Kind:      rbacv1.ServiceAccountKind,
+				Name:      name,
+				Namespace: env.Namespace,
+			}},
+		},
+	}
+}
+
+// activityAgentRBACBlank is an empty object of the same kind as obj, which a
+// lookup decodes into.
+func activityAgentRBACBlank(obj client.Object) client.Object {
+	switch obj.(type) {
+	case *corev1.ServiceAccount:
+		return &corev1.ServiceAccount{}
+	case *rbacv1.Role:
+		return &rbacv1.Role{}
+	default:
+		return &rbacv1.RoleBinding{}
+	}
+}
+
+// activityAgentRBACDrifted reports whether an existing authorization object says
+// something different from the desired one, over the fields this controller
+// owns. A ServiceAccount carries none of them — the server fills in its secrets
+// and a user may add labels to any of the three — so a field the controller did
+// not write is never drift.
+func activityAgentRBACDrifted(existing, desired client.Object) bool {
+	switch want := desired.(type) {
+	case *rbacv1.Role:
+		return !apiequality.Semantic.DeepEqual(existing.(*rbacv1.Role).Rules, want.Rules)
+	case *rbacv1.RoleBinding:
+		got := existing.(*rbacv1.RoleBinding)
+		return !apiequality.Semantic.DeepEqual(got.RoleRef, want.RoleRef) ||
+			!apiequality.Semantic.DeepEqual(got.Subjects, want.Subjects)
+	default:
+		return false
+	}
+}
+
+// removeOwnedObject deletes an object this environment controls, and does nothing
+// when it is already gone. A same-name object owned by someone else is reported
+// as a conflict rather than deleted, like every other managed object here.
+func (r *DevEnvironmentReconciler) removeOwnedObject(ctx context.Context, env *aiv1alpha1.DevEnvironment, obj client.Object) error {
+	err := r.Get(ctx, client.ObjectKeyFromObject(obj), obj)
+	if apierrors.IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err := ensureDevEnvOwned(obj, env); err != nil {
+		return err
+	}
+	return r.Delete(ctx, obj)
 }
 
 // applyStatefulSet creates or updates the StatefulSet. The pod template is
@@ -2373,6 +2732,26 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		// resource-name flags together, so hashing them resolved is what lets the
 		// flags above reach an existing workload.
 		RDMA *rdmaTemplate `json:"rdma,omitempty"`
+		// ShareProcessNamespace is pod-spec state nothing else in this input
+		// implies: it is what puts the environment's processes where the sidecar
+		// can read them, and a pod that kept it after the sidecar left — or lost
+		// it while the sidecar stayed — would be a template this input called
+		// unchanged.
+		ShareProcessNamespace bool `json:"shareProcessNamespace,omitempty"`
+		// ActivityAgent is ::activityAgentVersion, and is empty for every
+		// environment that carries no sidecar. Like PodSecurityContext it stands
+		// for something this input cannot see: the container is a constant plus the
+		// ports it watches, which follow from Type and SSHExposed, both of which
+		// are already here — so what is left to hash is the sentinel a change to
+		// the sidecar bumps. The empty string is omitted rather than hashed, so the
+		// environments that predate the agent digest exactly as they did before it
+		// existed and are not rolled on upgrade.
+		ActivityAgent string `json:"activityAgent,omitempty"`
+		// ServiceAccount is the account the pod template names, and is empty for
+		// every environment that runs under the namespace's default. It is the one
+		// pod-spec field here that is neither the spec nor a constant, so nothing
+		// else in this input would move if it were re-pointed.
+		ServiceAccount string `json:"serviceAccount,omitempty"`
 	}
 	var rdma *rdmaTemplate
 	if name, hostNetwork := r.rdmaResource(env); name != "" {
@@ -2395,22 +2774,34 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	if _, ok := resolvedHome(env); ok {
 		workspaceHome = workspaceHomeVersion
 	}
+	// Both empty unless the environment asks for an idle timeout, so the
+	// environments that ask for none — every one that predates the sidecar —
+	// digest exactly as they did before it existed.
+	activityAgent := ""
+	serviceAccount := ""
+	if activityAgentEnabled(env) {
+		activityAgent = activityAgentVersion
+		serviceAccount = activityAgentServiceAccountName(env)
+	}
 	h := sha256.New()
 	h.Write(mustJSON(templateInput{
-		Type:                 env.Spec.Type,
-		Image:                env.Spec.Image,
-		Resources:            env.Spec.Resources,
-		Runtime:              env.Spec.Runtime,
-		Storage:              env.Spec.Storage,
-		Volumes:              env.Spec.Volumes,
-		SSHExposed:           sshExposed(env),
-		JupyterTokenRevision: env.Annotations[jupyterTokenRevisionAnnotationKey],
-		SSHKeysRevision:      env.Annotations[sshKeysRevisionAnnotationKey],
-		SSHMount:             sshMountKey(env),
-		PodSecurityContext:   podSecurityContextVersion,
-		RootLauncherEnv:      rootLauncherEnv,
-		WorkspaceHome:        workspaceHome,
-		RDMA:                 rdma,
+		Type:                  env.Spec.Type,
+		Image:                 env.Spec.Image,
+		Resources:             env.Spec.Resources,
+		Runtime:               env.Spec.Runtime,
+		Storage:               env.Spec.Storage,
+		Volumes:               env.Spec.Volumes,
+		SSHExposed:            sshExposed(env),
+		JupyterTokenRevision:  env.Annotations[jupyterTokenRevisionAnnotationKey],
+		SSHKeysRevision:       env.Annotations[sshKeysRevisionAnnotationKey],
+		SSHMount:              sshMountKey(env),
+		PodSecurityContext:    podSecurityContextVersion,
+		RootLauncherEnv:       rootLauncherEnv,
+		WorkspaceHome:         workspaceHome,
+		RDMA:                  rdma,
+		ShareProcessNamespace: activityAgentEnabled(env),
+		ActivityAgent:         activityAgent,
+		ServiceAccount:        serviceAccount,
 	}))
 	return fmt.Sprintf("sha256:%x", h.Sum(nil))
 }

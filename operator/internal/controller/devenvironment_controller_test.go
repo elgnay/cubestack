@@ -23,6 +23,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -35,6 +36,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	networkingv1 "k8s.io/api/networking/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -43,6 +45,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -976,13 +979,32 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 		}
 
 		It("admits nothing while no dataplane namespace is configured", func() {
-			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env)
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env, nil)
 
 			Expect(np.Spec.Ingress).To(BeEmpty())
 			Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{
 				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress,
 			}))
+			// DNS, and nothing else. nil is what an environment that carries no
+			// activity agent is rendered with, so this is also the assertion that
+			// the apiserver allowance does not reach environments that never asked
+			// for one.
 			Expect(np.Spec.Egress).To(HaveLen(1))
+		})
+
+		It("adds the agent's apiserver allowance to the DNS rule", func() {
+			agentEgress := []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "10.96.0.1/32"},
+				}},
+			}}
+
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env, agentEgress)
+
+			// Appended, so DNS stays the first rule an operator reads.
+			Expect(np.Spec.Egress).To(HaveLen(2))
+			Expect(np.Spec.Egress[0].To[0].PodSelector.MatchLabels).To(HaveKeyWithValue("k8s-app", "kube-dns"))
+			Expect(np.Spec.Egress[1]).To(Equal(agentEgress[0]))
 		})
 
 		It("admits the configured Gateway's dataplane", func() {
@@ -990,7 +1012,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 				GatewayDataplaneNamespace: testGatewayDataplaneNamespace,
 			}}
 
-			np := r.desiredNetworkPolicy(env)
+			np := r.desiredNetworkPolicy(env, nil)
 
 			Expect(np.Spec.Ingress).To(HaveLen(1))
 			Expect(np.Spec.Ingress[0].From).To(HaveLen(1))
@@ -1012,7 +1034,7 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 
 			// An environment's ports vary by spec.type and spec.ports, so naming
 			// one here would admit it and silently refuse the rest.
-			Expect(r.desiredNetworkPolicy(env).Spec.Ingress[0].Ports).To(BeEmpty())
+			Expect(r.desiredNetworkPolicy(env, nil).Spec.Ingress[0].Ports).To(BeEmpty())
 		})
 	})
 })
@@ -1606,7 +1628,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(sc.RunAsNonRoot).To(Equal(ptrTo(false)))
 			Expect(sc.Privileged).To(Equal(ptrTo(false)))
 			Expect(sc.AllowPrivilegeEscalation).To(Equal(ptrTo(false)))
-			Expect(sc.Capabilities.Drop).To(ConsistOf(corev1.Capability("ALL")))
+			Expect(sc.Capabilities.Drop).To(ConsistOf(allCapabilities))
 			Expect(sc.Capabilities.Add).To(ConsistOf(
 				corev1.Capability("CHOWN"), corev1.Capability("FOWNER"), corev1.Capability("FSETID")))
 		})
@@ -1733,7 +1755,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				home("relative/home"),
 				home(""),
 				home("/home/$(USER)"),
-				{{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}}},
+				{{Name: homeEnv, ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: podNameFieldPath}}}},
 			} {
 				Expect(resolveMountPath(env(func(s *aiv1alpha1.DevEnvironmentSpec) {
 					s.Runtime = &aiv1alpha1.RuntimeSpec{User: testRuntimeUser, Env: envVars}
@@ -2497,6 +2519,140 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}
 			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).To(BeEmpty())
 		})
+
+		// The whole rollout story of this feature is that an environment which
+		// asks for no idle timeout is a pod spec that has not changed. Asserting
+		// it here is what keeps that a property rather than a coincidence: the
+		// hash is hand-assembled (::stsSpecHash), so a field added to the template
+		// without a matching entry there would reach every environment in the
+		// cluster the moment the next reconcile ran.
+		It("leaves an environment with no idle timeout exactly as it was", func() {
+			spec := render(nil)
+			Expect(spec.Containers).To(HaveLen(1))
+			// Nil, not false: unset is what serializes away, so an untouched
+			// field is the one thing that cannot enter the template.
+			Expect(spec.ShareProcessNamespace).To(BeNil())
+			Expect(spec.ServiceAccountName).To(BeEmpty())
+		})
+
+		// IdleTimeout 0 is the schema default and the API's own way of saying
+		// "disabled", so a lifecycle block that states it must be read as no
+		// request at all rather than as a request for an agent that would stop
+		// the environment the moment it was idle.
+		It("leaves an environment with a zero idle timeout alone too", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 0}
+			})
+			Expect(spec.Containers).To(HaveLen(1))
+			Expect(spec.ShareProcessNamespace).To(BeNil())
+		})
+
+		It("carries the activity agent when an idle timeout is asked for", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			})
+			Expect(spec.ShareProcessNamespace).To(Equal(ptrTo(true)))
+			Expect(spec.ServiceAccountName).To(Equal("de-render" + activityAgentNameSuffix))
+			// Appended, never prepended: Containers[0] is the environment itself.
+			Expect(spec.Containers).To(HaveLen(2))
+			Expect(spec.Containers[0].Name).To(Equal(string(aiv1alpha1.DevEnvironmentTypeVSCode)))
+			s := spec.Containers[1]
+			Expect(s.Name).To(Equal(activityAgentContainerName))
+			Expect(s.Image).To(Equal(activityAgentImage))
+			// The image is a mutable tag, so a node that cached an older layer
+			// would keep running an older agent: only the pull policy makes a
+			// rebuilt agent reach a node that already has the tag.
+			Expect(s.ImagePullPolicy).To(Equal(corev1.PullAlways))
+			Expect(s.Args).To(Equal([]string{"--ports=8080"}))
+			// A probe is the one thing a sidecar must not have: a failing one
+			// makes the pod NotReady, and the environment with it.
+			Expect(s.ReadinessProbe).To(BeNil())
+			Expect(s.LivenessProbe).To(BeNil())
+			Expect(s.StartupProbe).To(BeNil())
+			// The agent names itself through the downward API, so the controller
+			// never has to name a pod that does not exist until this creates it.
+			Expect(s.Env).To(ConsistOf(
+				corev1.EnvVar{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: podNameFieldPath},
+				}},
+				corev1.EnvVar{Name: "POD_NAMESPACE", ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.namespace"},
+				}},
+			))
+		})
+
+		// The ports are the ones the environment's own services bind *inside* the
+		// pod. ssh is published on sshServicePort, but that port belongs to the
+		// platform's proxy rather than to the container, so an agent watching it
+		// would watch a socket that never appears in the pod.
+		It("watches the ssh port of a jupyter environment that exposes it", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 60}
+			})
+			Expect(spec.Containers[1].Args).To(Equal([]string{"--ports=8888,2222"}))
+		})
+
+		// An ssh-typed environment's main port *is* the ssh port, and a container
+		// port may not be declared twice.
+		It("names the ssh port once for an ssh-typed environment", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 60}
+			})
+			Expect(spec.Containers[1].Args).To(Equal([]string{"--ports=2222"}))
+		})
+
+		// Reading /proc/<pid>/io is a ptrace permission check, and a process may
+		// only trace one of its own uid — so a sidecar on a uid of its own would
+		// come up, report CPU progress, and silently lose the IO dimension, which
+		// is the one that catches a training job using almost no CPU.
+		It("runs the sidecar as the environment's own account", func() {
+			for _, uid := range []int64{1000, 2000, 0} {
+				spec := render(func(env *aiv1alpha1.DevEnvironment) {
+					env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
+						SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(uid)},
+					}
+					env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 60}
+				})
+				main, sidecar := spec.Containers[0].SecurityContext, spec.Containers[1].SecurityContext
+				Expect(sidecar.RunAsUser).To(Equal(main.RunAsUser), "uid %d", uid)
+				Expect(sidecar.RunAsGroup).To(Equal(main.RunAsGroup), "uid %d", uid)
+				// A sidecar that disagrees with its own pod on this is a
+				// CreateContainerConfigError, and a sidecar that cannot start
+				// fails the whole environment.
+				Expect(sidecar.RunAsNonRoot).To(Equal(main.RunAsNonRoot), "uid %d", uid)
+			}
+		})
+
+		It("grants the sidecar nothing it does not need", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 60}
+			})
+			s := spec.Containers[1].SecurityContext
+			Expect(s.AllowPrivilegeEscalation).To(Equal(ptrTo(false)))
+			Expect(s.ReadOnlyRootFilesystem).To(Equal(ptrTo(true)))
+			Expect(s.Capabilities).To(Equal(&corev1.Capabilities{Drop: []corev1.Capability{allCapabilities}}))
+			// The environment's own container keeps the context it had: these
+			// are the sidecar's, not a change to how a tenant's work runs.
+			Expect(spec.Containers[0].SecurityContext.Capabilities).To(BeNil())
+			Expect(spec.Containers[0].SecurityContext.ReadOnlyRootFilesystem).To(BeNil())
+		})
+
+		// An agent that is throttled skips a sample; one that asks for more memory
+		// than the node has is evicted, and takes the user's work with it.
+		It("bounds what the sidecar can take from the environment", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 60}
+			})
+			res := spec.Containers[1].Resources
+			Expect(res.Requests[corev1.ResourceCPU]).To(Equal(resource.MustParse("10m")))
+			Expect(res.Requests[corev1.ResourceMemory]).To(Equal(resource.MustParse("32Mi")))
+			Expect(res.Limits[corev1.ResourceCPU]).To(Equal(resource.MustParse("50m")))
+			Expect(res.Limits[corev1.ResourceMemory]).To(Equal(resource.MustParse("64Mi")))
+		})
 	})
 
 	Describe("desiredService", func() {
@@ -2952,6 +3108,157 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.Template.Spec.Containers[0].Ports).To(ContainElement(corev1.ContainerPort{
 					Name: testMetricsPortName, ContainerPort: 9090, HostPort: 9090, Protocol: corev1.ProtocolTCP,
 				}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The sidecar reads /proc, and a pod's containers each get their own PID
+		// namespace unless the pod shares one — so without this the agent would
+		// see nothing but itself and record an environment nobody is using. It
+		// reads and writes only its own pod, through an account the controller
+		// mints for it and deletes with the environment.
+		It("gives an idle-enabled environment the activity agent and its account", func() {
+			env := validDevEnvironment("de-agent")
+			env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			account := env.Name + activityAgentNameSuffix
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				tmpl := sts.Spec.Template.Spec
+				g.Expect(tmpl.ShareProcessNamespace).To(Equal(ptrTo(true)))
+				g.Expect(tmpl.ServiceAccountName).To(Equal(account))
+				g.Expect(tmpl.Containers).To(HaveLen(2))
+				g.Expect(tmpl.Containers[0].Name).To(Equal(string(aiv1alpha1.DevEnvironmentTypeJupyter)))
+				g.Expect(tmpl.Containers[1].Name).To(Equal(activityAgentContainerName))
+				g.Expect(tmpl.Containers[1].Args).To(Equal([]string{"--ports=8888"}))
+			}, "15s", "200ms").Should(Succeed())
+
+			Eventually(func(g Gomega) {
+				sa := &corev1.ServiceAccount{}
+				g.Expect(k8sClient.Get(ctx, envKey(account), sa)).To(Succeed())
+				g.Expect(metav1.GetControllerOf(sa).UID).To(Equal(env.UID))
+
+				role := &rbacv1.Role{}
+				g.Expect(k8sClient.Get(ctx, envKey(account), role)).To(Succeed())
+				g.Expect(metav1.GetControllerOf(role).UID).To(Equal(env.UID))
+				g.Expect(role.Rules).To(Equal([]rbacv1.PolicyRule{{
+					APIGroups:     []string{""},
+					Resources:     []string{"pods"},
+					ResourceNames: []string{podName(env)},
+					Verbs:         []string{"get", "patch"},
+				}}))
+
+				binding := &rbacv1.RoleBinding{}
+				g.Expect(k8sClient.Get(ctx, envKey(account), binding)).To(Succeed())
+				g.Expect(metav1.GetControllerOf(binding).UID).To(Equal(env.UID))
+				g.Expect(binding.RoleRef.Name).To(Equal(account))
+				g.Expect(binding.Subjects).To(Equal([]rbacv1.Subject{{
+					Kind: rbacv1.ServiceAccountKind, Name: account, Namespace: testNamespace,
+				}}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The environment's NetworkPolicy is default-deny egress with a single DNS
+		// allowance, and NetworkPolicy admits traffic per pod rather than per
+		// container. Without this rule the agent's PATCH is dropped, and the agent
+		// deploys, runs, looks healthy and never records anything — the one
+		// failure in this feature that is invisible from every direction.
+		It("admits the activity agent to the apiserver", func() {
+			// The suite creates default/kubernetes (suite_test.go); read back the
+			// address it was given rather than naming one, so this asserts the
+			// controller read that Service instead of assuming an address.
+			apiserver := &corev1.Service{}
+			Expect(k8sClient.Get(ctx,
+				client.ObjectKey{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault}, apiserver)).To(Succeed())
+			Expect(netip.MustParseAddr(apiserver.Spec.ClusterIP).Is4()).To(BeTrue(),
+				"envtest allocates an IPv4 service address, which is what the /32 below assumes")
+
+			env := validDevEnvironment("de-agent-netpol")
+			env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				np := &networkingv1.NetworkPolicy{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), np)).To(Succeed())
+				// The DNS allowance stays first; the apiserver's is appended.
+				g.Expect(np.Spec.Egress).To(HaveLen(2))
+				rule := np.Spec.Egress[1]
+				g.Expect(rule.To).To(Equal([]networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: apiserver.Spec.ClusterIP + "/32"},
+				}}))
+				g.Expect(rule.Ports).To(HaveLen(1))
+				g.Expect(*rule.Ports[0].Port).To(Equal(intstr.FromInt32(443)))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// An environment that asks for no idle timeout must not gain one, and must
+		// not be rewritten for not having one — the hash is hand-assembled
+		// (::stsSpecHash), so a template field it does not cover would roll every
+		// environment in the cluster on the next reconcile.
+		It("rolls the StatefulSet when an idle timeout is turned on", func() {
+			env := validDevEnvironment("de-idle-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+				g.Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+				sa := &corev1.ServiceAccount{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx,
+					envKey(env.Name+activityAgentNameSuffix), sa))).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(2))
+				g.Expect(sts.Spec.Template.Spec.ShareProcessNamespace).To(Equal(ptrTo(true)))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The grant is worth having only while the sidecar exists to use it, so
+		// turning an idle timeout off has to take the account away with it: it can
+		// read and patch the pod, and nothing else would ever come back for it.
+		It("withdraws the agent's account when the idle timeout is turned off", func() {
+			env := validDevEnvironment("de-idle-off")
+			env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			account := env.Name + activityAgentNameSuffix
+			Eventually(func(g Gomega) {
+				g.Expect(k8sClient.Get(ctx, envKey(account), &corev1.ServiceAccount{})).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 0}
+			})
+
+			Eventually(func(g Gomega) {
+				sa := &corev1.ServiceAccount{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(account), sa))).To(BeTrue())
+				role := &rbacv1.Role{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(account), role))).To(BeTrue())
+				binding := &rbacv1.RoleBinding{}
+				g.Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(account), binding))).To(BeTrue())
+
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Spec.Template.Spec.Containers).To(HaveLen(1))
+				g.Expect(sts.Spec.Template.Spec.ShareProcessNamespace).To(BeNil())
+				g.Expect(sts.Spec.Template.Spec.ServiceAccountName).To(BeEmpty())
 			}, "15s", "200ms").Should(Succeed())
 		})
 

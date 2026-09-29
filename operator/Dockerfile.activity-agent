@@ -1,13 +1,21 @@
-# Build the manager binary
+# Build the activity-agent binary, the DevEnvironment idle-timeout sidecar.
+#
+# A near-copy of the manager's Dockerfile, and deliberately so: the same bases,
+# the same mirror build args, the same static build. What differs is the
+# command and the binary, and the fact that this image is run as the
+# environment's own account rather than as the manager's fixed uid — see the
+# USER at the bottom.
 #
 # Both bases are build args defaulting to upstream. The e2e overrides them with
 # the platform registry's copies (see BASE_MIRRORS in the Makefile) so its pulls
 # do not go to Docker Hub and GCR; leaving them as the defaults keeps a bare
-# `make docker-build` — and any build outside the platform's network — working.
+# `make docker-build-activity-agent` — and any build outside the platform's
+# network — working.
 #
 # Both must be declared before the first FROM. An ARG declared after one is
 # scoped to that stage, and the second FROM then expands to a blank base name —
 # "base name (${DISTROLESS_BASE}) should not be blank".
+#
 # The golang base is pinned to a patch version, not to the 1.26 line: go.mod
 # requires go 1.26.7 (envoyproxy/gateway v1.9.1), and a base older than that
 # makes the build download a toolchain at build time.
@@ -16,13 +24,6 @@ ARG DISTROLESS_BASE=gcr.io/distroless/static:nonroot
 FROM ${GOLANG_BASE} AS builder
 ARG TARGETOS
 ARG TARGETARCH
-# The activity-agent reference this manager should ask for. Empty means "name
-# none", and the build then keeps internal/controller/assets.go's own default —
-# a local build has no better answer than the latest published agent. CI names
-# the commit-addressed tag it publishes, so the manager and the sidecar it
-# creates are always the pair built from one commit; see the Makefile's
-# ACTIVITY_AGENT_IMAGE.
-ARG ACTIVITY_AGENT_IMAGE
 # Use the goproxy.cn module mirror (the default proxy.golang.org is
 # unreachable from this network without a proxy). Override with
 # --build-arg GOPROXY=... if needed.
@@ -33,7 +34,7 @@ WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
-# cache deps before building and copying source so that we don't need to re-download as much
+# cache deps before building and copying source so we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
 RUN go mod download
 
@@ -43,24 +44,19 @@ COPY . .
 # Build
 # the GOARCH has no default value to allow the binary to be built according to the host where the command
 # was called. For example, if we call make docker-build in a local env which has the Apple Silicon M1 SO
-# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64. Therefore,
-# by leaving it empty we can ensure that the container and binary shipped on it will have the same platform.
-#
-# The sidecar reference is only overridden when the build names one: -X with an
-# empty value would set the variable to the empty string and leave the manager
-# asking for an image called "", which is worse than the default it would
-# otherwise keep.
-RUN ldflags=""; \
-    if [ -n "${ACTIVITY_AGENT_IMAGE}" ]; then \
-        ldflags="-X github.com/suanova/cubestack/internal/controller.activityAgentImage=${ACTIVITY_AGENT_IMAGE}"; \
-    fi; \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${ldflags}" -o manager cmd/main.go
+# the docker BUILDPLATFORM arg will be linux/arm64 when for Apple x86 it will be linux/amd64.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o activity-agent cmd/activity-agent/main.go
 
-# Use distroless as minimal base image to package the manager binary
+# Use distroless as minimal base image to package the agent binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
 FROM ${DISTROLESS_BASE}
 WORKDIR /
-COPY --from=builder /workspace/manager .
+COPY --from=builder /workspace/activity-agent .
+# The uid here is a fallback, not a decision. The controller runs the sidecar as
+# the environment's own account, because /proc/<pid>/io is readable only by a
+# process that shares the identity of the one it is reading — running as 65532
+# beside a pod whose user is 1000 would silently cost the agent the IO
+# dimension, which is the one that catches a training job using almost no CPU.
 USER 65532:65532
 
-ENTRYPOINT ["/manager"]
+ENTRYPOINT ["/activity-agent"]
