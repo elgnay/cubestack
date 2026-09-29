@@ -25,6 +25,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -92,6 +94,26 @@ var _ = BeforeSuite(func() {
 
 	k8sClient, err = client.New(cfg, client.Options{Scheme: testScheme})
 	Expect(err).NotTo(HaveOccurred())
+
+	// Every conformant cluster carries this Service, and envtest is the one
+	// cluster that does not: it starts an apiserver with no kube-controller-manager
+	// to create it. The DevEnvironment reconciler reads it for the activity
+	// agent's egress allowance (::apiserverEgress) and fails the reconcile when
+	// it is missing, so creating it here is what makes envtest look like the
+	// cluster the controller is written for. Without it every idle-enabled
+	// environment in this suite fails to reconcile.
+	//
+	// No ClusterIP is named: the address is the cluster's to choose, and the
+	// controller is asserted against whatever this apiserver allocates.
+	apiserverService := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault},
+		Spec: corev1.ServiceSpec{
+			Ports: []corev1.ServicePort{{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP}},
+		},
+	}
+	Expect(client.IgnoreAlreadyExists(k8sClient.Create(ctx, apiserverService))).To(Succeed())
+	Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(apiserverService), apiserverService)).To(Succeed())
+	Expect(apiserverService.Spec.ClusterIP).NotTo(BeEmpty())
 
 	testMgr, err = ctrl.NewManager(cfg, ctrl.Options{
 		Scheme: testScheme,

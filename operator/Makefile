@@ -1,5 +1,12 @@
 # Image URL to use all building/pushing image targets
 IMG ?= harbor.isuanova.com/suanova/cubestack-controller-manager:latest
+# activityAgentImage in internal/controller/assets.go: the image the idle-timeout
+# sidecar runs. Read out of the source for the same reason PERMISSION_INIT_IMAGE
+# is — what the controller names is what has to exist, and a second copy of the
+# reference here is one that can drift from it. The `latest` tag is mutable,
+# which is why the controller pins the sidecar's imagePullPolicy to Always and
+# carries a version sentinel in the StatefulSet hash.
+ACTIVITY_AGENT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*activityAgentImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -584,6 +591,24 @@ docker-build: ## Build docker image with the manager.
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+# The idle-timeout sidecar. Separate from the manager's build because it is a
+# second image with its own Dockerfile and its own entrypoint, and the controller
+# names it by its own reference; the two share only their bases.
+#
+# ACTIVITY_AGENT_IMAGE is read out of assets.go, so a build here produces the
+# image the controller will actually ask for. The guard is the same as the init
+# container's: an empty value means the sed found nothing, and building
+# ":latest" would push an image nothing looks for.
+.PHONY: docker-build-activity-agent
+docker-build-activity-agent: ## Build docker image with the DevEnvironment activity agent.
+	@[ -n "$(ACTIVITY_AGENT_IMAGE)" ] || { echo "activityAgentImage not found in internal/controller/assets.go"; exit 1; }
+	$(CONTAINER_TOOL) build $(BASE_ARGS) -f Dockerfile.activity-agent -t $(ACTIVITY_AGENT_IMAGE) .
+
+.PHONY: docker-push-activity-agent
+docker-push-activity-agent: ## Push the activity agent image.
+	@[ -n "$(ACTIVITY_AGENT_IMAGE)" ] || { echo "activityAgentImage not found in internal/controller/assets.go"; exit 1; }
+	$(CONTAINER_TOOL) push $(ACTIVITY_AGENT_IMAGE)
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:

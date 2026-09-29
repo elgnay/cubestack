@@ -70,40 +70,60 @@ jobs:
           registry: harbor.isuanova.com
           username: ${{ vars.CI_BOT_NAME }}
           password: ${{ secrets.CI_BOT_PASSWORD }}
-      - name: Build and push image
+      - name: Build and push images
         env:
           GITHUB_TOKEN: ${{ secrets.GH_TOKEN }}
           RELEASE_VERSION: ${{ steps.release.outputs.version }}
         run: |
           set -euo pipefail
-          IMAGE=harbor.isuanova.com/suanova/cubestack-controller-manager
+          MANAGER=harbor.isuanova.com/suanova/cubestack-controller-manager
+          ACTIVITY_AGENT=harbor.isuanova.com/suanova/cubestack-activity-agent
           SHA_TAG="${GITHUB_SHA}"
 
-          # Push the immutable, commit-addressed tag. Safe for any commit that
+          # Push the immutable, commit-addressed tags. Safe for any commit that
           # ever landed on main, even if a newer commit now exists.
-          make -C operator docker-build IMG="${IMAGE}:${SHA_TAG}"
-          make -C operator docker-push IMG="${IMAGE}:${SHA_TAG}"
+          #
+          # Both images are built here, from one commit and one checkout, so the
+          # manager and the sidecar an environment runs are always the pair that
+          # was published together. The sidecar's reference is read out of the
+          # controller's source, so it is overridden with the commit-addressed
+          # one — `make docker-build-activity-agent` otherwise names `latest`,
+          # the tag the controller asks for, and that is moved below.
+          make -C operator docker-build IMG="${MANAGER}:${SHA_TAG}"
+          make -C operator docker-push IMG="${MANAGER}:${SHA_TAG}"
+          make -C operator docker-build-activity-agent ACTIVITY_AGENT_IMAGE="${ACTIVITY_AGENT}:${SHA_TAG}"
+          make -C operator docker-push-activity-agent ACTIVITY_AGENT_IMAGE="${ACTIVITY_AGENT}:${SHA_TAG}"
 
           # A release publishes the version it names and does not move `latest`,
           # which tracks main.
-          if [ -n "${RELEASE_VERSION}" ]; then
-            docker tag "${IMAGE}:${SHA_TAG}" "${IMAGE}:${RELEASE_VERSION}"
-            docker push "${IMAGE}:${RELEASE_VERSION}"
-            exit 0
+          #
+          # Only refresh a mutable tag if this run's commit is still the head of
+          # main. An older run can finish after a newer main commit; pushing its
+          # image as `latest` would mislabel which commit is newest.
+          CURRENT_MAIN=""
+          if [ -z "${RELEASE_VERSION}" ]; then
+            CURRENT_MAIN="$(
+              curl -fsSL \
+                -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+                "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/main" \
+                | jq -r .commit.sha
+            )"
           fi
 
-          # Only refresh the mutable `latest` tag if this run's commit is still
-          # the head of main. An older run can finish after a newer main commit;
-          # pushing its image as `latest` would mislabel which commit is newest.
-          CURRENT_MAIN="$(
-            curl -fsSL \
-              -H "Authorization: Bearer ${GITHUB_TOKEN}" \
-              "https://api.github.com/repos/${GITHUB_REPOSITORY}/branches/main" \
-              | jq -r .commit.sha
-          )"
-          if [ "${CURRENT_MAIN}" = "${SHA_TAG}" ]; then
-            docker tag "${IMAGE}:${SHA_TAG}" "${IMAGE}:latest"
-            docker push "${IMAGE}:latest"
-          else
-            echo "Skipping 'latest': ${SHA_TAG} is no longer the head of main (current: ${CURRENT_MAIN})"
-          fi
+          # Both images take the same tags. A release where one of them carried
+          # a version and the other did not would leave an environment running a
+          # sidecar from a different commit than its manager, which is the one
+          # pairing the controller's version sentinel cannot detect.
+          for IMAGE in "${MANAGER}" "${ACTIVITY_AGENT}"; do
+            if [ -n "${RELEASE_VERSION}" ]; then
+              docker tag "${IMAGE}:${SHA_TAG}" "${IMAGE}:${RELEASE_VERSION}"
+              docker push "${IMAGE}:${RELEASE_VERSION}"
+              continue
+            fi
+            if [ "${CURRENT_MAIN}" = "${SHA_TAG}" ]; then
+              docker tag "${IMAGE}:${SHA_TAG}" "${IMAGE}:latest"
+              docker push "${IMAGE}:latest"
+            else
+              echo "Skipping '${IMAGE}:latest': ${SHA_TAG} is no longer the head of main (current: ${CURRENT_MAIN})"
+            fi
+          done

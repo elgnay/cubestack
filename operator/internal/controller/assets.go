@@ -114,6 +114,49 @@ const (
 	// deployment mirrors it under the same name/host as its other images.
 	permissionInitImage = "harbor.isuanova.com/mirrors/docker.io/library/busybox:1.38.0"
 
+	// activityAgentContainerName is the idle-timeout sidecar. It shares the pod's
+	// process and network namespaces and reports activity by annotating the pod
+	// with activity.AnnotationKey; the controller reads that annotation, and
+	// nothing else about the sidecar crosses the pod boundary.
+	activityAgentContainerName = "activity-agent"
+
+	// activityAgentImage is the image that sidecar runs, published from this
+	// repository by .github/workflows/ci-operator-image.yml alongside the manager.
+	// It is a mutable tag, which is why the sidecar pins ImagePullPolicy: Always —
+	// see the comment on desiredActivityAgent.
+	activityAgentImage = "harbor.isuanova.com/suanova/cubestack-activity-agent:latest"
+
+	// activityAgentVersion is a sentinel nothing reads. It is part of the
+	// StatefulSet hash so that it is a value which, when changed, rolls the
+	// environments running the sidecar: a mutable image tag does not change the
+	// pod template, so without something to bump, a rebuilt agent would reach a
+	// running environment only when that environment happened to restart for
+	// some other reason — the one case where an agent bug stays fixed on paper
+	// and broken in the cluster.
+	activityAgentVersion = "1"
+
+	// activityAgentNameSuffix names the three objects that authorize the sidecar
+	// — the ServiceAccount it runs under and the Role and RoleBinding that give
+	// it access to the one pod it is in — as <env>-activity.
+	activityAgentNameSuffix = "-activity"
+
+	// kubernetesServiceName is the Service the cluster's apiserver is reached
+	// through, which is what the activity agent's egress allowance has to name
+	// (::apiserverEgress). Every conformant cluster keeps it at
+	// default/kubernetes; there is no API that reports where it is, so the
+	// convention is what the controller reads.
+	kubernetesServiceName = "kubernetes"
+
+	// allCapabilities is the capability list that drops every capability a
+	// container could hold. More than one container in the pod spells it out,
+	// and the ones that keep a capability do so by adding it back
+	// (::desiredPermissionInitContainer), so the drop is worth naming once.
+	allCapabilities = corev1.Capability("ALL")
+
+	// podNameFieldPath is the downward-API field the containers that need to
+	// know which pod they are in read.
+	podNameFieldPath = "metadata.name"
+
 	// permissionInitMountPath is where that container mounts the workspace claim.
 	// It is a path of the init container's own — the claim is also mounted at the
 	// environment's workspace path by the main container, and the two mounts are
