@@ -3994,11 +3994,32 @@ var _ = Describe("DevEnvironment controller", func() {
 				stopForIdle(g, env)
 			}, "15s", "200ms").Should(Succeed())
 
+			// When the controller made that stop, which is what distinguishes it from
+			// the one the spec waits for below.
+			first := &aiv1alpha1.DevEnvironment{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), first)).To(Succeed())
+			firstStop := first.Annotations[autoStoppedAtAnnotationKey]
+			Expect(firstStop).NotTo(BeEmpty())
+
 			clearMark(env)
 
-			// The same pod, one timeout after the stop it survived.
+			// The same pod, one timeout after the stop it survived — and a *second*
+			// stop, rather than the first one read again. Until the pass that reads the
+			// cleared mark has written its own status, the environment still reports
+			// the stop the clear is undoing, so waiting for Stopped alone would be
+			// satisfied by the stop just made and would prove nothing.
+			//
+			// The stop's own timestamp is the evidence, rather than an intervening
+			// Running: the environment is Running for barely the timeout — a second
+			// here — before it stops again, and a lookup that misses that window would
+			// fail a spec that had watched the clock restart perfectly well. The
+			// timestamp cannot be missed, and only the controller writes it.
 			Eventually(func(g Gomega) {
 				stopForIdle(g, env)
+
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Annotations[autoStoppedAtAnnotationKey]).NotTo(Equal(firstStop))
 			}, "20s", "200ms").Should(Succeed())
 		})
 

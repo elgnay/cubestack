@@ -62,6 +62,19 @@ const (
 	// (::lastAutoStopAt).
 	autoStoppedAtAnnotationKey = "ai.cubestack.io/auto-stopped-at"
 
+	// autoStopStampFormat is the layout that key is written and read with, named
+	// once so the two ends cannot drift apart — which they had: the writer used
+	// time.RFC3339, which drops fractional seconds, so a stop at 12:00:00.999 was
+	// recorded as 12:00:00 and the floor granted the environment up to a second
+	// less than the timeout it asked for. The asymmetry is silent and the error is
+	// always in the same direction, shortening a timeout, which is why a wrong
+	// answer here looks like a working one.
+	//
+	// RFC3339Nano parses a value with or without a fraction, so the marks the
+	// earlier build wrote are still read, and it renders a whole second without a
+	// spurious suffix, so the ordinary case is unchanged.
+	autoStopStampFormat = time.RFC3339Nano
+
 	// idleCheckPeriod is the longest the controller waits between looks at an
 	// idle environment's clock, and the only RequeueAfter in this controller: a
 	// genuinely idle environment produces no events at all — that is what idle
@@ -213,7 +226,7 @@ func lastAutoStopAt(env *aiv1alpha1.DevEnvironment) time.Time {
 	if raw == "" {
 		return time.Time{}
 	}
-	at, err := time.Parse(time.RFC3339, raw)
+	at, err := time.Parse(autoStopStampFormat, raw)
 	if err != nil {
 		return time.Time{}
 	}
@@ -237,7 +250,7 @@ func (r *DevEnvironmentReconciler) markAutoStopped(ctx context.Context, env *aiv
 	body, err := json.Marshal(map[string]any{"metadata": map[string]any{
 		"annotations": map[string]string{
 			autoStoppedAnnotationKey:   autoStoppedValue,
-			autoStoppedAtAnnotationKey: time.Now().UTC().Format(time.RFC3339),
+			autoStoppedAtAnnotationKey: time.Now().UTC().Format(autoStopStampFormat),
 		},
 	}})
 	if err != nil {

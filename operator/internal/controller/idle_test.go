@@ -212,6 +212,18 @@ var _ = Describe("lastAutoStopAt", func() {
 		Expect(lastAutoStopAt(env)).To(BeTemporally("==", at))
 	})
 
+	It("keeps the sub-second part of the instant it recorded", func() {
+		// A whole second of the timeout turns on this. The floor hands the
+		// environment the timeout over again from the stop, so a stop at
+		// 12:00:00.999 recorded as 12:00:00 gives back a second less than was asked
+		// for — silently, and always in the direction of stopping sooner. The two
+		// ends of the record share one layout precisely so this cannot drift.
+		at := now.Add(-10 * time.Minute).Add(999 * time.Millisecond)
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = at.Format(autoStopStampFormat)
+		Expect(lastAutoStopAt(env)).To(BeTemporally("==", at))
+	})
+
 	It("reports nothing for an environment the controller has never stopped", func() {
 		Expect(lastAutoStopAt(idleEnv(true, 60, false))).To(BeZero())
 	})
