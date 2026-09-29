@@ -356,6 +356,17 @@ type RuntimeSecurityContext struct {
 // LifecycleSpec configures the lifecycle.
 type LifecycleSpec struct {
 	// IdleTimeout is the idle auto-shutdown timeout in seconds; 0 disables it.
+	//
+	// An environment idle for this long is stopped without its spec being
+	// touched: the workload is scaled to zero and status.phase reports Stopped
+	// with reason IdleTimeout, while spec.running stays as the user left it. The
+	// stop is marked with the annotation ai.cubestack.io/auto-stopped on the
+	// DevEnvironment, and that mark — not spec.running — is what says the
+	// environment is stopped.
+	//
+	// A client starting an environment must therefore clear that annotation.
+	// With spec.running already true a start changes nothing this platform can
+	// observe, so an environment left marked stays stopped.
 	// +kubebuilder:default=0
 	// +kubebuilder:validation:Minimum=0
 	// +optional
@@ -473,8 +484,12 @@ type DevEnvironmentStatus struct {
 	// +optional
 	JupyterTokenSecret *corev1.SecretReference `json:"jupyterTokenSecret,omitempty"`
 
-	// LastActivityTime is the last activity time, used for idle timeout
-	// determination.
+	// LastActivityTime is when the environment was last seen active, which is
+	// what the idle timeout is measured against. It is reported by the
+	// environment's own activity agent, which writes the pod annotation
+	// ai.cubestack.io/last-activity while it sees activity — so the value
+	// standing still is the signal, and it is absent until the environment has
+	// been active at least once.
 	// +optional
 	LastActivityTime *metav1.Time `json:"lastActivityTime,omitempty"`
 

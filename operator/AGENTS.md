@@ -225,8 +225,9 @@ kubectl logs -n <project>-system deployment/<project>-controller-manager -c mana
 
 A DevEnvironment with `spec.lifecycle.idleTimeout > 0` carries a second container,
 the `activity-agent` sidecar (`cmd/activity-agent`, judgement in `internal/activity/`).
-It reports activity by writing the pod annotation `ai.cubestack.io/last-activity`.
-Two things about it are easy to get wrong:
+It reports activity by writing the pod annotation `ai.cubestack.io/last-activity`,
+which the controller reads back to stop an environment that has gone idle
+(`internal/controller/idle.go`). The parts of that pair that are easy to get wrong:
 
 - **The sidecar must never fail.** `podFailed` iterates *every* container status, so
   a sidecar in `CrashLoopBackOff` or `ImagePullBackOff` marks the whole environment
@@ -244,6 +245,24 @@ Two things about it are easy to get wrong:
   dimension is unaffected: CPU and IO counters come from `/proc/<pid>`, which is
   namespaced by pid rather than by net. RDMA environments (`spec.network`) are the
   host-network case.
+- **An idle stop is a mark on the environment, not a spec change.** The stop sets
+  `ai.cubestack.io/auto-stopped` on the *DevEnvironment* — never on the pod, which
+  is the very thing the scale-to-0 deletes — and both the StatefulSet's replicas
+  and the reported phase are derived from that mark, so `spec.running` goes on
+  saying what the user asked for (D7/DEV-27). The consequence is a contract a client
+  has to keep: starting an environment means clearing the mark, because with
+  `spec.running` already true a start changes nothing the controller can observe.
+  The controller clears it itself only when the user stops the environment or turns
+  the timeout off.
+- **That mark must never reach the pod template.** `podTemplateAnnotations` copies
+  its two revision annotations explicitly rather than the whole map, and
+  `stsSpecHash` reads those same two. Adding the mark to either would roll every
+  idle-enabled environment on a stop that is meant to be invisible to the workload.
+- **The idle deadline is the one legitimate `RequeueAfter`** (the rule above is
+  about resources). An idle environment emits no events at all — that is what idle
+  means — so no watch can wake the controller to stop it. `idleCheckPeriod` is that
+  timer, and it exists only while the environment is Running, the timeout is on and
+  the mark is clear; it is not a substitute for the pod and DevEnvironment watches.
 
 ### Logging
 

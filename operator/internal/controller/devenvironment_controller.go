@@ -124,13 +124,18 @@ type DevEnvironmentControllerConfig struct {
 }
 
 // Reason constants for DevEnvironment conditions and status.phase. Several
-// values double as both a phase name and a condition reason.
+// values double as both a phase name and a condition reason. A phase reason is
+// not only a failure reason: it is also what tells two ways of reaching the same
+// phase apart — reasonStopped from a user's stop, reasonIdleTimeout from the
+// idle timeout stopping the environment on its own — and the lifecycle Event for
+// a transition is recorded under it (::emitLifecycleTransition).
 const (
 	reasonPending                = "Pending"
 	reasonRunning                = "Running"
 	reasonStopped                = "Stopped"
 	reasonFailed                 = "Failed"
 	reasonDeleting               = "Deleting"
+	reasonIdleTimeout            = "IdleTimeout"
 	reasonScheduled              = "Scheduled"
 	reasonNotScheduled           = "NotScheduled"
 	reasonNotCreated             = "PodNotCreated"
@@ -359,11 +364,15 @@ const (
 
 	// Kubernetes Event reasons emitted on lifecycle transitions (design §11.2):
 	// Created on adoption, Started/Stopped on phase transitions into
-	// Running/Stopped, and Failed (Warning) on transitions into Failed.
-	eventReasonCreated = "Created"
-	eventReasonStarted = "Started"
-	eventReasonStopped = "Stopped"
-	eventReasonFailed  = "Failed"
+	// Running/Stopped, and Failed (Warning) on transitions into Failed. A
+	// transition into Stopped is recorded under the phase's own reason, so an
+	// idle auto-stop is eventReasonIdleTimeout rather than eventReasonStopped;
+	// the other transitions have one reason each.
+	eventReasonCreated     = "Created"
+	eventReasonStarted     = "Started"
+	eventReasonStopped     = "Stopped"
+	eventReasonFailed      = "Failed"
+	eventReasonIdleTimeout = "IdleTimeout"
 
 	// legacyStorageReadyCondition is the workspace condition the pre-delegation
 	// controller reported while it managed the claim itself. The claim's
@@ -443,6 +452,13 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// (::specFindings), and nothing can set or clear it any more either.
 	meta.RemoveStatusCondition(&desired.Status.Conditions, legacyStorageReadyCondition)
 	meta.RemoveStatusCondition(&desired.Status.Conditions, legacyBrandMatchValidCondition)
+
+	// An auto-stop mark the user has superseded is dropped before the
+	// StatefulSet and the phase below are derived from it, so one pass sees one
+	// state (::clearSupersededAutoStop).
+	if err := r.clearSupersededAutoStop(ctx, &env); err != nil {
+		return ctrl.Result{}, err
+	}
 
 	// 1. Spec gate: every place the controller resolves a field itself rather
 	// than applying the spec as written (::specFindings). A finding only the user
@@ -554,11 +570,31 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	setPodScheduledCondition(&desired.Status.Conditions, pod)
 	r.setPhaseAndReady(&env, &desired.Status, pod)
 
+	// 6. Idle auto-stop (design §4.2 step 4). The mark is written here and only
+	// here, from the phase just derived and the pod just observed; the replicas
+	// and the phase that follow from it belong to the pass that reads it back.
+	// So this pass's status still reports Running, which is what is true at this
+	// instant: the mark stops the environment, it does not report it stopped.
+	decision, err := r.reconcileIdleStop(ctx, &env, &desired.Status, pod)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+
 	if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
 		return ctrl.Result{}, err
 	}
 	r.emitLifecycleTransition(&env, desired)
-	return ctrl.Result{}, nil
+	if decision.Stop {
+		// The write to the environment is itself a watched update, so this
+		// requeue is belt and braces rather than the mechanism.
+		return ctrl.Result{Requeue: true}, nil
+	}
+	// RequeueAfter is the idle deadline — the one thing here that no watch can
+	// wake the controller for, since an idle environment emits nothing to watch
+	// (see idleCheckPeriod). Zero, the case for every environment with no timeout
+	// and for one that is not running, is the zero Result, so those reconcile
+	// exactly as they did before the timer existed.
+	return ctrl.Result{RequeueAfter: decision.RequeueAfter}, nil
 }
 
 // updateStatusIfChanged writes the desired status only when it differs from
@@ -1834,13 +1870,16 @@ func findingsMessage(findings []specFinding) string {
 }
 
 // desiredStatefulSet renders the environment StatefulSet: replicas 1/0 from
-// spec.running, the workspace volumeClaimTemplate, and PVC retention. The
-// workspace PVC's lifecycle belongs to the StatefulSet: it creates the claim
+// spec.running, the workspace volumeClaimTemplate, and PVC retention. Replicas
+// are zero for the idle auto-stop as well, which overrides the spec without
+// changing it (::autoStoppedAnnotationKey): both are read on every pass, so the
+// pass that writes the mark still renders 1 and the pass after it renders 0.
+// The workspace PVC's lifecycle belongs to the StatefulSet: it creates the claim
 // from the template and, per whenDeleted, removes it when the StatefulSet is
 // deleted — so the controller neither creates nor deletes workspace claims.
 func (r *DevEnvironmentReconciler) desiredStatefulSet(env *aiv1alpha1.DevEnvironment) *appsv1.StatefulSet {
 	replicas := int32(0)
-	if env.Spec.Running {
+	if env.Spec.Running && !autoStopped(env) {
 		replicas = 1
 	}
 	// spec.storage.pvcRetention is carried by the StatefulSet rather than acted
@@ -4451,6 +4490,16 @@ func (r *DevEnvironmentReconciler) setPhaseAndReady(env *aiv1alpha1.DevEnvironme
 	case !env.Spec.Running:
 		setPhase(status, aiv1alpha1.PhaseStopped, reasonStopped)
 		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonStopped, "Environment is stopped (running=false)")
+	case autoStopped(env):
+		// The mark, not spec.running, is what says stopped (D7/DEV-27), and it
+		// has to be read before the pod cases: the stop scales the StatefulSet to
+		// zero, so the pod this reconcile sees is missing or terminating, and
+		// reporting Pending or Failed for an environment the platform stopped on
+		// purpose would be wrong in both directions. A user's own stop keeps its
+		// own reason — its case is above, and it clears the mark before this runs.
+		setPhase(status, aiv1alpha1.PhaseStopped, reasonIdleTimeout)
+		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonIdleTimeout,
+			fmt.Sprintf("Environment was stopped after %s of inactivity", idleTimeoutOf(env)))
 	case pod == nil:
 		setPhase(status, aiv1alpha1.PhasePending, reasonPending)
 		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "The environment pod has not been created yet")
@@ -4495,7 +4544,16 @@ func (r *DevEnvironmentReconciler) emitLifecycleTransition(env, desired *aiv1alp
 		}
 	case aiv1alpha1.PhaseStopped:
 		if oldName != "" && oldName != aiv1alpha1.PhaseStopped {
-			r.Recorder.Eventf(env, nil, corev1.EventTypeNormal, eventReasonStopped, eventReasonStopped,
+			// The reason is the phase's own, so an idle auto-stop is recorded
+			// under reasonIdleTimeout while a user stop keeps the reason it has
+			// always had: both constants are the string "Stopped", so that path
+			// is unchanged. Keying this off the mark instead would label a user's
+			// stop of a marked environment an auto-stop.
+			reason := eventReasonStopped
+			if desired.Status.Phase.Reason != "" {
+				reason = desired.Status.Phase.Reason
+			}
+			r.Recorder.Eventf(env, nil, corev1.EventTypeNormal, reason, reason,
 				"DevEnvironment %s/%s is stopped", env.Namespace, env.Name)
 		}
 	case aiv1alpha1.PhaseFailed:
