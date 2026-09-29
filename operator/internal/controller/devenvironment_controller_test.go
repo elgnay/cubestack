@@ -3816,11 +3816,12 @@ var _ = Describe("DevEnvironment controller", func() {
 
 		// replacePod stands in for the StatefulSet controller, which envtest does
 		// not run: stopping the environment deletes the pod, and starting it brings
-		// a fresh one up whose agent is only beginning to report. Without the
-		// replacement the previous pod's stale mark would still be visible, and the
-		// environment would be judged idle again the moment it started — which is
-		// the state the platform is in for as long as the scale-down is in flight,
-		// and what the pod's deletion timestamp is read for.
+		// a fresh one up whose agent is only beginning to report.
+		//
+		// The other half of that controller's job — the gap between the scale-down
+		// being written and the pod actually going away — is not simulated here.
+		// It is exercised where it matters, by the specs below that clear the mark
+		// with the old pod still standing.
 		replacePod := func(env *aiv1alpha1.DevEnvironment, at time.Time) {
 			deletePod(env)
 			Eventually(func(g Gomega) {
@@ -3916,6 +3917,89 @@ var _ = Describe("DevEnvironment controller", func() {
 			got := &aiv1alpha1.DevEnvironment{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 			Expect(got.Status.LastActivityTime).To(BeNil())
+		})
+
+		// clearMark is a client starting an auto-stopped environment the way §4.4
+		// says the console does: the mark goes and spec.running, which the platform
+		// deliberately left true, stays as it is.
+		clearMark := func(env *aiv1alpha1.DevEnvironment) {
+			Eventually(func(g Gomega) {
+				cur := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), cur)).To(Succeed())
+				delete(cur.Annotations, autoStoppedAnnotationKey)
+				g.Expect(k8sClient.Update(ctx, cur)).To(Succeed())
+			}, "15s", "200ms").Should(Succeed())
+		}
+
+		It("keeps a start that clears the mark while the stopped pod is still with it", func() {
+			// The pod a stop takes away does not leave the instant the mark is
+			// written — the scale-down lands a moment later — and until it does, the
+			// old pod is the one the controller observes: running, ready, and still
+			// carrying the activity mark that made it look idle. Clearing the mark is
+			// a start, and judging that start against the pod of the session before
+			// it would re-mark the environment the user has just restarted.
+			//
+			// envtest is in that state by construction, which is why the pod here is
+			// deliberately left standing: nothing runs the StatefulSet controller, so
+			// nothing deletes it and it carries no deletion timestamp.
+			env := idleWithTimeout("de-idle-race", idleTimeout)
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			createStatefulPod(env, true, nil)
+			defer deletePod(env)
+			markActivity(env, staleMark())
+			Eventually(func(g Gomega) {
+				stopForIdle(g, env)
+			}, "15s", "200ms").Should(Succeed())
+
+			clearMark(env)
+
+			// The start is kept: the mark stays off, the phase goes back to Running,
+			// and the workload is asked back for.
+			kept := func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Annotations).NotTo(HaveKey(autoStoppedAnnotationKey))
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
+
+				cur := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), cur)).To(Succeed())
+				g.Expect(cur.Spec.Replicas).NotTo(BeNil())
+				g.Expect(*cur.Spec.Replicas).To(Equal(int32(1)))
+			}
+			// eventually before consistently, because the phase is the controller's:
+			// until the pass that reads the cleared mark has written its own, the
+			// environment still reports the stop that pass is undoing.
+			Eventually(kept, "15s", "200ms").Should(Succeed())
+			Consistently(kept, "3s", "200ms").Should(Succeed())
+		})
+
+		It("restarts the idle clock at the stop rather than disarming it", func() {
+			// The floor is a floor, not a veto. The pod above outlives its own stop
+			// and its activity mark is older than the stop, so if the floor simply
+			// disqualified it the environment would run until the pod was replaced —
+			// the timeout silently off with nothing to say so. Measuring from the
+			// stop instead gives it the timeout over again, which is what this spec
+			// watches happen.
+			env := idleWithTimeout("de-idle-floor", 1)
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			createStatefulPod(env, true, nil)
+			defer deletePod(env)
+			markActivity(env, staleMark())
+			Eventually(func(g Gomega) {
+				stopForIdle(g, env)
+			}, "15s", "200ms").Should(Succeed())
+
+			clearMark(env)
+
+			// The same pod, one timeout after the stop it survived.
+			Eventually(func(g Gomega) {
+				stopForIdle(g, env)
+			}, "20s", "200ms").Should(Succeed())
 		})
 
 		It("returns to Running when the user stops and starts the environment", func() {

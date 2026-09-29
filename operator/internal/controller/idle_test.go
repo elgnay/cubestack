@@ -198,6 +198,82 @@ var _ = Describe("activityBaseline", func() {
 	})
 })
 
+var _ = Describe("lastAutoStopAt", func() {
+	var now time.Time
+
+	BeforeEach(func() {
+		now = time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	})
+
+	It("reads the instant the controller recorded alongside the mark", func() {
+		at := now.Add(-10 * time.Minute)
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = stampActivity(at)
+		Expect(lastAutoStopAt(env)).To(BeTemporally("==", at))
+	})
+
+	It("reports nothing for an environment the controller has never stopped", func() {
+		Expect(lastAutoStopAt(idleEnv(true, 60, false))).To(BeZero())
+	})
+
+	It("reports nothing when the record does not parse", func() {
+		// The same rule the pod's mark is held to: a record that cannot be read
+		// must not hold an environment awake, and must not stop one either.
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = "not-a-time"
+		Expect(lastAutoStopAt(env)).To(BeZero())
+	})
+})
+
+var _ = Describe("idleBaseline", func() {
+	var now time.Time
+
+	BeforeEach(func() {
+		now = time.Date(2026, time.September, 29, 12, 0, 0, 0, time.UTC)
+	})
+
+	It("measures from the pod when the controller has never stopped it", func() {
+		at := now.Add(-10 * time.Minute)
+		env := idleEnv(true, 60, false)
+		Expect(idleBaseline(env, activityPod(stampActivity(at), nil, time.Time{}))).To(BeTemporally("==", at))
+	})
+
+	It("measures from the stop when the pod in front of it is older", func() {
+		// The pod the stop replaced is still there and still carries the mark that
+		// made it look idle. That session is over, and judging the pod would re-mark
+		// the environment the user has just started.
+		stoppedAt := now.Add(-time.Minute)
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = stampActivity(stoppedAt)
+		pod := activityPod(stampActivity(now.Add(-time.Hour)), nil, time.Time{})
+		Expect(idleBaseline(env, pod)).To(BeTemporally("==", stoppedAt))
+	})
+
+	It("measures from the pod when it has been active since the stop", func() {
+		// The floor moves the clock, it does not disarm it: a pod that really does
+		// outlive its own stop is still stopped, one timeout later, rather than
+		// never.
+		at := now.Add(-time.Minute)
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = stampActivity(now.Add(-time.Hour))
+		Expect(idleBaseline(env, activityPod(stampActivity(at), nil, time.Time{}))).To(BeTemporally("==", at))
+	})
+
+	It("leaves the pod's own fallbacks alone when there is no stop to floor them", func() {
+		// A floor that has nothing to say must not turn a pod-start baseline into
+		// no baseline at all, which would stop the judgement instead of moving it.
+		start := metav1.NewTime(now.Add(-time.Hour))
+		env := idleEnv(true, 60, false)
+		Expect(idleBaseline(env, activityPod("", &start, now))).To(BeTemporally("==", start.Time))
+	})
+
+	It("has nothing to measure from without a pod", func() {
+		env := idleEnv(true, 60, true)
+		env.Annotations[autoStoppedAtAnnotationKey] = stampActivity(now.Add(-time.Minute))
+		Expect(idleBaseline(env, nil)).To(BeTemporally("==", now.Add(-time.Minute)))
+	})
+})
+
 var _ = Describe("syncLastActivity", func() {
 	var now time.Time
 

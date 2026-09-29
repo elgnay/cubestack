@@ -47,6 +47,21 @@ const (
 	autoStoppedAnnotationKey = "ai.cubestack.io/auto-stopped"
 	autoStoppedValue         = "true"
 
+	// autoStoppedAtAnnotationKey is the companion record of *when* the mark was
+	// written, and it is deliberately a second key rather than the mark's value.
+	// The mark is the client's to clear, so anything stored in it is gone at
+	// exactly the moment it is needed — the pass that finds the mark cleared is
+	// the pass that has to know when the stop it describes happened. This key is
+	// the controller's own and no client writes or clears it.
+	//
+	// What it is for: a pod the platform has already stopped does not disappear
+	// the instant the mark is written. It is still there for as long as the
+	// scale-down takes, and while it is, it still carries the stale activity mark
+	// that made it look idle in the first place. Clearing the mark is a start, and
+	// a start must not be judged idle against the pod of the session before it
+	// (::lastAutoStopAt).
+	autoStoppedAtAnnotationKey = "ai.cubestack.io/auto-stopped-at"
+
 	// idleCheckPeriod is the longest the controller waits between looks at an
 	// idle environment's clock, and the only RequeueAfter in this controller: a
 	// genuinely idle environment produces no events at all — that is what idle
@@ -139,6 +154,29 @@ func activityBaseline(pod *corev1.Pod) time.Time {
 	return pod.CreationTimestamp.Time
 }
 
+// idleBaseline is the instant the idle clock is measured from: the pod's own
+// activity, floored at the last stop this controller made.
+//
+// The floor is the second of the two guards that protect a start. A pod does not
+// vanish when the mark is written — the scale-down lands a moment later, and
+// until it does the pod this reconcile observes is the old one: running, ready,
+// and still carrying the activity mark from the session that has just ended.
+// Clearing the mark is a start, and a start must not be judged against the pod
+// it replaced, so the clock measures from the later of the two
+// (::lastAutoStopAt).
+//
+// It is a floor on the clock rather than a veto on the judgement: the
+// environment is not kept awake, it is given the timeout over again from the
+// stop — so a pod that really does survive its own stop is still stopped,
+// one timeout later, rather than never.
+func idleBaseline(env *aiv1alpha1.DevEnvironment, pod *corev1.Pod) time.Time {
+	baseline := activityBaseline(pod)
+	if stoppedAt := lastAutoStopAt(env); stoppedAt.After(baseline) {
+		baseline = stoppedAt
+	}
+	return baseline
+}
+
 // idleTimeoutOf is the environment's idle timeout, or zero when it has none.
 // Only an environment with the feature on can carry the mark — turning the
 // timeout off clears it — but nothing that reports on a mark should depend on
@@ -155,9 +193,36 @@ func autoStopped(env *aiv1alpha1.DevEnvironment) bool {
 	return env.Annotations[autoStoppedAnnotationKey] == autoStoppedValue
 }
 
-// markAutoStopped writes the mark.
+// lastAutoStopAt is the instant the controller last stopped this environment
+// itself, or the zero time when it never has.
 //
-// The write is a JSON merge patch naming the one annotation, aimed at a fresh
+// It is a floor for the idle clock, and it exists because clearing the mark is
+// not only a change of state, it is also the moment the environment's session
+// restarts. The pod from before that instant is still visible for as long as the
+// scale-down takes to land — and it is still carrying the activity mark that
+// made it look idle, so judging it would re-mark the environment the user has
+// just started. Measuring from the later of the pod's activity and this instant
+// says the only thing that is true of both cases: everything the environment did
+// before it was stopped belongs to the session that is over.
+//
+// An unreadable value is no value, for the same reason an unreadable pod mark is
+// no mark: a record the controller cannot read must not be allowed to hold an
+// environment awake, and must not be allowed to stop one either.
+func lastAutoStopAt(env *aiv1alpha1.DevEnvironment) time.Time {
+	raw := env.Annotations[autoStoppedAtAnnotationKey]
+	if raw == "" {
+		return time.Time{}
+	}
+	at, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return at
+}
+
+// markAutoStopped writes the mark, and with it the instant it was written.
+//
+// The write is a JSON merge patch naming the two annotations, aimed at a fresh
 // object that is an address and nothing more — the shape internal/activity uses
 // for the pod annotation, and for the same reason: a patch computed from the
 // object this reconcile read would carry the informer's copy of every other
@@ -170,7 +235,10 @@ func autoStopped(env *aiv1alpha1.DevEnvironment) bool {
 // cluster has not reached.
 func (r *DevEnvironmentReconciler) markAutoStopped(ctx context.Context, env *aiv1alpha1.DevEnvironment) error {
 	body, err := json.Marshal(map[string]any{"metadata": map[string]any{
-		"annotations": map[string]string{autoStoppedAnnotationKey: autoStoppedValue},
+		"annotations": map[string]string{
+			autoStoppedAnnotationKey:   autoStoppedValue,
+			autoStoppedAtAnnotationKey: time.Now().UTC().Format(time.RFC3339),
+		},
 	}})
 	if err != nil {
 		return fmt.Errorf("building the auto-stop patch: %w", err)
@@ -256,18 +324,21 @@ func syncLastActivity(status *aiv1alpha1.DevEnvironmentStatus, pod *corev1.Pod) 
 func (r *DevEnvironmentReconciler) reconcileIdleStop(ctx context.Context, env *aiv1alpha1.DevEnvironment, status *aiv1alpha1.DevEnvironmentStatus, pod *corev1.Pod) (idleDecision, error) {
 	syncLastActivity(status, pod)
 
-	// A pod on its way out is not evidence that anyone is working. This is what
-	// protects a start: the mark has just been cleared, the previous pod is still
-	// visible carrying the annotation that made it look idle, and without this
-	// the judgement would fire again and re-mark the environment the user has
-	// just started.
+	// A pod on its way out is not evidence that anyone is working. This is the
+	// first of the two guards that protect a start: the mark has just been
+	// cleared, the previous pod is still visible carrying the annotation that made
+	// it look idle, and without this the judgement would fire again and re-mark
+	// the environment the user has just started.
+	//
+	// It covers the pod that is already terminating. The second guard covers the
+	// one that is not yet — see the baseline below.
 	if pod == nil || pod.DeletionTimestamp != nil || autoStopped(env) {
 		return idleDecision{}, nil
 	}
 
 	running := status.Phase != nil && status.Phase.Name == aiv1alpha1.PhaseRunning
 
-	decision := decideIdle(time.Now(), running, idleTimeoutOf(env), activityBaseline(pod))
+	decision := decideIdle(time.Now(), running, idleTimeoutOf(env), idleBaseline(env, pod))
 	if !decision.Stop {
 		return decision, nil
 	}
