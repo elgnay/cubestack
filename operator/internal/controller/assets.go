@@ -120,12 +120,6 @@ const (
 	// nothing else about the sidecar crosses the pod boundary.
 	activityAgentContainerName = "activity-agent"
 
-	// activityAgentImage is the image that sidecar runs, published from this
-	// repository by .github/workflows/ci-operator-image.yml alongside the manager.
-	// It is a mutable tag, which is why the sidecar pins ImagePullPolicy: Always —
-	// see the comment on desiredActivityAgent.
-	activityAgentImage = "harbor.isuanova.com/suanova/cubestack-activity-agent:latest"
-
 	// activityAgentVersion is a sentinel nothing reads. It is part of the
 	// StatefulSet hash so that it is a value which, when changed, rolls the
 	// environments running the sidecar: a mutable image tag does not change the
@@ -170,6 +164,22 @@ const (
 	permissionInitUIDEnv  = "WORKSPACE_UID"
 	permissionInitGIDEnv  = "WORKSPACE_GID"
 )
+
+// activityAgentImage is the image the idle-timeout sidecar runs, published from
+// this repository by .github/workflows/ci-operator-image.yml alongside the
+// manager.
+//
+// It is a variable rather than a constant so that a build can name it. The
+// manager and the sidecar are two images from one commit, and the mutable
+// `latest` default below is the one reference that can make them disagree: an
+// install that carries a released manager but no `latest` has no sidecar to
+// pull, and one that carries a newer `latest` runs an agent that postdates its
+// own controller. CI therefore overrides this with the commit-addressed tag it
+// publishes (make docker-build ACTIVITY_AGENT_IMAGE=..., from the build arg of
+// the same name), so a manager asks for the agent built beside it. A build that
+// names nothing — a local make docker-build — keeps the default, because it has
+// no better answer than the latest published agent.
+var activityAgentImage = "harbor.isuanova.com/suanova/cubestack-activity-agent:latest"
 
 // permissionInitScript establishes the workspace claim's root ownership: the
 // account the environment runs as has to own the directory it works in.

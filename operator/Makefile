@@ -6,7 +6,15 @@ IMG ?= harbor.isuanova.com/suanova/cubestack-controller-manager:latest
 # reference here is one that can drift from it. The `latest` tag is mutable,
 # which is why the controller pins the sidecar's imagePullPolicy to Always and
 # carries a version sentinel in the StatefulSet hash.
-ACTIVITY_AGENT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*activityAgentImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\1/p' internal/controller/assets.go)
+#
+# It names the reference twice: what docker-build-activity-agent tags and pushes,
+# and — through the build arg of the same name — what docker-build bakes into the
+# manager. Those have to be one value. Two images built from two commits that
+# name each other by a tag either of them can move is the drift this whole
+# arrangement exists to remove, and `latest` is exactly that tag.
+#
+# The pattern allows a leading `var`, because it is one: the build overrides it.
+ACTIVITY_AGENT_IMAGE ?= $(shell sed -n 's/^[[:space:]]*\(var[[:space:]]*\)\{0,1\}activityAgentImage[[:space:]]*=[[:space:]]*"\(.*\)"$$/\2/p' internal/controller/assets.go)
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
@@ -586,7 +594,7 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build $(BASE_ARGS) -t ${IMG} .
+	$(CONTAINER_TOOL) build $(BASE_ARGS) --build-arg ACTIVITY_AGENT_IMAGE=$(ACTIVITY_AGENT_IMAGE) -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
@@ -624,7 +632,7 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	builder="cubestack-builder-$$$$"; \
 	trap '$(CONTAINER_TOOL) buildx rm "$$builder" >/dev/null 2>&1 || true; rm -f Dockerfile.cross' EXIT; \
 	$(CONTAINER_TOOL) buildx create --name "$$builder" --use; \
-	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	$(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --build-arg ACTIVITY_AGENT_IMAGE=$(ACTIVITY_AGENT_IMAGE) --tag ${IMG} -f Dockerfile.cross .
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.

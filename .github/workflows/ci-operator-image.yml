@@ -83,13 +83,15 @@ jobs:
           # Push the immutable, commit-addressed tags. Safe for any commit that
           # ever landed on main, even if a newer commit now exists.
           #
-          # Both images are built here, from one commit and one checkout, so the
-          # manager and the sidecar an environment runs are always the pair that
-          # was published together. The sidecar's reference is read out of the
-          # controller's source, so it is overridden with the commit-addressed
-          # one — `make docker-build-activity-agent` otherwise names `latest`,
-          # the tag the controller asks for, and that is moved below.
-          make -C operator docker-build IMG="${MANAGER}:${SHA_TAG}"
+          # Both images are built here, from one commit and one checkout, and the
+          # manager is told which sidecar it is paired with: the commit-addressed
+          # reference the agent is tagged with is baked into the manager's binary
+          # as well, so an environment asks for the agent built beside its own
+          # controller. `latest` is not that reference — a release never moves it,
+          # so a manager that asked for it could have no sidecar to pull at all,
+          # and on main it names a newer commit than the manager it runs under.
+          make -C operator docker-build IMG="${MANAGER}:${SHA_TAG}" \
+            ACTIVITY_AGENT_IMAGE="${ACTIVITY_AGENT}:${SHA_TAG}"
           make -C operator docker-push IMG="${MANAGER}:${SHA_TAG}"
           make -C operator docker-build-activity-agent ACTIVITY_AGENT_IMAGE="${ACTIVITY_AGENT}:${SHA_TAG}"
           make -C operator docker-push-activity-agent ACTIVITY_AGENT_IMAGE="${ACTIVITY_AGENT}:${SHA_TAG}"

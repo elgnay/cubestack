@@ -45,9 +45,14 @@ const (
 	// it was busy.
 	MinWriteInterval = 60 * time.Second
 
-	// defaultWriteTimeout bounds one PATCH, so an apiserver that stops answering
-	// cannot wedge the loop. A tick that is skipped is one sample, which is
-	// nothing next to an annotation that is never written again.
+	// defaultWriteTimeout bounds one call to the apiserver — the startup read as
+	// much as a PATCH. A server that stops answering must not be able to wedge
+	// the loop: a tick that is skipped is one sample, and a write that is given
+	// up on costs nothing next to a mark that is never moved again. The read is
+	// bounded for the same reason and matters more, because it happens before
+	// the loop starts: an agent that never gets past it never samples, so it
+	// never marks the environment active, and the environment is stopped out
+	// from under whoever is using it.
 	defaultWriteTimeout = 10 * time.Second
 )
 
@@ -110,7 +115,14 @@ func NewRecorder(detector Stepper, store AnnotationStore, log logr.Logger) *Reco
 // work. Every failure here is therefore logged and waited out, and the next
 // tick tries again.
 func (r *Recorder) Run(ctx context.Context, ticks <-chan time.Time) {
-	if current, err := r.store.Current(ctx); err != nil {
+	// Bounded, like the write below and for a worse reason: this is the one call
+	// that stands between a running agent and its first sample. On the signal
+	// context alone, an apiserver that accepts the connection and never answers
+	// would hold the loop here for as long as the sidecar runs.
+	readCtx, cancel := context.WithTimeout(ctx, r.writeTimeout)
+	current, err := r.store.Current(readCtx)
+	cancel()
+	if err != nil {
 		r.log.Error(err, "Could not read the current last-activity annotation; the next active sample will write one")
 	} else {
 		r.lastWritten = current

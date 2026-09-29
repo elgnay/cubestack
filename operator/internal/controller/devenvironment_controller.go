@@ -2157,8 +2157,13 @@ func (r *DevEnvironmentReconciler) desiredActivityAgent(env *aiv1alpha1.DevEnvir
 	// entrypoint to keep, and this container has no entrypoint but the binary.
 	securityContext.Capabilities = &corev1.Capabilities{Drop: []corev1.Capability{allCapabilities}}
 	return corev1.Container{
-		Name:            activityAgentContainerName,
-		Image:           activityAgentImage,
+		Name:  activityAgentContainerName,
+		Image: activityAgentImage,
+		// Always, because the reference above is not guaranteed to be immutable:
+		// a manager built without one names the agent's default `latest` tag, and
+		// a cached layer under a mutable tag is a rebuilt agent that no node ever
+		// picks up. Pulling every time costs a manifest request next to the image
+		// layers the node already holds.
 		ImagePullPolicy: corev1.PullAlways,
 		Args:            []string{"--ports=" + strings.Join(watched, ",")},
 		// The pod's own identity, so the agent needs no flag and no guess about

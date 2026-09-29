@@ -276,6 +276,23 @@ var _ = Describe("Recorder", func() {
 		Expect(store.attempts).To(Equal(2))
 		Expect(store.writes).To(BeEmpty())
 	})
+
+	It("bounds the startup read, so a server that never answers cannot stop it sampling", func() {
+		// The write above is bounded inside tick; this is the same hazard one step
+		// earlier, where it costs more. The read happens before the loop starts,
+		// so an agent held there never samples at all — it never marks the
+		// environment active, nothing reports it as failed, and the environment is
+		// stopped out from under whoever is using it. The signal context alone
+		// never carries a deadline, so this read is the recorder's to bound.
+		store := &deadlineStore{}
+		detector := newScript(busy())
+
+		run(store, detector, at(0))
+
+		Expect(store.bounded).To(BeTrue(),
+			"the startup read must be bounded, or an apiserver that never answers keeps the agent from ever sampling")
+		Expect(store.writes).To(Equal([]string{stamp(at(0))}))
+	})
 })
 
 // blockingStore is an apiserver that never answers. Set returns when the
@@ -292,4 +309,19 @@ func (b *blockingStore) Set(ctx context.Context, value string) error {
 	b.attempts++
 	<-ctx.Done()
 	return ctx.Err()
+}
+
+// deadlineStore answers the startup read, but reports how it was asked. A
+// bounded call is only observable on the context that carried it, and this is
+// the one call whose bound cannot be seen any other way: Current returns
+// immediately here, so a missing timeout costs nothing until the day the
+// apiserver stops answering.
+type deadlineStore struct {
+	fakeStore
+	bounded bool
+}
+
+func (d *deadlineStore) Current(ctx context.Context) (string, error) {
+	_, d.bounded = ctx.Deadline()
+	return d.fakeStore.Current(ctx)
 }
