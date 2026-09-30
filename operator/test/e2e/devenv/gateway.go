@@ -158,7 +158,7 @@ func (e *Environment) HTTPRouteRules(ctx context.Context) ([]HTTPRouteRule, erro
 			rule.PathPrefix = *r.Matches[0].Path.Value
 		}
 		if len(r.BackendRefs) > 0 && r.BackendRefs[0].Port != nil {
-			rule.BackendPort = int32(*r.BackendRefs[0].Port)
+			rule.BackendPort = *r.BackendRefs[0].Port
 		}
 		rules = append(rules, rule)
 	}
