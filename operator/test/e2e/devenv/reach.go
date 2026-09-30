@@ -37,12 +37,26 @@ type Dialer struct {
 // thirty seconds is not going to.
 const httpTimeout = 30 * time.Second
 
-// sshTimeout bounds the handshake. The transport underneath is bounded by the
-// caller's context.
+// sshTimeout bounds a handshake, and not the session that follows it: a vendor
+// image's first import of torch takes minutes, and the case asked for it.
 const sshTimeout = 30 * time.Second
 
+// dialTimeout bounds a connection nothing else bounds.
+const dialTimeout = 30 * time.Second
+
 // DialContext opens a connection to addr, through the proxy when one is set.
+//
+// A context that carries no deadline of its own gets dialTimeout, because what
+// this suite dials is a peer that may accept the connection and then say nothing
+// — a published port with no pod behind it, a proxy that has stopped forwarding
+// — and an unbounded dial waits on the operating system instead of failing the
+// case. A deadline the caller did set is left alone.
 func (d Dialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, dialTimeout)
+		defer cancel()
+	}
 	if d.Proxy == "" {
 		var nd net.Dialer
 		return nd.DialContext(ctx, network, addr)
@@ -195,17 +209,21 @@ func (d Dialer) SSHPresentedHostKey(ctx context.Context, addr string) (ssh.Publi
 			presented = key
 			return errHostKeyCaptured
 		},
-		Timeout: sshTimeout,
 	}
 
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	// The bound is on the socket and not in ClientConfig: the Timeout field
+	// there is read only by ssh.Dial, and this dials for itself so that the
+	// connection goes through the suite's proxy. A spec's own deadline is
+	// sooner when it has one, which WithTimeout prefers.
+	hsCtx, cancel := context.WithTimeout(ctx, sshTimeout)
+	defer cancel()
+	conn, err := d.DialContext(hsCtx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dialing %s: %w", addr, err)
 	}
 	defer func() { _ = conn.Close() }()
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
+	deadline, _ := hsCtx.Deadline()
+	_ = conn.SetDeadline(deadline)
 
 	// The handshake is expected to fail with the sentinel above, so the error is
 	// only the diagnosis for the case where no key arrived at all — which is why
@@ -239,23 +257,32 @@ func (d Dialer) SSH(
 		User:            user,
 		Auth:            []ssh.AuthMethod{ssh.PublicKeys(key)},
 		HostKeyCallback: ssh.FixedHostKey(hostKey),
-		Timeout:         sshTimeout,
 	}
 
-	conn, err := d.DialContext(ctx, "tcp", addr)
+	// The handshake is bounded and the session is not. A peer that accepts the
+	// connection and then says nothing has to fail the case rather than hang the
+	// run until the go test timeout, and a command the case asked for may
+	// legitimately take minutes — a vendor image's first import of torch does.
+	// So the socket carries a deadline until the handshake is done, and the
+	// caller's own afterwards, if the caller set one.
+	hsCtx, cancel := context.WithTimeout(ctx, sshTimeout)
+	defer cancel()
+	conn, err := d.DialContext(hsCtx, "tcp", addr)
 	if err != nil {
 		return SSHResult{}, fmt.Errorf("dialing %s: %w", addr, err)
 	}
-	// The handshake below blocks without a deadline of its own, so the context
-	// has to reach the socket for a stalled peer to fail rather than hang.
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
+	handshake, _ := hsCtx.Deadline()
+	_ = conn.SetDeadline(handshake)
 
 	sshConn, chans, reqs, err := ssh.NewClientConn(conn, addr, cfg)
 	if err != nil {
 		_ = conn.Close()
 		return SSHResult{}, fmt.Errorf("ssh handshake with %s: %w", addr, err)
+	}
+	if sessionDeadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(sessionDeadline)
+	} else {
+		_ = conn.SetDeadline(time.Time{})
 	}
 	client := ssh.NewClient(sshConn, chans, reqs)
 	defer func() { _ = client.Close() }()

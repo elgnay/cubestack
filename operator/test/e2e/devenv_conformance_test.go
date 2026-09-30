@@ -18,6 +18,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"golang.org/x/crypto/ssh"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -917,6 +919,19 @@ func sshReady(ctx SpecContext, env *devenv.Environment) *devenv.Session {
 	Eventually(func() error { return sess.Ping(ctx) }).
 		WithTimeout(3*time.Minute).WithPolling(5*time.Second).
 		Should(Succeed(), "an ssh session on %s", env.Name)
+	return sess
+}
+
+// sshReadyWithKey is sshReady for an environment the platform minted no login
+// key for, where the session is the caller's own key against the platform's
+// address and host key.
+//
+// No ping: what the case checks is which keys log in, and pinging first would
+// answer that question with the wrong key.
+func sshReadyWithKey(ctx SpecContext, env *devenv.Environment, key ssh.Signer) *devenv.Session {
+	GinkgoHelper()
+	sess, err := env.OpenWithKey(ctx, key)
+	Expect(err).NotTo(HaveOccurred(), "%s publishes no address to log in to", env.Name)
 	return sess
 }
 

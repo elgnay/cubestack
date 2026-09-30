@@ -261,7 +261,7 @@ func describeDelegatedKeys() {
 				Label(devenv.TierP1, devenv.LabelFamily("I")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
-					sess := sshReady(ctx, env)
+					sess := sshReadyWithKey(ctx, env, keyA.Signer)
 
 					for i, k := range []sshKey{keyA, keyB} {
 						res, err := conformance.Dialer.SSH(ctx, sess.Addr(), sess.User(),
@@ -293,7 +293,7 @@ func describeDelegatedKeys() {
 				Label(devenv.TierP1, devenv.LabelFamily("I")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
-					sess := sshReady(ctx, env)
+					sess := sshReadyWithKey(ctx, env, keyA.Signer)
 					before, err := env.PodUID(ctx)
 					Expect(err).NotTo(HaveOccurred())
 
@@ -333,7 +333,7 @@ func describeDelegatedKeys() {
 				Label(devenv.TierP1, devenv.LabelFamily("I")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
-					sess := sshReady(ctx, env)
+					sess := sshReadyWithKey(ctx, env, keyA.Signer)
 
 					// What `ssh-copy-id` does, done here: append the key to the
 					// account's own authorized_keys with the modes sshd expects. The
@@ -346,9 +346,13 @@ func describeDelegatedKeys() {
 					// would refuse a key file under such a directory.
 					own, err := newSSHKey()
 					Expect(err).NotTo(HaveOccurred())
-					sshOutput(ctx, env,
+					res, err := sess.Run(ctx,
 						`umask 077 && mkdir -p "$HOME/.ssh" && chmod 700 "$HOME/.ssh" && `+
 							`printf '%s\n' '`+own.Line+`' >> "$HOME/.ssh/authorized_keys"`)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(res.ExitCode).To(Equal(0),
+						"writing $HOME/.ssh/authorized_keys exited %d (stderr: %s)",
+						res.ExitCode, strings.TrimSpace(res.Stderr))
 
 					_, err = conformance.Dialer.SSH(ctx, sess.Addr(), sess.User(),
 						own.Signer, sess.HostKey(), "true")
@@ -474,6 +478,15 @@ func describeSSHWithdrawal() {
 					port := ep.ListenerPort
 					Expect(port).NotTo(BeZero())
 
+					// The pod the environment is on before the change. The withdrawal
+					// rewrites the pod template — the host key and the authorized keys
+					// arrive as volumes, and an environment no longer serving ssh must
+					// not keep them mounted — so the workload is replaced, and the
+					// wait at the end is keyed on this because an environment reads
+					// Running on the pod it is replacing.
+					uidBefore, err := env.PodUID(ctx)
+					Expect(err).NotTo(HaveOccurred())
+
 					// The published address works before the change, so everything
 					// asserted after it is about the withdrawal and not about an
 					// endpoint that never served.
@@ -526,9 +539,13 @@ func describeSSHWithdrawal() {
 						port, strings.Join(held[port], ", "))
 
 					// And the notebook is untouched: this is a withdrawal of one
-					// exposure, not a stop.
+					// exposure, not a stop. The environment is re-provisioned rather
+					// than stopped, and that the replacement becomes Ready is part of
+					// the assertion — the template it is built from has given up the
+					// host key and the authorized keys, and a template that gave up
+					// something it still needs is a pod that does not start.
+					runningOn(ctx, env, uidBefore)
 					Expect(env.EndpointNames()).To(ContainElement(string(aiv1alpha1.DevEnvironmentTypeJupyter)))
-					Expect(env.Object().Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
 				})
 		},
 	}.declare()
@@ -630,10 +647,12 @@ func describeLiveUndelegation() {
 
 					// The key the user had still works: whatever the platform decides
 					// about the reference, it cannot un-mount bytes that are already in
-					// the container, and pretending otherwise would be an outage.
-					sess := sshReady(ctx, env)
-					_, err := conformance.Dialer.SSH(ctx, sess.Addr(), sess.User(),
-						key.Signer, sess.HostKey(), "true")
+					// the container, and pretending otherwise would be an outage. The
+					// session opens with that key because it is the only one there is:
+					// the platform mints no login key for an environment whose keys are
+					// delegated, which is the property the block above asserts.
+					sess := sshReadyWithKey(ctx, env, key.Signer)
+					_, err := sess.Run(ctx, "true")
 					Expect(err).NotTo(HaveOccurred(),
 						"the key already mounted in the environment stopped working")
 				})
@@ -655,10 +674,22 @@ func createSecret(
 		Data:       data,
 	}
 	err := conformance.Client.Create(ctx, secret)
-	if err == nil || apierrors.IsAlreadyExists(err) {
+	if err == nil {
 		return nil
 	}
-	return fmt.Errorf("creating the Secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	if !apierrors.IsAlreadyExists(err) {
+		return fmt.Errorf("creating the Secret %s/%s: %w", secret.Namespace, secret.Name, err)
+	}
+	// A name that is already taken is an interrupted run and a second attempt
+	// under the same run id, which reuses the run namespace. What the first
+	// attempt left is the previous keys and — for the case that delegates a
+	// Secret to the platform — the delegation label, and the cases here are
+	// about exactly those two things. So the caller's bytes and the caller's
+	// labels are what stand afterwards, rather than the leftovers.
+	return patchSecret(ctx, name, func(s *corev1.Secret) {
+		s.Data = data
+		s.Labels = labels
+	})
 }
 
 func secretData(ctx context.Context, name string) (map[string][]byte, error) {

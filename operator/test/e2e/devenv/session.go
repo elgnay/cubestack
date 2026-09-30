@@ -27,20 +27,37 @@ type Session struct {
 }
 
 // Open resolves the endpoint, the key and the host key.
+//
+// The key is the platform's own, which is what a case about the environment the
+// platform built wants. An environment whose spec delegates its authorized_keys
+// source has no key of the platform's to find, and a case about *that* has to
+// name its own: OpenWithKey.
 func (e *Environment) Open(ctx context.Context) (*Session, error) {
-	ep, ok := e.SSHEndpoint()
-	if !ok {
-		return nil, fmt.Errorf("status published no ssh endpoint (has %v)", e.EndpointNames())
-	}
-	target, err := ParseSSHAddress(ep.Address)
-	if err != nil {
-		return nil, err
-	}
 	pem, err := e.SSHClientKey(ctx)
 	if err != nil {
 		return nil, err
 	}
 	key, err := ParseClientKey(pem)
+	if err != nil {
+		return nil, err
+	}
+	return e.OpenWithKey(ctx, key)
+}
+
+// OpenWithKey resolves the address and the host key, and logs in with the key
+// the caller names.
+//
+// The address and the account still come from the platform — they are what is
+// under test — and so does the host key, which the platform minted and the
+// server therefore has to be holding. The login key is the caller's, because an
+// environment that delegates its authorized_keys source serves keys the platform
+// never saw.
+func (e *Environment) OpenWithKey(ctx context.Context, key ssh.Signer) (*Session, error) {
+	ep, ok := e.SSHEndpoint()
+	if !ok {
+		return nil, fmt.Errorf("status published no ssh endpoint (has %v)", e.EndpointNames())
+	}
+	target, err := ParseSSHAddress(ep.Address)
 	if err != nil {
 		return nil, err
 	}

@@ -529,7 +529,16 @@ func (s *Suite) Draft(name string, img Image, id Identity) *Environment {
 // The one thing that makes an environment not-the-run's is where it lives, and
 // the only case that wants one is about the pool being cluster-wide — so the
 // namespace is a parameter here and nothing else is.
+//
+// An empty namespace means the run's, and is filled in here rather than left for
+// the first read to resolve: the cases that name the namespace — the path an
+// exposure is published under, the owner of a ListenerSet — read the field
+// itself, and a case that left it empty would build its expectation around an
+// empty string instead of around the environment's address.
 func (s *Suite) DraftIn(namespace, name string, img Image, id Identity) *Environment {
+	if namespace == "" {
+		namespace = s.Namespace
+	}
 	return &Environment{Suite: s, Image: img, Identity: id, Name: name, Namespace: namespace}
 }
 
@@ -653,6 +662,25 @@ func (e *Environment) PodUID(ctx context.Context) (types.UID, error) {
 		return "", err
 	}
 	return pod.UID, nil
+}
+
+// PodUIDs are the identities of every pod the environment's label selects.
+//
+// The plural, where PodUID is the singular, because "the environment is on a
+// different pod" is a statement about a set: a restart replaces a pod rather
+// than emptying the namespace first, so a caller that asked only for the first
+// pod it found would be reading whichever one the API server happened to list
+// first during the handover.
+func (e *Environment) PodUIDs(ctx context.Context) ([]types.UID, error) {
+	pods, err := e.Pods(ctx)
+	if err != nil {
+		return nil, err
+	}
+	uids := make([]types.UID, 0, len(pods))
+	for i := range pods {
+		uids = append(uids, pods[i].UID)
+	}
+	return uids, nil
 }
 
 // RestartPod removes the environment's pod and lets the StatefulSet replace it.

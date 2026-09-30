@@ -19,6 +19,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -61,13 +62,14 @@ func describeLifecycle() {
 	describeRetention()
 }
 
-// describeStopStart is G1–G4, on one environment and two stop/start cycles.
+// describeStopStart is G1–G4, on one environment and three stop/start cycles.
 //
-// The chain is deliberate: G2 leaves the environment stopped, G3 reads what a
-// stopped environment still publishes, and G4 starts it again. Each case
-// re-establishes the state it needs rather than trusting the one before it, so a
-// failure in G2 shows up as the rest of the container being skipped — Ginkgo's
-// Ordered — rather than as three cases reporting the same fault.
+// The chain is deliberate: G1 watches a start, G2 a stop, G3 what a stop takes
+// back and what it keeps, and G4 the start that lands back on the port G3 left
+// reserved. Each case re-establishes the state it needs rather than trusting the
+// one before it — G2 leaves the environment stopped and G3 starts it again —
+// and a failure in one shows up as the rest of the container being skipped,
+// Ginkgo's Ordered, rather than as three cases reporting the same fault.
 func describeStopStart() {
 	draftCase{
 		Name:     "lifecycle-stop-start",
@@ -78,6 +80,20 @@ func describeStopStart() {
 				Label(devenv.TierP1, devenv.LabelFamily("G")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
+
+					// The pod the environment is on now, which is what a start has to
+					// change — the phase cannot say it. A stop moves the replicas the
+					// platform wants and nothing else, and the pod it is deleting goes on
+					// satisfying Running and Ready for as long as its grace period lasts
+					// (measured on cs3: StatefulSet replicas 0, the pod carrying a
+					// deletionTimestamp 30s out, status still phase Running with every
+					// condition true and its endpoint still published). A sample read in
+					// that window is indistinguishable from a healthy environment, so a
+					// case that keyed on the phase alone would be reading the state the
+					// stop left behind. A StatefulSet recreates the pod under the same
+					// name, so the uid is the one thing a restart moves.
+					before, err := env.PodUID(ctx)
+					Expect(err).NotTo(HaveOccurred())
 
 					// The transition this case watches is one it caused. BeforeAll
 					// created the environment and it is Running by the time any case
@@ -90,8 +106,17 @@ func describeStopStart() {
 					// A poll of its own rather than an Eventually: the subject is an
 					// invariant that has to hold at *every* sample, and a matcher
 					// inside an Eventually's function is retried instead of reported.
+					//
+					// It ends on the environment Running again on a pod other than the
+					// one it stopped on, so the samples span the whole restart: the
+					// phase reads Stopped, then whatever the pod on its way out makes it
+					// read, then Pending while the replacement comes up. That is what
+					// keeps this from being an assertion about an environment that was
+					// simply left running, and it is a stronger guard than counting the
+					// samples that were not Running — which an environment whose pod is
+					// still terminating never produces at all.
 					deadline := time.Now().Add(devenv.UpTimeout())
-					var samples, up int
+					var samples int
 					var last string
 					for {
 						Expect(env.Refresh(ctx)).To(Succeed())
@@ -102,13 +127,14 @@ func describeStopStart() {
 						}
 						Expect(phaseAgreement(st)).To(Succeed(),
 							"sample %d of the start, with the environment at %s", samples, last)
-						if st.Phase != nil && st.Phase.Name == aiv1alpha1.PhaseRunning {
+						back, err := onAnotherPod(ctx, env, before)
+						Expect(err).NotTo(HaveOccurred())
+						if st.Phase != nil && st.Phase.Name == aiv1alpha1.PhaseRunning && back {
 							break
 						}
-						up++
 						if time.Now().After(deadline) {
-							Fail(fmt.Sprintf("%s did not come back up within %s; the last sample found it at %s",
-								env.Name, devenv.UpTimeout(), last))
+							Fail(fmt.Sprintf("%s never came back on another pod within %s; "+
+								"the last sample found it at %s", env.Name, devenv.UpTimeout(), last))
 						}
 						select {
 						case <-ctx.Done():
@@ -116,13 +142,6 @@ func describeStopStart() {
 						case <-time.After(time.Second):
 						}
 					}
-
-					// The samples have to have spanned the start. Without this, an
-					// environment that was already Running — a start that did nothing —
-					// would satisfy every assertion above on its first sample.
-					Expect(up).To(BeNumerically(">", 0),
-						"all %d samples found %s already Running, so this case never observed "+
-							"the transition it is about", samples, env.Name)
 
 					// And the end of it is a usable environment, not merely a phase.
 					running(ctx, env)
@@ -159,42 +178,61 @@ func describeStopStart() {
 						Should(BeEmpty(), "pods still running behind a Stopped phase")
 				})
 
-			It("G3 keeps the stopped environment's address reserved and stops serving on it",
+			It("G3 withdraws the stopped environment's address and keeps its port reserved",
 				Label(devenv.TierP1, devenv.LabelFamily("G")), func(ctx SpecContext) {
 					env := open()
+
+					// G2 left it stopped, and a case about what a stop takes back
+					// starts from what the stop had to take: the address it published,
+					// and a session open on it. Both are read here, while it is up —
+					// read after the stop there would be no address to have seen
+					// published and no session left to ask.
+					Expect(env.SetRunning(ctx, true)).To(Succeed())
+					running(ctx, env)
+
+					ep, ok := env.SSHEndpoint()
+					Expect(ok).To(BeTrue(), "status published no ssh endpoint (has %v)", env.EndpointNames())
+					sess, err := env.Open(ctx)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(sess.Ping(ctx)).To(Succeed(),
+						"the environment does not answer on its own published address before the stop")
+
+					Expect(env.SetRunning(ctx, false)).To(Succeed())
 					stopped(ctx, env)
 
-					// The address survives the stop. Stopping is not un-publishing:
-					// the endpoint a user was given is a number the platform holds
-					// for this environment, and taking it away would make every stop
-					// and start a new address to hand out. The withdrawal belongs to
-					// the states that end the environment — a refused spec and a
-					// deletion, both of which release the port.
-					ep, ok := env.SSHEndpoint()
-					Expect(ok).To(BeTrue(),
-						"a stopped environment publishes %v, and its ssh address has to survive the "+
-							"stop for a restart to land where the user was told to connect",
-						env.EndpointNames())
-					Expect(ep.ListenerPort).To(BeNumerically(">=", cluster.L4Start))
-					Expect(ep.ListenerPort).To(BeNumerically("<=", cluster.L4End))
+					// The address goes. status.endpoints is what the platform tells a
+					// user to connect to, and a stopped environment serves nothing, so
+					// publishing it anyway would hand out an address that answers
+					// nowhere — which is what RouteReady reports as not ready.
+					//
+					// This is the withdrawal a *stop* performs, and it is narrower
+					// than the one a spec change performs: turning an exposure off
+					// (I4) also deletes the ListenerSet and lets the port go, where a
+					// stop keeps both, below.
+					Eventually(func() []string {
+						_ = env.Refresh(ctx)
+						return env.EndpointNames()
+					}).WithTimeout(3*time.Minute).WithPolling(3*time.Second).
+						Should(BeEmpty(), "a stopped environment still publishes an address")
 
-					// And it is still declared to the Gateway and still programmed:
-					// reserved means the same number, not a number nobody is serving.
-					entry, st, err := env.L4Listener(ctx, devenv.SSHEndpointName)
+					// The port does not go. The ListenerSet is the durable record of
+					// which pool port the environment holds — the object K3 asserts
+					// the other half of the reservation on — so the number is still
+					// declared and still drawn from the pool, and G4 starts onto it
+					// rather than onto one allocated afresh.
+					entry, _, err := env.L4Listener(ctx, devenv.SSHEndpointName)
 					Expect(err).NotTo(HaveOccurred())
-					Expect(entry.Port).To(Equal(ep.ListenerPort))
-					programmed := devenv.ListenerProgrammed(st)
-					Expect(programmed).NotTo(BeNil(), "the ssh listener's Programmed condition")
-					Expect(programmed.Status).To(Equal(metav1.ConditionTrue),
-						"the ssh listener is %s, so the port the environment still publishes is not "+
-							"served", devenv.ConditionSummary(programmed))
+					Expect(entry.Port).To(Equal(ep.ListenerPort),
+						"the stopped environment's port moved from %d to %d", ep.ListenerPort, entry.Port)
+					held, err := conformance.L4PortsHeld(ctx)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(held).To(HaveKey(ep.ListenerPort),
+						"port %d left the pool when the environment stopped, so anything starting next "+
+							"draws another number", ep.ListenerPort)
 
-					// What the stop actually changes: nothing is behind the address.
-					// This is the half a user notices, and the half that makes the
-					// reservation defensible — a port kept for a stopped environment
-					// is only reasonable if what it leads to refuses.
-					sess, err := env.Open(ctx)
-					Expect(err).NotTo(HaveOccurred(), "resolving the stopped environment's ssh endpoint")
+					// And what the stop changes for a user: nothing is behind the
+					// address any more. A reservation is only defensible while what
+					// it leads to refuses.
 					Expect(sess.Ping(ctx)).To(HaveOccurred(),
 						"a stopped environment answered ssh on %s", sess.Addr())
 				})
@@ -204,10 +242,34 @@ func describeStopStart() {
 					env := open()
 					stopped(ctx, env)
 
-					// The claim, read before the start because it is read off the pod
-					// and there is none yet.
+					// The port the stop left reserved, read from the ListenerSet
+					// rather than carried over from the case before: the claim is
+					// about this environment, and the object the allocation lives in
+					// is where the answer has to come from.
+					reserved, _, err := env.L4Listener(ctx, devenv.SSHEndpointName)
+					Expect(err).NotTo(HaveOccurred())
+
+					// The pods the stop left behind, which the start has to replace.
+					// Read here rather than carried over from the case before, because
+					// it is the one moment this case can see them: the pod a stop is
+					// deleting goes on reading as a healthy environment until its grace
+					// period runs out, so a wait for "Running" that did not exclude it
+					// would be satisfied by the environment the stop just took away —
+					// and the ssh below would be aimed at a container on its way out.
+					was, err := env.PodUIDs(ctx)
+					Expect(err).NotTo(HaveOccurred())
+
 					Expect(env.SetRunning(ctx, true)).To(Succeed())
-					running(ctx, env)
+					runningOn(ctx, env, was...)
+
+					// And it came back onto that number. A restart that drew a fresh
+					// port would make every stop an address to read out again, which
+					// is the whole of what the reservation is for.
+					ep, ok := env.SSHEndpoint()
+					Expect(ok).To(BeTrue(), "status published no ssh endpoint (has %v)", env.EndpointNames())
+					Expect(ep.ListenerPort).To(Equal(reserved.Port),
+						"the environment came back on port %d, having held %d while it was stopped",
+						ep.ListenerPort, reserved.Port)
 
 					// Same workspace, proven by content and not by path: the mount
 					// path would be the same even if the platform had provisioned a
@@ -477,6 +539,49 @@ func running(ctx SpecContext, env *devenv.Environment) {
 		Should(Succeed(), "%s never became running", env.Name)
 }
 
+// runningOn is running, on a pod other than the ones named.
+//
+// The wait a case that restarted an environment needs, and the reason it exists
+// is in onAnotherPod: an environment whose pod is being deleted reads as a
+// running one, so "it is Running again" is satisfied by the environment that
+// was stopped until the platform has actually replaced the workload.
+func runningOn(ctx SpecContext, env *devenv.Environment, was ...types.UID) {
+	GinkgoHelper()
+	Eventually(func() error {
+		if err := env.Ready(ctx); err != nil {
+			return err
+		}
+		back, err := onAnotherPod(ctx, env, was...)
+		if err != nil {
+			return err
+		}
+		if !back {
+			return errors.New("the environment is still the pod the stop was deleting")
+		}
+		return nil
+	}).WithTimeout(devenv.UpTimeout()).WithPolling(5*time.Second).
+		Should(Succeed(), "%s never came back on another pod", env.Name)
+}
+
+// onAnotherPod reports whether the environment has a pod that is not one of
+// was — with no names, whether it has a pod at all.
+//
+// An empty list is the honest answer to "which pod was it on?" for an
+// environment that had no pod when the question was asked: whatever it is on
+// now, it is not one it was on before.
+func onAnotherPod(ctx context.Context, env *devenv.Environment, was ...types.UID) (bool, error) {
+	now, err := env.PodUIDs(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, uid := range now {
+		if !slices.Contains(was, uid) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // stopped waits for the platform to report an environment as stopped.
 func stopped(ctx SpecContext, env *devenv.Environment) {
 	GinkgoHelper()
@@ -500,9 +605,19 @@ func hold(ctx context.Context, env *devenv.Environment) {
 //
 // A plain context rather than the spec's, because it is also called from a
 // DeferCleanup, by which time the SpecContext has been cancelled.
+//
+// The toleration is load-bearing rather than defensive. The case that deletes an
+// environment releases the hold before waiting for it to go — the hold is what
+// the deletion has to get past — so by the time the DeferCleanup runs the object
+// is gone, and a release that failed on that would report a successful deletion
+// as a failure of the case that performed it.
 func release(ctx context.Context, env *devenv.Environment) {
 	GinkgoHelper()
-	Expect(env.Patch(ctx, func(want *aiv1alpha1.DevEnvironment) {
+	err := env.Patch(ctx, func(want *aiv1alpha1.DevEnvironment) {
 		want.Finalizers = slices.DeleteFunc(want.Finalizers, func(f string) bool { return f == holdFinalizer })
-	})).To(Succeed())
+	})
+	if apierrors.IsNotFound(err) {
+		return
+	}
+	Expect(err).To(Succeed(), "removing %s from %s", holdFinalizer, env.Name)
 }

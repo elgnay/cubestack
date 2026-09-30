@@ -45,6 +45,19 @@ const (
 	portUDPName   = "probe-udp"
 )
 
+// The container ports the two http exposures name. Neither is a port the image
+// serves, and neither may be one the Service already carries: sshd and the
+// notebook are what the other exposures are for, and a ServicePort whose (port,
+// protocol) the Service already publishes is rejected by the API server — see
+// extraPorts.
+//
+// They differ from each other for the same reason: two exposures on one
+// container port would be one Service entry twice.
+const (
+	portHTTPContainer  int32 = 8080
+	portHTTP2Container int32 = 8081
+)
+
 func describePorts() {
 	describeExtraPorts()
 	describePoolIsShared()
@@ -55,10 +68,21 @@ func describePorts() {
 // The container ports are the notebook's own and the image's sshd, so each
 // exposure has something behind it that already answers. Nothing here needs a
 // process started inside the environment to be reachable, which is what lets
-// the tcp one be asserted end to end.
+// the tcp one be asserted end to end. The sshd is at 2222 and the Service
+// publishes it as 22, so an exposure on 2222 is a port the Service does not
+// already carry.
+//
+// The http one is the exception, and deliberately: 8080 is a port the container
+// does not listen on, because the notebook's own 8888 is already published as
+// the Service's `main` entry — as are its ssh and jupyter endpoints — and a
+// second ServicePort on the same (port, protocol) is rejected by the API server
+// outright, so a spec that asks for one leaves the environment with no Service
+// and no status at all. That the platform answers such a spec that way is a
+// finding (see the PR), not a contract, so the case does not encode it: nothing
+// dials the http exposure, because what it is about is the routing.
 func extraPorts(want *aiv1alpha1.DevEnvironment) {
 	want.Spec.Ports = []aiv1alpha1.PortSpec{
-		{Name: portHTTPName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: devenv.ContainerJupyterPort},
+		{Name: portHTTPName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: portHTTPContainer},
 		{Name: portTCPName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: devenv.ContainerSSHPort},
 		{Name: portUDPName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: devenv.ContainerJupyterPort},
 	}
@@ -121,7 +145,7 @@ func describeExtraPorts() {
 					}
 					Expect(rule).NotTo(BeNil(),
 						"the web route has no rule for the port's path (rules: %v)", rules)
-					Expect(rule.BackendPort).To(Equal(devenv.ContainerJupyterPort),
+					Expect(rule.BackendPort).To(Equal(portHTTPContainer),
 						"the rule forwards to a port the spec did not declare")
 
 					svc, err := env.Service(ctx)
@@ -378,7 +402,7 @@ func describeExtraPorts() {
 						want.Spec.Ports = append(want.Spec.Ports, aiv1alpha1.PortSpec{
 							Name:          portHTTP2Name,
 							Type:          aiv1alpha1.PortTypeHTTP,
-							ContainerPort: devenv.ContainerJupyterPort,
+							ContainerPort: portHTTP2Container,
 						})
 					})).To(Succeed())
 
@@ -507,12 +531,15 @@ func describePoolIsShared() {
 					// own port, which is the key test K2 makes.
 					ep, ok := peer.Endpoint(devenv.SSHEndpointName)
 					Expect(ok).To(BeTrue())
-					peerHost, err := addressHost(ep.Address)
+					// The port the address publishes, and not the listener's:
+					// where the dataplane renumbers a listener onto a nodePort the
+					// two are different numbers, and dialing the listener's would
+					// ask about a port nothing serves.
+					target, err := hostPortOf(ep.Address)
 					Expect(err).NotTo(HaveOccurred())
 					want, err := peer.SSHHostKey(ctx)
 					Expect(err).NotTo(HaveOccurred())
-					presented, err := conformance.Dialer.SSHPresentedHostKey(
-						ctx, net.JoinHostPort(peerHost, strconv.Itoa(int(ep.ListenerPort))))
+					presented, err := conformance.Dialer.SSHPresentedHostKey(ctx, target)
 					Expect(err).NotTo(HaveOccurred(),
 						"nothing answered on %s's ssh endpoint at %s", peer.Name, ep.Address)
 					Expect(presented.Marshal()).To(Equal(want.Marshal()),

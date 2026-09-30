@@ -3,6 +3,7 @@ package devenv
 import (
 	"fmt"
 	"os"
+	"time"
 
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -40,6 +41,15 @@ func NewScheme() (*runtime.Scheme, error) {
 	return s, nil
 }
 
+// apiTimeout bounds one request to the API server.
+//
+// Without it a wedged API server is not a failure but a wait: the preflight runs
+// in BeforeSuite, where there is no spec deadline to run out, so a request that
+// never comes back stalls the run until the go test timeout and says nothing
+// about why. Thirty seconds is two orders of magnitude more than any request
+// here takes.
+const apiTimeout = 30 * time.Second
+
 // NewClient builds a typed client against the cluster the ambient kubeconfig
 // names.
 //
@@ -55,6 +65,7 @@ func NewClient() (client.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("loading kubeconfig: %w", err)
 	}
+	cfg.Timeout = apiTimeout
 	s, err := NewScheme()
 	if err != nil {
 		return nil, err

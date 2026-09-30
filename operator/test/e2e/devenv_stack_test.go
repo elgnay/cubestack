@@ -186,12 +186,30 @@ func notebookProcess(ctx SpecContext, env *devenv.Environment) (notebookProcessI
 //
 // The exe is the resolved path and not the argv[0], because argv[0] is whatever
 // the launcher was given and the question is which binary is running. The gid is
-// the process's own, not the session's. Both come from /proc entries the session
-// owns, so this reads nothing a user's own session could not.
+// the process's own, not the session's.
+//
+// The exe is read as the container's own gid, because reading the /proc symlink
+// at any other one fails: the kernel allows it when the reader's uid *and* gid
+// match the target's, or the reader holds CAP_SYS_PTRACE, which a container does
+// not have in the default capability set. So for a session whose gid is not the
+// container's, `readlink` finds nothing, `|| continue` drops every process, and
+// the answer is "no process runs jupyter" about a container that is running one.
+// That is not hypothetical — it is what a root environment produced: the root
+// account's gid is 0 from the image's /etc/passwd while the platform runs the
+// container as 0:<workspace gid>, and the case failed on exactly this message
+// (measured on cs3, with the same probe reading the same container correctly at
+// the container's own gid and answering nothing at gid 0). A non-root session's
+// gids agree with the container's and the first branch is the whole story.
+//
+// cmdline is not gated the same way — measured: it reads at either gid, which is
+// why the read below it is not guarded too.
 const notebookProcessProbe = `
+set -o pipefail
+gid=$(awk '/^Gid:/{print $2}' /proc/1/status)
+own=$(id -g)
 for p in /proc/[0-9]*; do
-  [ -r "$p/cmdline" ] || continue
-  exe=$(readlink -f "$p/exe" 2>/dev/null) || continue
+  if [ "$own" = "$gid" ]; then exe=$(readlink -f "$p/exe" 2>/dev/null) || continue
+  else exe=$(setpriv --regid "$gid" --keep-groups readlink -f "$p/exe" 2>/dev/null) || continue; fi
   case "${exe##*/}" in python*) ;; *) continue ;; esac
   cmd=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null) || continue
   case "$cmd" in *jupyter*) ;; *) continue ;; esac

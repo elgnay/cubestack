@@ -154,7 +154,7 @@ func describeMountPath() {
 			want.Spec.Storage.Size = size
 		},
 		Cases: func(open func() *devenv.Environment) {
-			It("H2 mounts the workspace where the spec says, and the session's home follows it",
+			It("H2 mounts the workspace where the spec says, and a session's home stays its account's",
 				Label(devenv.TierP1, devenv.LabelFamily("H")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
@@ -173,13 +173,28 @@ func describeMountPath() {
 					Expect(err).NotTo(HaveOccurred())
 					Expect(containerEnv(pod)).To(HaveKeyWithValue(devenv.EnvHome, pinned))
 
-					// And the session agrees, which is the half a user experiences:
-					// this image's account has /home/ubuntu in /etc/passwd, so a
-					// session that answers with anything but the pinned path is one
-					// the platform did not reach.
+					// The session's home is not the mount path, and is not meant to
+					// be: mountPath says where the claim is mounted, while a login
+					// account's home is a property of the image's passwd entry, which
+					// sshd reads for each session and no environment variable moves.
+					// The two agree on every default environment because the platform
+					// derives the mount path from the account, which is exactly why
+					// this is the one case that can tell them apart — pinning a path
+					// the account does not use. E6 asserts the other half: that a HOME
+					// the spec declares does not reach the container either.
+					//
+					// Read from the image rather than written here, so the assertion
+					// is "the session gets its account's home" and not a second copy
+					// of /home/ubuntu.
 					home := strings.TrimSpace(sshOutput(ctx, env, `printf '%s' "$HOME"`))
-					Expect(home).To(Equal(pinned),
-						"the session's HOME is %s while the workspace is at %s", home, pinned)
+					declared := strings.TrimSpace(sshOutput(ctx, env,
+						`getent passwd "$(id -un)" | cut -d: -f6`))
+					Expect(declared).NotTo(BeEmpty(), "the account has no home in the image's passwd")
+					Expect(home).To(Equal(declared),
+						"the session's HOME is %s and its account's is %s", home, declared)
+					Expect(home).NotTo(Equal(pinned),
+						"the session's HOME follows the mount path, so a login session is no longer "+
+							"reading the image's account and the workspace is something the mount alone decides")
 					sshOutput(ctx, env, `test -w "$HOME"`)
 				})
 
@@ -206,7 +221,7 @@ func describeMountPath() {
 
 					Expect(pvc.Status.Phase).To(Equal(corev1.ClaimBound),
 						"the workspace %s is %s rather than provisioned: %s",
-						pvc.Name, pvc.Status.Phase, claimEvents(ctx, env, pvc.Name))
+						pvc.Name, pvc.Status.Phase, objectEvents(ctx, "PersistentVolumeClaim", pvc.Name))
 
 					// Bound at the size asked for, not merely Bound: a provisioner
 					// that quietly gave less would leave the same green environment and
@@ -226,9 +241,21 @@ func describeMountPath() {
 //
 // It is the one case here that needs a cluster object before the environment
 // exists, because `spec.volumes[]` references a claim that already has to be
-// there — the platform never creates one for a user. The same claim is
-// referenced three times, at three paths and in three shapes, which is what
-// makes the case about the mount options rather than about the PVC.
+// there — the platform never creates one for a user.
+//
+// Three claims, each mounted once. One claim mounted three times is what the case
+// would rather ask, and cannot: on the reference cluster a pod that references a
+// cephfs claim twice never starts. Measured there with a hand-written pod, so it
+// is the cluster's storage and not anything this platform renders — rw+rw,
+// rw+readOnly, and a claim beside its own subdirectory, all sat in
+// ContainerCreating for ten minutes with the CSI node plugin silent and no
+// FailedMount event, while the same three mounts against three distinct claims
+// ran immediately. So each question below is asked of a claim of its own.
+//
+// What puts the markers in them is then a loader pod that mounts each claim
+// whole, because the environment cannot: it is handed one of them read-only and
+// another narrowed to a subdirectory, and both assertions are about what those
+// mounts must not show.
 func describeVolumes() {
 	// The StorageClass the platform itself hardcodes for the workspace claim, so a
 	// cluster running these cases has it — and ReadWriteMany because the workspace
@@ -237,20 +264,30 @@ func describeVolumes() {
 	// because Prepare runs before there is an environment to read one from.
 	const (
 		storageClass = "cephfs-ephemeral"
+
 		claimName    = "storage-volumes-data"
-		subPath      = "sub"
+		roClaimName  = "storage-volumes-data-ro"
+		subClaimName = "storage-volumes-data-sub"
+
+		subPath = "sub"
+
+		// What the loader leaves, as file names: one at each claim's own root,
+		// which a mount that ignored subPath would show and a narrowed one must
+		// not, and one inside the subdirectory a narrowed mount is narrowed to.
+		rootFile = ".e2e-h3-root"
+		leafFile = ".e2e-h3-leaf"
 	)
 
-	// The three mounts, and why each is a different question: the same claim at a
-	// second path is a mount the platform has to place; readOnly is one it has to
-	// respect; subPath is one it has to narrow. A platform that mounted every
-	// reference the same way would satisfy the first and fail the other two.
+	// The three mounts, and why each is a different question: a second path is a
+	// mount the platform has to place; readOnly is one it has to respect; subPath
+	// is one it has to narrow. A platform that mounted every reference the same
+	// way would satisfy the first and fail the other two.
 	shaped := func(want *aiv1alpha1.DevEnvironment) {
 		want.Spec.Storage.MountPath = "/workspace-volumes"
 		want.Spec.Volumes = []aiv1alpha1.VolumeMount{
 			{Name: "data", PVCName: claimName, MountPath: "/data"},
-			{Name: "data-ro", PVCName: claimName, MountPath: "/data-ro", ReadOnly: true},
-			{Name: "data-sub", PVCName: claimName, MountPath: "/sub", SubPath: subPath},
+			{Name: "data-ro", PVCName: roClaimName, MountPath: "/data-ro", ReadOnly: true},
+			{Name: "data-sub", PVCName: subClaimName, MountPath: "/sub", SubPath: subPath},
 		}
 	}
 
@@ -260,7 +297,13 @@ func describeVolumes() {
 		Identity: devenv.NonRoot,
 		Shape:    shaped,
 		Prepare: func(ctx context.Context) error {
-			return prepareClaim(ctx, claimName, storageClass)
+			for _, claim := range []string{claimName, roClaimName, subClaimName} {
+				if err := prepareClaim(ctx, claim, storageClass); err != nil {
+					return err
+				}
+			}
+			return loadVolumeMarkers(ctx, fmt.Sprintf(volumeLoaderScript, rootFile, leafFile, subPath),
+				claimName, roClaimName, subClaimName)
 		},
 		Cases: func(open func() *devenv.Environment) {
 			It("H3 mounts a referenced claim at its path, read-only as asked, and narrowed by subPath",
@@ -268,9 +311,8 @@ func describeVolumes() {
 					env := open()
 					running(ctx, env)
 
-					// What the platform was asked for, on the pod: three mounts of one
-					// claim, and the read-only one carrying the flag through to the
-					// volume as well as the mount.
+					// What the platform was asked for, on the pod: three mounts, and
+					// the read-only one carrying the flag through to the mount.
 					pod, err := env.Pod(ctx)
 					Expect(err).NotTo(HaveOccurred())
 					mounts := map[string]corev1.VolumeMount{}
@@ -285,31 +327,26 @@ func describeVolumes() {
 						"the read-only mount reached the container writable")
 					Expect(mounts["data-sub"].SubPath).To(Equal(subPath))
 
-					const rootFile = ".e2e-h3-root"
-					sshOutput(ctx, env, `printf 'root' > /data/`+rootFile+
-						` && mkdir -p /data/`+subPath+` && printf 'inner' > /data/`+subPath+`/leaf`)
+					// The control the read-only assertion needs: a platform that made
+					// every mount read-only would satisfy everything below about the
+					// second one.
+					sshOutput(ctx, env, `printf 'own' > /data/.e2e-h3-owned`)
 
-					// The second mount is the same storage: proving that is what makes
-					// the refusal below a statement about the mount rather than about a
-					// volume that never got there.
+					// And the read-only mount carries the storage it was given, so
+					// the refusal below is about the mount and not about an empty
+					// volume.
 					content := strings.TrimSpace(sshOutput(ctx, env, `cat /data-ro/`+rootFile))
 					Expect(content).To(Equal("root"),
-						"the read-only mount does not show what was written through the other one")
+						"the read-only mount does not show what is in the claim it was handed")
 
 					res := sshRun(ctx, env, `touch /data-ro/.e2e-h3-probe`)
 					Expect(res.ExitCode).NotTo(Equal(0),
 						"a write through the read-only mount succeeded: %s", res.Stdout)
-					// And it was refused rather than lost: the file is not there under
-					// the writable mount either, which is what tells a read-only mount
-					// apart from a write that went somewhere unexpected.
-					res = sshRun(ctx, env, `test -e /data/.e2e-h3-probe`)
-					Expect(res.ExitCode).NotTo(Equal(0),
-						"the refused write reached the same storage through the writable mount")
 
 					// And the third is narrowed: the subdirectory is visible, the
 					// claim's root is not. A platform that ignored subPath would mount
 					// the whole claim at /sub and pass every assertion above.
-					leaf := strings.TrimSpace(sshOutput(ctx, env, `cat /sub/leaf`))
+					leaf := strings.TrimSpace(sshOutput(ctx, env, `cat /sub/`+leafFile))
 					Expect(leaf).To(Equal("inner"),
 						"the subPath mount does not show the subdirectory's contents")
 					listed := sshOutput(ctx, env, `ls -A /sub`)
@@ -319,6 +356,103 @@ func describeVolumes() {
 				})
 		},
 	}.declare()
+}
+
+// volumeLoaderScript writes the markers H3 asserts on, from a pod that mounts
+// each claim whole. The paths are this pod's own and are not the environment's:
+// the environment is handed one claim read-only and another narrowed to a
+// subdirectory, so it can write to neither the claim it must only read nor the
+// root of the claim it must not see.
+//
+// The chmod is what lets the environment's own uid write to the first, which is
+// not the uid this pod runs as. It does not weaken the read-only assertion below
+// it: that refusal is the mount's, and a mount the platform left writable would
+// let the write through whatever the directory mode says.
+//
+// The names are the case's — the markers, and the subdirectory the third claim
+// is narrowed to — so what is written and what is read cannot drift apart.
+const volumeLoaderScript = `
+set -e
+chmod 0777 /data /data-ro /data-sub
+printf 'root' > /data/%[1]s
+printf 'root' > /data-ro/%[1]s
+mkdir -p /data-sub/%[3]s
+printf 'inner' > /data-sub/%[3]s/%[2]s
+printf 'root' > /data-sub/%[1]s
+`
+
+// volumeLoaderMounts are where the loader mounts the case's three claims, in the
+// order it is handed them, and are the paths volumeLoaderScript writes to.
+var volumeLoaderMounts = []string{"/data", "/data-ro", "/data-sub"}
+
+// volumeLoaderName is the loader pod's name.
+const volumeLoaderName = "storage-volumes-loader"
+
+// loadVolumeMarkers runs volumeLoaderScript and waits for it to finish.
+//
+// The pod is the case's, so the image is the case's too and the loader costs no
+// pull the environment does not already pay for. It mounts each claim once,
+// which is the constraint describeVolumes records: the three paths below are the
+// ones the script names, and a claim mounted somewhere else fails the loader
+// loudly rather than quietly writing nothing.
+func loadVolumeMarkers(ctx context.Context, script, data, ro, sub string) error {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: volumeLoaderName, Namespace: conformance.Namespace},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:    "load",
+				Image:   devenv.MustImage("ssh-ubuntu22.04").Ref(),
+				Command: []string{"sh", "-c", script},
+				// Root, because the image lands on its own account, which does not
+				// own the directory it would have to chmod.
+				SecurityContext: &corev1.SecurityContext{RunAsUser: ptr(int64(0))},
+			}},
+		},
+	}
+	for i, claim := range []string{data, ro, sub} {
+		name := fmt.Sprintf("claim-%d", i)
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim},
+			},
+		})
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: name, MountPath: volumeLoaderMounts[i]})
+	}
+
+	switch err := conformance.Client.Create(ctx, pod); {
+	case err == nil:
+	case apierrors.IsAlreadyExists(err):
+		// A previous run in this namespace — the run's own, so this one reuses
+		// whatever it finds rather than treating it as a foreign object.
+	default:
+		return fmt.Errorf("creating the volume loader: %w", err)
+	}
+
+	deadline := time.Now().Add(3 * time.Minute)
+	for {
+		var got corev1.Pod
+		if err := conformance.Client.Get(ctx, client.ObjectKeyFromObject(pod), &got); err != nil {
+			return fmt.Errorf("reading the volume loader back: %w", err)
+		}
+		switch got.Status.Phase {
+		case corev1.PodSucceeded:
+			return nil
+		case corev1.PodFailed:
+			return fmt.Errorf("the volume loader failed: %s", objectEvents(ctx, "Pod", got.Name))
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the volume loader is %s after 3m: %s",
+				got.Status.Phase, objectEvents(ctx, "Pod", got.Name))
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // prepareClaim creates the claim a spec.volumes entry references, and waits for
@@ -375,10 +509,10 @@ func prepareClaim(ctx context.Context, name, class string) error {
 // ptr is the one-line helper the API's pointer fields need.
 func ptr[T any](v T) *T { return &v }
 
-// claimEvents is the tail of a failure message: why a claim did not bind is in
-// the events on it, and a case that reported only the phase would leave the
-// reader to go and look.
-func claimEvents(ctx context.Context, env *devenv.Environment, name string) string {
+// objectEvents is the tail of a failure message: why an object did not get where
+// it was going is in the events on it, and a case that reported only the phase
+// would leave the reader to go and look.
+func objectEvents(ctx context.Context, kind, name string) string {
 	var events corev1.EventList
 	if err := conformance.Client.List(ctx, &events, client.InNamespace(conformance.Namespace)); err != nil {
 		return "the events could not be read: " + err.Error()
@@ -386,7 +520,7 @@ func claimEvents(ctx context.Context, env *devenv.Environment, name string) stri
 	var b strings.Builder
 	for i := range events.Items {
 		e := &events.Items[i]
-		if e.InvolvedObject.Kind != "PersistentVolumeClaim" || e.InvolvedObject.Name != name {
+		if e.InvolvedObject.Kind != kind || e.InvolvedObject.Name != name {
 			continue
 		}
 		fmt.Fprintf(&b, "; %s: %s", e.Reason, truncate(e.Message))
