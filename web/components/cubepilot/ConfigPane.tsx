@@ -8,10 +8,11 @@
 // needs no AI Gateway round trip for it.
 
 import { Box } from "@mui/material";
-import { ReactNode, useCallback, useEffect, useState } from "react";
+import { ReactNode, useCallback, useEffect, useRef, useState } from "react";
 
 import { apiFetch } from "@/lib/base-path";
-import { modelKey } from "@/lib/cubepilot/llm";
+import { phaseText, waitingSeconds } from "@/lib/cubepilot/agentThread";
+import { MAX_PROVIDER_MODELS, modelIdError, modelKey } from "@/lib/cubepilot/llm";
 import {
   PLATFORM_MODEL_NAME,
   displayModelName,
@@ -26,7 +27,7 @@ import { useI18n } from "@/lib/i18n";
 import { ruleKey } from "@/lib/cubepilot/allowlist";
 
 import { fmtSeconds } from "./format";
-import { Btn, Card, CardHead, CpInput, CpTextArea, Icons, Pill, inputSx, monoSx, useToast } from "./ui";
+import { Btn, Card, CardHead, CpInput, CpTextArea, Icons, Pill, Spinner, inputSx, monoSx, useToast } from "./ui";
 
 /** The policy the select shows: the override when it is one we offer, else the
  *  effective policy when that is, else Allowlist. */
@@ -97,6 +98,16 @@ export function ConfigPane() {
   const [llmForm, setLlmForm] = useState({ name: "", endpoint: "", models: "", apiKey: "", public: false });
   const [editingProvider, setEditingProvider] = useState("");
   const [llmBusy, setLlmBusy] = useState(false);
+  /** The ids the last fetch found, plus how many the endpoint offered in total
+   *  (the card lists the first MAX_PROVIDER_MODELS of them, which is all a
+   *  provider may declare). */
+  const [llmFetched, setLlmFetched] = useState<{ ids: string[]; total: number; warning: string } | null>(null);
+  const [llmFetchError, setLlmFetchError] = useState("");
+  const [llmFetching, setLlmFetching] = useState(false);
+  /** Bumped whenever what the request would be made with changes (or the form
+   *  moves to another provider), so an answer that arrives late is dropped
+   *  instead of installing one endpoint's ids under another's. */
+  const llmFetchGenRef = useRef(0);
   const [saving, setSaving] = useState(false);
   /** The last load failure: kept on screen (a toast disappears before it can be
    *  read, which is what makes an empty page look like "nothing loaded"). */
@@ -141,8 +152,41 @@ export function ConfigPane() {
   }, []);
   /* eslint-enable react-hooks/set-state-in-effect, react-hooks/exhaustive-deps */
 
+  /** The waiting line counts seconds, so the card needs a clock while the
+   *  instance is coming up — and only then. */
+  const [now, setNow] = useState(() => Date.now());
+  /** Guards the status reads above against landing out of order. */
+  const statusGenRef = useRef(0);
+  useEffect(() => {
+    if (!status || status.phase === "Ready") return;
+    const id = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(id);
+  }, [status]);
+
+  // A save leaves the instance starting (its identity is minted, then the pod
+  // comes up), so the card asks again until it is Ready instead of sitting on
+  // "Creating" until a reload.
+  useEffect(() => {
+    if (!status || status.phase === "Ready") return;
+    const id = setInterval(() => {
+      // Only the newest read counts: a slow one must not put an older phase
+      // back on the card after a newer one said Ready.
+      const gen = ++statusGenRef.current;
+      void apiFetch("/api/cubepilot/agent/status")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((s) => {
+          if (s && statusGenRef.current === gen) setStatus(s as AgentStatus);
+        })
+        .catch(() => undefined);
+    }, 4000);
+    return () => clearInterval(id);
+  }, [status]);
+
   async function saveConfig() {
     if (saving) return;
+    // A first save only starts the instance, which is not "saved" in the sense
+    // the reader expects.
+    const wasMissing = !config.exists;
     setSaving(true);
     try {
       const res = await apiFetch("/api/cubepilot/agent/config", {
@@ -158,7 +202,7 @@ export function ConfigPane() {
       }
       const body = (await res.json()) as { config: AgentConfig };
       setConfig(body.config);
-      showToast(t("cubepilot.config.saved"));
+      showToast(t(wasMissing ? "cubepilot.config.savedCreating" : "cubepilot.config.saved"));
       // The first save provisions the instance — refresh status/confirm.
       void loadAll();
     } catch (e) {
@@ -228,17 +272,67 @@ export function ConfigPane() {
   // ── external providers (AgentTemplate.spec.providers; keys live in Secrets) ──
 
   function resetLlmForm() {
+    clearFetched();
     setLlmForm({ name: "", endpoint: "", models: "", apiKey: "", public: false });
     setEditingProvider("");
   }
 
   function startEditLlm(p: TemplateProviderOption) {
+    clearFetched();
     setEditingProvider(p.name);
     setLlmForm({ name: p.name, endpoint: p.endpoint ?? "", models: p.models.join(", "), apiKey: "", public: !p.keyed });
   }
 
   function cancelEditLlm() {
     resetLlmForm();
+  }
+
+  /** A fetched list belongs to the endpoint it came from: editing what the
+   *  request is made with drops it rather than letting stale ids be ticked. */
+  function clearFetched(): void {
+    llmFetchGenRef.current += 1;
+    setLlmFetched(null);
+    setLlmFetchError("");
+  }
+
+  /** Ask the endpoint which ids it serves. The portal makes the call — a page
+   *  cannot reach an arbitrary endpoint, and the key is not stored yet. */
+  async function fetchLlmModels(): Promise<void> {
+    if (llmFetching) return;
+    const gen = (llmFetchGenRef.current += 1);
+    setLlmFetching(true);
+    setLlmFetchError("");
+    setLlmFetched(null);
+    try {
+      const res = await apiFetch("/api/cubepilot/agent/llm-models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ endpoint: llmForm.endpoint, apiKey: llmForm.apiKey, public: llmForm.public }),
+      });
+      const body = (await res.json().catch(() => null)) as { models?: string[]; error?: string; warning?: string } | null;
+      if (llmFetchGenRef.current !== gen) return;
+      if (!res.ok) throw new Error(body?.error || `HTTP ${res.status}`);
+      // Only ids this form can carry are offered: one the CR would refuse makes
+      // the save fail, and one holding the field's own separator (a comma)
+      // cannot be written into it at all.
+      const valid = (body?.models ?? []).filter((id) => modelIdError(id) === "" && !/[,]/.test(id));
+      setLlmFetched({ ids: valid.slice(0, MAX_PROVIDER_MODELS), total: valid.length, warning: body?.warning ?? "" });
+    } catch (e) {
+      if (llmFetchGenRef.current !== gen) return;
+      setLlmFetchError(e instanceof Error ? e.message : String(e));
+    } finally {
+      // Unconditional: only one attempt runs at a time, and a stale one still
+      // has to release the button it disabled.
+      setLlmFetching(false);
+    }
+  }
+
+  /** Tick or untick a fetched id. The field stays the one source of truth, so
+   *  the ticks and a hand-typed list can never disagree. */
+  function toggleModel(id: string): void {
+    const ids = parseModels(llmForm.models);
+    const next = ids.includes(id) ? ids.filter((x) => x !== id) : [...ids, id];
+    setLlmForm((f) => ({ ...f, models: next.join(", ") }));
   }
 
   /** Both routes answer with the affected provider; reloading the config keeps
@@ -260,7 +354,11 @@ export function ConfigPane() {
       showToast(t("cubepilot.config.llmErrModels"));
       return;
     }
-    if (!llmForm.public && !editingProvider && !llmForm.apiKey) {
+    // A provider that ends up keyed needs a key: either it is new, or it was
+    // public and is being switched (nothing is stored to fall back on). An
+    // already-keyed provider leaves the field empty to keep its key.
+    const wasKeyed = providers.some((p) => p.name === editingProvider && p.keyed);
+    if (!llmForm.public && !llmForm.apiKey.trim() && !wasKeyed) {
       showToast(t("cubepilot.config.llmErrKey"));
       return;
     }
@@ -523,41 +621,131 @@ export function ConfigPane() {
                     placeholder={t("cubepilot.config.llmEndpointPh")}
                     aria-label={t("cubepilot.config.llmEndpointPh")}
                     value={llmForm.endpoint}
-                    onChange={(e) => setLlmForm((f) => ({ ...f, endpoint: e.target.value }))}
+                    onChange={(e) => {
+                      clearFetched();
+                      setLlmForm((f) => ({ ...f, endpoint: e.target.value }));
+                    }}
                     sx={{ ...monoSx, fontSize: 12.5 }}
                     data-od-id="cp-config-llm-endpoint"
                   />
-                  <CpInput
-                    placeholder={t("cubepilot.config.llmModelsPh")}
-                    aria-label={t("cubepilot.config.llmModelsPh")}
-                    value={llmForm.models}
-                    onChange={(e) => setLlmForm((f) => ({ ...f, models: e.target.value }))}
-                    sx={{ ...monoSx, fontSize: 12.5 }}
-                    data-od-id="cp-config-llm-models"
-                  />
+                  <Box sx={{ display: "flex", alignItems: "center", gap: "14px", fontSize: 12.5, color: "text.secondary" }}>
+                    {/* One choice, not a checkbox beside a field: the two are
+                        exclusive (a provider has a credential or is public), and
+                        picking public drops whatever key was typed. */}
+                    <Box component="label" sx={{ display: "inline-flex", alignItems: "center", gap: "5px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="cp-config-llm-cred"
+                        checked={!llmForm.public}
+                        onChange={() => setLlmForm((f) => ({ ...f, public: false }))}
+                        data-od-id="cp-config-llm-cred-key"
+                      />
+                      {t("cubepilot.config.llmKeyed")}
+                    </Box>
+                    <Box component="label" sx={{ display: "inline-flex", alignItems: "center", gap: "5px", cursor: "pointer" }}>
+                      <input
+                        type="radio"
+                        name="cp-config-llm-cred"
+                        checked={llmForm.public}
+                        onChange={() => {
+                          clearFetched();
+                          setLlmForm((f) => ({ ...f, public: true, apiKey: "" }));
+                        }}
+                        data-od-id="cp-config-llm-cred-public"
+                      />
+                      {t("cubepilot.config.llmPublicLabel")}
+                    </Box>
+                  </Box>
+                  {llmForm.public ? null : (
                   <CpInput
                     type="password"
                     placeholder={editingProvider ? t("cubepilot.config.llmKeyPhEdit") : t("cubepilot.config.llmKeyPh")}
                     aria-label={t("cubepilot.config.llmKeyPh")}
                     value={llmForm.apiKey}
-                    disabled={llmForm.public}
-                    onChange={(e) => setLlmForm((f) => ({ ...f, apiKey: e.target.value }))}
+                    onChange={(e) => {
+                      clearFetched();
+                      setLlmForm((f) => ({ ...f, apiKey: e.target.value }));
+                    }}
                     sx={{ ...monoSx, fontSize: 12.5 }}
                     data-od-id="cp-config-llm-key"
                   />
-                  <Box sx={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-                    <Box
-                      component="label"
-                      sx={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: 12.5, color: "text.secondary" }}
+                  )}
+                  <Box sx={{ display: "flex", gap: "6px", alignItems: "stretch" }}>
+                    <CpInput
+                      placeholder={t("cubepilot.config.llmModelsPh")}
+                      aria-label={t("cubepilot.config.llmModelsPh")}
+                      value={llmForm.models}
+                      onChange={(e) => setLlmForm((f) => ({ ...f, models: e.target.value }))}
+                      sx={{ ...monoSx, fontSize: 12.5 }}
+                      data-od-id="cp-config-llm-models"
+                    />
+                    {/* Fetching needs what the request would be made with: an
+                        endpoint, and either a key or public. */}
+                    <Btn
+                      small
+                      variant="ghost"
+                      disabled={llmFetching || llmForm.endpoint.trim() === "" || (!llmForm.public && llmForm.apiKey.trim() === "")}
+                      title={!llmForm.public && llmForm.apiKey.trim() === "" ? t("cubepilot.config.llmFetchNeedsKey") : undefined}
+                      onClick={() => void fetchLlmModels()}
+                      data-od-id="cp-config-llm-fetch"
                     >
-                      <input
-                        type="checkbox"
-                        checked={llmForm.public}
-                        onChange={(e) => setLlmForm((f) => ({ ...f, public: e.target.checked }))}
-                        data-od-id="cp-config-llm-public"
-                      />
-                      {t("cubepilot.config.llmPublicLabel")}
+                      {llmFetching ? t("cubepilot.config.llmFetching") : t("cubepilot.config.llmFetch")}
+                    </Btn>
+                  </Box>
+                  {llmFetchError ? (
+                    <Box sx={{ fontSize: 11.5, color: "var(--danger)" }} data-od-id="cp-config-llm-fetch-error">
+                      {t("cubepilot.config.llmFetchFailed", { error: llmFetchError })}
                     </Box>
+                  ) : null}
+                  {llmFetched ? (
+                    <Box
+                      data-od-id="cp-config-llm-fetched"
+                      sx={{
+                        maxHeight: 180,
+                        overflowY: "auto",
+                        border: 1,
+                        borderColor: "divider",
+                        borderRadius: "var(--radius)",
+                        p: "6px 8px",
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "2px",
+                      }}
+                    >
+                      {llmFetched.ids.length === 0 ? (
+                        <Box sx={{ fontSize: 11.5, color: "text.secondary" }}>{t("cubepilot.config.llmFetchNone")}</Box>
+                      ) : null}
+                      {llmFetched.ids.map((id) => (
+                        <Box
+                          key={id}
+                          component="label"
+                          data-od-id={`cp-config-llm-fetched-${id}`}
+                          sx={{ display: "flex", alignItems: "center", gap: "6px", fontSize: 12, ...monoSx, cursor: "pointer" }}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={parseModels(llmForm.models).includes(id)}
+                            onChange={() => toggleModel(id)}
+                          />
+                          {id}
+                        </Box>
+                      ))}
+                      {llmFetched.warning === "key-over-http" ? (
+                        <Box sx={{ fontSize: 10.5, color: "var(--warn)", pt: "2px" }} data-od-id="cp-config-llm-fetch-warning">
+                          {t("cubepilot.config.llmFetchHttpWarning")}
+                        </Box>
+                      ) : null}
+                      {llmFetched.total > llmFetched.ids.length ? (
+                        <Box sx={{ fontSize: 10.5, color: "text.secondary", pt: "2px" }}>
+                          {t("cubepilot.config.llmFetchCapped", {
+                            shown: String(llmFetched.ids.length),
+                            total: String(llmFetched.total),
+                          })}
+                        </Box>
+                      ) : null}
+                    </Box>
+                  ) : null}
+                  <Box sx={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
                     <Box sx={{ flex: 1 }} />
                     {editingProvider ? (
                       <Btn small disabled={llmBusy} onClick={cancelEditLlm} data-od-id="cp-config-llm-cancel">
@@ -599,9 +787,22 @@ export function ConfigPane() {
           <CardHead
             title={t("cubepilot.config.instTitle")}
             actions={
-              <Pill variant={hasInstance ? (status?.phase === "Ready" ? "ok" : "warn") : "neutral"} dot pulse={hasInstance && status?.phase === "Ready"}>
-                {hasInstance ? (status?.phase || t("cubepilot.config.instPending")) : "—"}
-              </Pill>
+              <>
+                {/* The pulse belongs to a start in progress, not to a finished one. */}
+                <Pill
+                  variant={hasInstance ? (status?.phase === "Ready" ? "ok" : status?.phase === "Failed" ? "danger" : "warn") : "neutral"}
+                  dot
+                  pulse={hasInstance && status?.phase !== "Ready"}
+                >
+                  {hasInstance ? phaseText(t, status?.phase) || t("cubepilot.config.instPending") : "—"}
+                </Pill>
+                {hasInstance && status?.phase !== "Ready" ? (
+                  <Box sx={{ display: "inline-flex", alignItems: "center", gap: "6px", fontSize: 12, color: "text.secondary", ml: "8px" }}>
+                    <Spinner size={12} />
+                    {t("cubepilot.config.instWaiting", { secs: String(waitingSeconds(status?.startedAt, now) ?? 0) })}
+                  </Box>
+                ) : null}
+              </>
             }
           />
           <Box sx={{ p: "16px", display: "grid", gridTemplateColumns: "1fr", gap: "12px" }}>
