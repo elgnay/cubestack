@@ -2789,6 +2789,49 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(svc.Spec.Ports[0].Port).To(Equal(int32(8080)))
 			Expect(svc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(8080)))
 		})
+
+		// spec.ports is free to name a port the platform already publishes, and
+		// the platform publishes two the user did not write: the type's main port
+		// and, with ssh, the number sshd is bridged from. A Service may not carry
+		// one (port, protocol) twice — the API server refuses the write outright,
+		// and that error aborts the reconcile before its status write — so the
+		// list dedupes the way the container port list does (::desiredContainerPorts).
+		// The exposure is not lost by that: the Service keeps publishing the
+		// number, and a route names a Service port by number, not by name.
+		It("publishes each Service port once, per protocol", func() {
+			svc := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
+				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+				env.Spec.Ports = []aiv1alpha1.PortSpec{
+					{Name: "jupyter-again", Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 8888},
+					{Name: "sshd-again", Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshServicePort},
+					{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 8888},
+				}
+			})
+			// Both repeats of a platform-published port are gone; the udp entry
+			// on the same number as the notebook is a different port and stays.
+			Expect(svc.Spec.Ports).To(Equal([]corev1.ServicePort{
+				{Name: mainPortName, Port: 8888, TargetPort: intstr.FromInt32(8888), Protocol: corev1.ProtocolTCP},
+				{Name: sshPortName, Port: sshServicePort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP},
+				{Name: testSyslogPortName, Port: 8888, TargetPort: intstr.FromInt32(8888), Protocol: corev1.ProtocolUDP},
+			}))
+		})
+
+		// The ssh type publishes its main port at 22 targeting the container's
+		// 2222, so the two sides of the bridge diverge and only the Service side
+		// can collide there.
+		It("keeps a spec port on the ssh type's container port, which the Service does not carry", func() {
+			svc := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+				env.Spec.Ports = []aiv1alpha1.PortSpec{
+					{Name: "sshd-direct", Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshContainerPort},
+				}
+			})
+			Expect(svc.Spec.Ports).To(Equal([]corev1.ServicePort{
+				{Name: mainPortName, Port: sshServicePort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP},
+				{Name: "sshd-direct", Port: sshContainerPort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP},
+			}))
+		})
 	})
 
 	Describe("desiredListenerSet", func() {
@@ -5515,6 +5558,73 @@ var _ = Describe("DevEnvironment controller", func() {
 			// take the environment off the HTTP listener.
 			Expect(got.Status.Endpoints).To(ContainElement(
 				aiv1alpha1.Endpoint{Name: testJupyterName, Address: "http://" + testGatewayIP + ":80" + webRootPath + env.Name + "/", ListenerPort: 80}))
+		})
+
+		// An exposure repeating a port the Service already publishes is a spec the
+		// controller resolves rather than refuses (::desiredService). It used to be
+		// the API server that refused it: the duplicate ServicePort failed the
+		// Service write, and because applyService errors before the status write the
+		// environment was left with no Service, no pod and no status at all. So this
+		// asserts both halves — the write is accepted, and the environment has a
+		// status at all — plus that the exposure's own route survives the folding,
+		// which is what makes resolving it rather than refusing it the honest call.
+		It("settles an exposure that repeats the Service's own port", func() {
+			createGateway(true)
+			defer deleteGateway()
+
+			const repeatName = "notebook-again"
+			notebookPort := mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)
+
+			env := validDevEnvironment("de-svc-repeat")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: repeatName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: notebookPort},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			// The Service carries the notebook's port once: the repeat is folded
+			// into the platform's own entry rather than written beside it.
+			Eventually(func(g Gomega) {
+				svc := &corev1.Service{}
+				g.Expect(k8sClient.Get(ctx, client.ObjectKey{Name: env.Name, Namespace: env.Namespace}, svc)).To(Succeed())
+				g.Expect(svc.Spec.Ports).To(HaveLen(1))
+				g.Expect(svc.Spec.Ports[0].Name).To(Equal(mainPortName))
+				g.Expect(svc.Spec.Ports[0].Port).To(Equal(notebookPort))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The reconcile got past the Service, which is what the duplicate
+			// ServicePort used to take away: a status at all, written for the
+			// generation that is current.
+			Eventually(func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).NotTo(BeEmpty())
+				g.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			// Nothing was taken from the user: the repeat's exposure is still
+			// published on its own path, reaching the Service by number — which is
+			// why the name it was declared under can go unused.
+			route := &gatewayv1.HTTPRoute{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: webRouteName(env), Namespace: env.Namespace}, route)).To(Succeed())
+			repeatPath := fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, repeatName)
+			var matched bool
+			for _, rule := range route.Spec.Rules {
+				if len(rule.Matches) == 0 || rule.Matches[0].Path == nil || rule.Matches[0].Path.Value == nil {
+					continue
+				}
+				if *rule.Matches[0].Path.Value != repeatPath {
+					continue
+				}
+				matched = true
+				Expect(rule.BackendRefs).To(HaveLen(1))
+				Expect(rule.BackendRefs[0].Name).To(Equal(gatewayv1.ObjectName(env.Name)))
+				Expect(rule.BackendRefs[0].Port).To(Equal(ptrTo(notebookPort)))
+			}
+			Expect(matched).To(BeTrue(), "the repeat's exposure lost its route")
 		})
 
 		It("holds a udp port and a tcp port on different numbers", func() {

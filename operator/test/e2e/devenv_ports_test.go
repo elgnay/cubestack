@@ -43,16 +43,21 @@ const (
 	portHTTP2Name = "probe-http-2"
 	portTCPName   = "probe-tcp"
 	portUDPName   = "probe-udp"
+
+	// portRepeatName is declared on a container port the Service already
+	// publishes, which is what K6 is about and what the four above deliberately
+	// avoid.
+	portRepeatName = "notebook-again"
 )
 
 // The container ports the two http exposures name. Neither is a port the image
-// serves, and neither may be one the Service already carries: sshd and the
-// notebook are what the other exposures are for, and a ServicePort whose (port,
-// protocol) the Service already publishes is rejected by the API server — see
-// extraPorts.
+// serves — sshd and the notebook are what the other exposures are for — and
+// neither repeats one the Service already publishes, so each is an entry of its
+// own and the cases below are about the routing rather than about a repeat being
+// folded into the platform's own entry (::desiredService, and K6 for that case).
 //
-// They differ from each other for the same reason: two exposures on one
-// container port would be one Service entry twice.
+// They differ from each other for the same reason: two exposures naming one
+// container port are one Service entry, however they are named.
 const (
 	portHTTPContainer  int32 = 8080
 	portHTTP2Container int32 = 8081
@@ -74,12 +79,12 @@ func describePorts() {
 //
 // The http one is the exception, and deliberately: 8080 is a port the container
 // does not listen on, because the notebook's own 8888 is already published as
-// the Service's `main` entry — as are its ssh and jupyter endpoints — and a
-// second ServicePort on the same (port, protocol) is rejected by the API server
-// outright, so a spec that asks for one leaves the environment with no Service
-// and no status at all. That the platform answers such a spec that way is a
-// finding (see the PR), not a contract, so the case does not encode it: nothing
-// dials the http exposure, because what it is about is the routing.
+// the Service's `main` entry — as are its ssh and jupyter endpoints. An exposure
+// naming 8888 anyway is folded into that entry rather than added beside it
+// (::desiredService), and is a case of its own below (K6); naming a port of its
+// own is what makes this exposure an entry the Service carries for its sake,
+// which is what K1 reads the routing against. Nothing dials the http exposure,
+// because what it is about is the routing.
 func extraPorts(want *aiv1alpha1.DevEnvironment) {
 	want.Spec.Ports = []aiv1alpha1.PortSpec{
 		{Name: portHTTPName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: portHTTPContainer},
@@ -427,6 +432,68 @@ func describeExtraPorts() {
 					Expect(now).To(Equal(held),
 						"an L4 port moved while the environment was reconciled\nbefore: %v\nafter:  %v",
 						held, now)
+				})
+		},
+	}.declare()
+
+	// K6 is the shape the four above are arranged not to be: an exposure naming a
+	// container port the Service already publishes. The platform used to answer
+	// such a spec by refusing the Service write outright, which — because
+	// applyService errors before the reconcile writes status — left the
+	// environment with no Service, no pod and no status at all. So the case is
+	// about both halves of the fix: the environment converges, and the exposure
+	// the user asked for is still published.
+	draftCase{
+		Name:     "ports-repeat",
+		Image:    devenv.MustImage("jupyter-minimal"),
+		Identity: devenv.NonRoot,
+		Shape: func(want *aiv1alpha1.DevEnvironment) {
+			want.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: portRepeatName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: devenv.ContainerJupyterPort},
+			}
+		},
+		Cases: func(open func() *devenv.Environment) {
+			It("K6 folds an exposure repeating the notebook's own port into the platform's entry",
+				Label(devenv.TierP1, devenv.LabelFamily("K")), func(ctx SpecContext) {
+					env := open()
+					// Reaching Running is the assertion that the write was
+					// accepted: the environment has a status at all, which is
+					// exactly what the refused Service used to take away.
+					running(ctx, env)
+
+					// The Service carries the notebook's port once — under the
+					// platform's own name, not the exposure's — so the repeat is
+					// folded in rather than written beside it.
+					svc, err := env.Service(ctx)
+					Expect(err).NotTo(HaveOccurred())
+					var onNotebookPort int
+					for _, p := range svc.Spec.Ports {
+						if p.Port == devenv.ContainerJupyterPort {
+							onNotebookPort++
+						}
+					}
+					Expect(onNotebookPort).To(Equal(1),
+						"the Service carries %d entries on the notebook's port %d (ports: %v)",
+						onNotebookPort, devenv.ContainerJupyterPort, servicePortNames(svc))
+
+					// And nothing was taken from the user: the exposure keeps a
+					// route of its own, forwarding to the number it declared —
+					// which is what makes folding the entry in honest rather than
+					// silent.
+					wantPath := fmt.Sprintf("/dev/%s/%s/port/%s/", env.Namespace, env.Name, portRepeatName)
+					rules, err := env.HTTPRouteRules(ctx)
+					Expect(err).NotTo(HaveOccurred())
+					var rule *devenv.HTTPRouteRule
+					for i := range rules {
+						if rules[i].PathPrefix == wantPath {
+							rule = &rules[i]
+							break
+						}
+					}
+					Expect(rule).NotTo(BeNil(),
+						"the repeat lost its route (rules: %v)", rules)
+					Expect(rule.BackendPort).To(Equal(int32(devenv.ContainerJupyterPort)),
+						"the rule forwards to a port the exposure did not declare")
 				})
 		},
 	}.declare()

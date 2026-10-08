@@ -2269,6 +2269,14 @@ func (r *DevEnvironmentReconciler) desiredVolumeClaimTemplates(env *aiv1alpha1.D
 
 // desiredService renders the ClusterIP Service with the main port, the SSH
 // port (when exposed and not the main port), and the extra application ports.
+//
+// Like the container port list it is rendered beside (::desiredContainerPorts),
+// the list dedupes on port and protocol: spec.ports is free to repeat a port the
+// platform already declared, and a Service carrying one (port, protocol) twice
+// is refused by the API server outright. Dropping the repeat takes nothing from
+// the user — the Service still publishes the number, and a route reaches a
+// Service by number rather than by name (::serviceBackendRef) — so the exposure
+// keeps working and only the name it was declared under goes unused.
 func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment) *corev1.Service {
 	mainPort := mainContainerPort(env.Spec.Type)
 	// The ssh container listens on the unprivileged sshContainerPort but is
@@ -2278,11 +2286,26 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeSSH {
 		mainServicePort = sshServicePort
 	}
-	ports := []corev1.ServicePort{
-		{Name: mainPortName, Port: mainServicePort, TargetPort: intstr.FromInt32(mainPort), Protocol: corev1.ProtocolTCP},
+	// The seen set is keyed by port and protocol, as desiredContainerPorts keys
+	// its own: the same number under another protocol is a different Service
+	// port and survives. The ssh entry is guarded by type, as the container port
+	// list guards its own: for the ssh type the two entries are the same port,
+	// and the main one is what names it.
+	var ports []corev1.ServicePort
+	seen := map[string]bool{}
+	add := func(name string, port, targetPort int32, protocol corev1.Protocol) {
+		key := fmt.Sprintf("%d/%s", port, protocol)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		ports = append(ports, corev1.ServicePort{
+			Name: name, Port: port, TargetPort: intstr.FromInt32(targetPort), Protocol: protocol,
+		})
 	}
+	add(mainPortName, mainServicePort, mainPort, corev1.ProtocolTCP)
 	if sshExposed(env) && env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
-		ports = append(ports, corev1.ServicePort{Name: sshPortName, Port: sshServicePort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP})
+		add(sshPortName, sshServicePort, sshContainerPort, corev1.ProtocolTCP)
 	}
 	for _, p := range env.Spec.Ports {
 		// The Service port carries the protocol the exposure speaks: a UDPRoute
@@ -2290,7 +2313,7 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 		// that same one. A udp port that stayed TCP here would be accepted and
 		// then forward nothing, since a TCP Service port does not listen for
 		// datagrams.
-		ports = append(ports, corev1.ServicePort{Name: p.Name, Port: p.ContainerPort, TargetPort: intstr.FromInt32(p.ContainerPort), Protocol: portProtocol(p)})
+		add(p.Name, p.ContainerPort, p.ContainerPort, portProtocol(p))
 	}
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
