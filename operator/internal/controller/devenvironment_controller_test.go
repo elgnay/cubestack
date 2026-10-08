@@ -1941,6 +1941,47 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		})
 	})
 
+	Describe("withdrawStoppedEndpoints", func() {
+		// The phase is what says an environment is stopped, and both its reasons —
+		// a user's running=false and an idle auto-stop — land on the same name, so
+		// one rule covers them both (::setPhaseAndReady).
+		endpoints := func() []aiv1alpha1.Endpoint {
+			return []aiv1alpha1.Endpoint{{
+				Name: sshPortName, Address: testGatewayIP + ":20001", ListenerPort: 20001,
+			}}
+		}
+
+		It("withdraws the address of a stopped environment", func() {
+			// An ssh exposure loses its address whether this withholds it or not:
+			// the gateway rejects its L4 route once the workload is scaled to zero.
+			// A web address has no such route to go away for it, which is what makes
+			// this the case the rule exists for.
+			status := &aiv1alpha1.DevEnvironmentStatus{
+				Phase:     &aiv1alpha1.Phase{Name: aiv1alpha1.PhaseStopped},
+				Endpoints: endpoints(),
+			}
+			withdrawStoppedEndpoints(status)
+			Expect(status.Endpoints).To(BeEmpty())
+		})
+
+		It("keeps the address of a running environment", func() {
+			status := &aiv1alpha1.DevEnvironmentStatus{
+				Phase:     &aiv1alpha1.Phase{Name: aiv1alpha1.PhaseRunning},
+				Endpoints: endpoints(),
+			}
+			withdrawStoppedEndpoints(status)
+			Expect(status.Endpoints).To(HaveLen(1))
+		})
+
+		It("keeps the address of an environment whose phase is not recorded yet", func() {
+			// Nothing about an absent phase says the environment is stopped, and the
+			// address is what a user was handed the moment it was published.
+			status := &aiv1alpha1.DevEnvironmentStatus{Endpoints: endpoints()}
+			withdrawStoppedEndpoints(status)
+			Expect(status.Endpoints).To(HaveLen(1))
+		})
+	})
+
 	Describe("desiredPodSpec", func() {
 		newEnv := func() *aiv1alpha1.DevEnvironment {
 			return &aiv1alpha1.DevEnvironment{
@@ -6304,6 +6345,72 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
 				g.Expect(devEnvEndpointPort(got.Status.Endpoints, sshPortName)).To(Equal(before))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		It("withdraws the address of a stopped environment, and not its route", func() {
+			// A stop and a gateway failure both end with no address, and what tells
+			// them apart is RouteReady: the route is still published and still
+			// accepted, so the condition goes on saying so while the address goes.
+			// Only a web environment can tell the two apart — an ssh exposure loses
+			// its address either way, the gateway rejecting its L4 route once nothing
+			// is behind the Service — so this is the case the rule exists for.
+			createGateway(true)
+			defer deleteGateway()
+
+			// No ssh, so the web address is the only endpoint this environment
+			// publishes and nothing else can be what withdrew it. The timeout is what
+			// makes an auto-stop mark survive: with the feature off the mark is stale
+			// by definition, and the controller clears it before the phase is derived
+			// (::clearSupersededAutoStop).
+			env := validDevEnvironment("de-gw-stopped")
+			env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 600}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			webAddressPublished := func(g Gomega) {
+				stampDevEnvRoutes(g, env.Name, true, "", "")
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				g.Expect(got.Status.Endpoints).To(HaveLen(1))
+				g.Expect(got.Status.Endpoints[0].Name).To(Equal(string(aiv1alpha1.DevEnvironmentTypeJupyter)))
+			}
+			Eventually(webAddressPublished, "15s", "200ms").Should(Succeed())
+
+			// A user's stop.
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) { e.Spec.Running = false })
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseStopped))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			// And it is the address that went, not the routes: starting again is
+			// handed the same one rather than provisioned afresh.
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) { e.Spec.Running = true })
+			Eventually(webAddressPublished, "15s", "200ms").Should(Succeed())
+
+			// The other reason a phase becomes Stopped, and the one no user asked
+			// for. The mark is written by hand because driving the idle clock is the
+			// idle suite's subject; the state is the one that suite produces.
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				if e.Annotations == nil {
+					e.Annotations = map[string]string{}
+				}
+				e.Annotations[autoStoppedAnnotationKey] = autoStoppedValue
+			})
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseStopped))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonIdleTimeout))
+				g.Expect(got.Status.Endpoints).To(BeEmpty())
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
 

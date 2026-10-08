@@ -575,6 +575,9 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	}
 	setPodScheduledCondition(&desired.Status.Conditions, pod)
 	r.setPhaseAndReady(&env, &desired.Status, pod)
+	// The phase is the one statement of what state the environment is in, so what
+	// an address means follows from it rather than being decided again here.
+	withdrawStoppedEndpoints(&desired.Status)
 
 	// 6. Idle auto-stop (design §4.2 step 4). The mark is written here and only
 	// here, from the phase just derived and the pod just observed; the replicas
@@ -4621,6 +4624,23 @@ func (r *DevEnvironmentReconciler) setPhaseAndReady(env *aiv1alpha1.DevEnvironme
 	default:
 		setPhase(status, aiv1alpha1.PhasePending, reasonPending)
 		setDevEnvironmentReadyCondition(&status.Conditions, metav1.ConditionFalse, reasonPending, "Environment pod is being created")
+	}
+}
+
+// withdrawStoppedEndpoints drops the access addresses of a stopped environment:
+// its workload is scaled to zero, so nothing answers behind the routes, and the
+// phase already says why. Withheld here rather than where the routes are
+// published so that one rule covers every stop — a user's spec.running=false, an
+// idle auto-stop, and an environment that has never been started — the way it
+// already covers them for an ssh exposure, whose L4 route the gateway rejects
+// once its Service has no ready endpoints.
+//
+// The routes and the ListenerSet are left in place: the address is recomputed on
+// the next start, and for an L4 exposure heldPorts recovers the port it held from
+// the ListenerSet (::heldPorts), so the environment comes back on the same one.
+func withdrawStoppedEndpoints(status *aiv1alpha1.DevEnvironmentStatus) {
+	if status.Phase != nil && status.Phase.Name == aiv1alpha1.PhaseStopped {
+		status.Endpoints = nil
 	}
 }
 
