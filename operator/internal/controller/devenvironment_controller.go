@@ -21,7 +21,13 @@ limitations under the License.
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// patch is here for the grant, not for the controller: an idle-enabled
+// environment's activity agent is given get+patch on its own pod
+// (::desiredActivityAgentRBAC), and RBAC privilege-escalation prevention
+// refuses a Role whose rules the creator does not itself hold. The manager
+// never patches a pod — the Role it renders is the narrow one, scoped by
+// resourceNames to a single pod.
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;patch
 // +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=list;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete

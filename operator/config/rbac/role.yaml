@@ -23,7 +23,6 @@ rules:
   - ""
   resources:
   - endpoints
-  - pods
   verbs:
   - get
   - list
@@ -34,6 +33,15 @@ rules:
   - persistentvolumeclaims
   verbs:
   - create
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
   - get
   - list
   - patch
