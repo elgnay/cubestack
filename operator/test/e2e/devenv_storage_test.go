@@ -422,13 +422,14 @@ func loadVolumeMarkers(ctx context.Context, script, data, ro, sub string) error 
 			corev1.VolumeMount{Name: name, MountPath: volumeLoaderMounts[i]})
 	}
 
-	switch err := conformance.Client.Create(ctx, pod); {
-	case err == nil:
-	case apierrors.IsAlreadyExists(err):
-		// A previous run in this namespace — the run's own, so this one reuses
-		// whatever it finds rather than treating it as a foreign object.
-	default:
-		return fmt.Errorf("creating the volume loader: %w", err)
+	// The loader is this run's, and an earlier run's is replaced rather than
+	// reused. This case can be handed a leftover: nothing removes the run
+	// namespace except the cleanup target, so a run that died mid-way leaves one
+	// behind, and its loader pod with it. A pod that has run cannot run again, so
+	// reusing it answers for the previous run's claims — as the failure it
+	// stopped on, or as a success whose markers the current claims do not carry.
+	if err := replacePod(ctx, pod); err != nil {
+		return err
 	}
 
 	deadline := time.Now().Add(3 * time.Minute)
@@ -451,6 +452,47 @@ func loadVolumeMarkers(ctx context.Context, script, data, ro, sub string) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+// replacePod removes a pod of the given name if one is there and creates the
+// given one in its place.
+//
+// Delete-then-create rather than create-then-delete-on-conflict because the API
+// server refuses the create for as long as the old object exists, and a pod is
+// not the kind of object whose leftovers can be written over: a container that
+// has exited is not run again by editing it.
+func replacePod(ctx context.Context, pod *corev1.Pod) error {
+	// Grace zero, because what is being replaced has already run to a terminal
+	// phase and has nothing left to shut down. It is also the shape that cannot
+	// hang here: a pod with a grace period sits in Terminating until something
+	// else removes it, and on a node that has since gone away that is not this
+	// case's to wait for.
+	err := conformance.Client.Delete(ctx, pod, client.GracePeriodSeconds(0))
+	if err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting the previous volume loader: %w", err)
+	}
+
+	deadline := time.Now().Add(time.Minute)
+	for {
+		var gone corev1.Pod
+		switch err := conformance.Client.Get(ctx, client.ObjectKeyFromObject(pod), &gone); {
+		case apierrors.IsNotFound(err):
+			if err := conformance.Client.Create(ctx, pod); err != nil {
+				return fmt.Errorf("creating the volume loader: %w", err)
+			}
+			return nil
+		case err != nil:
+			return fmt.Errorf("reading the previous volume loader: %w", err)
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("the previous volume loader is still terminating after 1m")
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
 		}
 	}
 }
