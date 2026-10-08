@@ -2495,6 +2495,23 @@ func (r *DevEnvironmentReconciler) apiserverEgress(ctx context.Context, env *aiv
 			ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &protocol, Port: &port})
 		}
 	}
+	// An Endpoints object is a set: neither its subsets, their addresses nor
+	// their ports have a guaranteed order, so the same cluster can list the same
+	// endpoints differently between one reconcile and the next. What this rule
+	// renders is compared against the live NetworkPolicy to decide whether to
+	// write (::applyNetworkPolicy), and that policy is owned by this environment,
+	// so an order-only difference would buy a pointless update and the reconcile
+	// its own write enqueues. Sorting both lists leaves the render a function of
+	// what the apiserver publishes, not of the order it published it in.
+	slices.SortFunc(peers, func(a, b networkingv1.NetworkPolicyPeer) int {
+		return cmp.Compare(a.IPBlock.CIDR, b.IPBlock.CIDR)
+	})
+	slices.SortFunc(ports, func(a, b networkingv1.NetworkPolicyPort) int {
+		if c := cmp.Compare(*a.Protocol, *b.Protocol); c != 0 {
+			return c
+		}
+		return cmp.Compare(a.Port.IntVal, b.Port.IntVal)
+	})
 	return []networkingv1.NetworkPolicyEgressRule{{To: peers, Ports: ports}}, nil
 }
 

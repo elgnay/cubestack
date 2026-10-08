@@ -1042,6 +1042,75 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(r.desiredNetworkPolicy(env, nil).Spec.Ingress[0].Ports).To(BeEmpty())
 		})
 	})
+
+	Describe("apiserverEgress", func() {
+		// An Endpoints is a set: neither its addresses nor its ports carry an
+		// order, so both are listed below in an order the rendered rule must not
+		// inherit. The rule is compared against the live NetworkPolicy to decide
+		// whether to write, and that policy is owned by the environment, so a
+		// render that followed the object would buy an update — and the reconcile
+		// that write enqueues — for the apiserver publishing the same set in a
+		// different order.
+		newReconciler := func() *DevEnvironmentReconciler {
+			scheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault},
+					Spec: corev1.ServiceSpec{
+						ClusterIPs: []string{"10.0.0.1"},
+						Ports:      []corev1.ServicePort{{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP}},
+					},
+				},
+				//nolint:staticcheck // Endpoints is deprecated in v1.33+ but still served; it is what the rule reads.
+				&corev1.Endpoints{
+					ObjectMeta: metav1.ObjectMeta{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault},
+					//nolint:staticcheck // The deprecated object's own subset type.
+					Subsets: []corev1.EndpointSubset{{
+						Addresses: []corev1.EndpointAddress{{IP: "10.0.0.9"}, {IP: "10.0.0.3"}},
+						Ports: []corev1.EndpointPort{
+							{Port: 6443, Protocol: corev1.ProtocolTCP},
+							{Port: 5000, Protocol: corev1.ProtocolTCP},
+						},
+					}},
+				},
+			).Build()
+			return &DevEnvironmentReconciler{Client: live}
+		}
+
+		idleEnv := func() *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-egress", Namespace: testNamespace},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Lifecycle: &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600},
+				},
+			}
+		}
+
+		It("renders the apiserver's addresses and ports in a canonical order", func() {
+			rules, err := newReconciler().apiserverEgress(context.Background(), idleEnv())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rules).To(HaveLen(1))
+
+			tcp := corev1.ProtocolTCP
+			port := func(p int32) *intstr.IntOrString { v := intstr.FromInt32(p); return &v }
+
+			// Ascending, so one set of endpoints always renders one rule. The
+			// ClusterIP and the endpoint addresses are a single list here: which
+			// of them came from which object is not part of the contract.
+			Expect(rules[0].To).To(Equal([]networkingv1.NetworkPolicyPeer{
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.1/32"}},
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.3/32"}},
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.9/32"}},
+			}))
+			Expect(rules[0].Ports).To(Equal([]networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: port(443)},
+				{Protocol: &tcp, Port: port(5000)},
+				{Protocol: &tcp, Port: port(6443)},
+			}))
+		})
+	})
 })
 
 var _ = Describe("emitLifecycleTransition", func() {
@@ -3238,15 +3307,25 @@ var _ = Describe("DevEnvironment controller", func() {
 				// Both addresses the apiserver answers at, on both ports: the
 				// ClusterIP on the Service's port for a CNI that filters before
 				// the service rewrite, the endpoint on its target port for one
-				// that filters after it.
+				// that filters after it. Asserted as a set — the controller sorts
+				// both lists so that a reordered Endpoints cannot churn the
+				// render, and which of the two addresses sorts first is a
+				// property of the addresses, not a contract.
 				rule := np.Spec.Egress[1]
-				g.Expect(rule.To).To(Equal([]networkingv1.NetworkPolicyPeer{
-					{IPBlock: &networkingv1.IPBlock{CIDR: apiserver.Spec.ClusterIP + "/32"}},
-					{IPBlock: &networkingv1.IPBlock{CIDR: endpointAddress + "/32"}},
-				}))
+				g.Expect(rule.To).To(HaveLen(2))
+				g.Expect(rule.To).To(ContainElement(
+					networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: apiserver.Spec.ClusterIP + "/32"}}))
+				g.Expect(rule.To).To(ContainElement(
+					networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: endpointAddress + "/32"}}))
+
+				tcp := corev1.ProtocolTCP
+				servicePort := intstr.FromInt32(443)
+				apiserverPort := intstr.FromInt32(endpointPort)
 				g.Expect(rule.Ports).To(HaveLen(2))
-				g.Expect(*rule.Ports[0].Port).To(Equal(intstr.FromInt32(443)))
-				g.Expect(*rule.Ports[1].Port).To(Equal(intstr.FromInt32(endpointPort)))
+				g.Expect(rule.Ports).To(ContainElement(
+					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &servicePort}))
+				g.Expect(rule.Ports).To(ContainElement(
+					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &apiserverPort}))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
