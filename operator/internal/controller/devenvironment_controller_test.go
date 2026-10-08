@@ -84,6 +84,10 @@ const (
 	testMetricsPortName           = "metrics"
 	// testSyslogPortName is the extra udp port the UDP specs expose.
 	testSyslogPortName = "syslog"
+	// testCollidingPortName is the extra tcp port the specs exposing the Service
+	// port the ssh bridge is published on declare: an exposure the bridge would
+	// answer for rather than the workload the entry named.
+	testCollidingPortName = "user-app"
 	// testDevEnvKind is the kind as the API server writes it into an
 	// ownerReference.
 	testDevEnvKind = "DevEnvironment"
@@ -1525,6 +1529,15 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				}},
 			})
 		}
+		// An extra application port, and an ssh exposure for it to collide with.
+		exposing := func(env *aiv1alpha1.DevEnvironment, ports ...aiv1alpha1.PortSpec) *aiv1alpha1.DevEnvironment {
+			env.Spec.Ports = append(env.Spec.Ports, ports...)
+			return env
+		}
+		withSSH := func(env *aiv1alpha1.DevEnvironment) *aiv1alpha1.DevEnvironment {
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			return env
+		}
 
 		// Each entry states the disposition it expects, not just that something was
 		// reported: the whole point of the condition is which of the two a value
@@ -1566,6 +1579,38 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Entry("a home the derivation cannot use",
 				claiming(homeFrom(newJupyter())), 0,
 				[]string{"spec.runtime.env[HOME]: ignored — "}),
+			// An exposure on a port the Service already publishes is folded into the
+			// entry that carries it, and which disposition it gets is decided by
+			// where that entry forwards (::portCollisionFindings).
+			//
+			// A repeat of the type's own main port folds into an entry forwarding to
+			// the same container port, so the exposure is served exactly as declared
+			// and only the name it was declared under goes unused.
+			Entry("a repeat of the notebook's own port is ignored",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: "notebook-again", Type: aiv1alpha1.PortTypeHTTP,
+					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
+				}), 0, []string{"spec.ports[0]: ignored — "}),
+			// As does a repeat of an earlier exposure: the Service carries the number
+			// once, and both entries forward to the port they name.
+			Entry("a second exposure on one container port is ignored",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: "metrics-again", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				), 0, []string{"spec.ports[1]: ignored — "}),
+			// The other side of the ssh bridge is not published, so an exposure on it
+			// is an entry of its own rather than a repeat.
+			Entry("an exposure on the port the ssh bridge forwards to",
+				exposing(withSSH(newJupyter()), aiv1alpha1.PortSpec{
+					Name: "raw-ssh", Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshContainerPort,
+				}), 0, nil),
+			// The same number under another protocol is a different Service port, so
+			// neither folds into the other.
+			Entry("a udp exposure on the notebook's port",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP,
+					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
+				}), 0, nil),
 			// Both dispositions in one spec: the refusal is what the phase follows,
 			// and the resolved value is reported beside it rather than instead of it.
 			Entry("reports a refusal and a resolved value together",
@@ -1575,6 +1620,34 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					"spec.runtime.env[NB_UID]: ignored — ",
 				}),
 		)
+
+		// The fold that is not lossless, and so is not a resolved value: the ssh
+		// bridge is published at 22 and forwards to the sshd on 2222, so an exposure
+		// declaring container port 22 would have its route reach sshd rather than
+		// the workload it named, and no other port carries what it asks for. Only
+		// the user can choose another port, which is what mustUpdate says.
+		It("fails an exposure the ssh bridge would answer for", func() {
+			env := exposing(withSSH(newJupyter()),
+				aiv1alpha1.PortSpec{Name: testCollidingPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshServicePort})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+			Expect(blocking[0].field).To(Equal("ports[0]"))
+			Expect(blocking[0].detail).To(ContainSubstring(
+				fmt.Sprintf("forwards to container port %d rather than the %d this entry declares",
+					sshContainerPort, sshServicePort)))
+		})
+
+		// The ssh type publishes its own bridge as the main entry, so its two sides
+		// are the same divergence and the same refusal.
+		It("fails an exposure on the ssh type's own bridge port", func() {
+			env := exposing(&aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Type: aiv1alpha1.DevEnvironmentTypeSSH, Image: testDevImage,
+			}}, aiv1alpha1.PortSpec{Name: testCollidingPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshServicePort})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+		})
 
 		It("fails the environment on the brand mismatch before any other refusal", func() {
 			env := fromValueFrom()
@@ -5644,6 +5717,13 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(got.Status.Phase.Name).NotTo(BeEmpty())
 				g.Expect(got.Status.ObservedGeneration).To(Equal(got.Generation))
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionRouteReady)).To(BeTrue())
+				// And the fold is stated rather than passed over: this one is
+				// lossless, so the environment runs and Accepted reports it.
+				accepted := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(accepted).NotTo(BeNil())
+				g.Expect(accepted.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(accepted.Reason).To(Equal(reasonOverridden))
+				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[0]: ignored"))
 			}, "15s", "200ms").Should(Succeed())
 
 			// Nothing was taken from the user: the repeat's exposure is still
@@ -5666,6 +5746,40 @@ var _ = Describe("DevEnvironment controller", func() {
 				Expect(rule.BackendRefs[0].Port).To(Equal(ptrTo(notebookPort)))
 			}
 			Expect(matched).To(BeTrue(), "the repeat's exposure lost its route")
+		})
+
+		// The fold that is not lossless, driven through the API server: the ssh
+		// bridge publishes 22 and forwards to the sshd on 2222, so an exposure
+		// declaring container port 22 would reach sshd rather than the workload it
+		// named. Resolving that is not the controller's to do — no port carries what
+		// the user asked for — so the environment fails with the entry named, which
+		// is the only place the finding is reported.
+		It("fails an exposure the Service's own entry would answer for", func() {
+			env := validDevEnvironment("de-svc-collide")
+			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testCollidingPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshServicePort},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonPortCollision))
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+				accepted := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(accepted).NotTo(BeNil())
+				g.Expect(accepted.Reason).To(Equal(reasonPortCollision))
+				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[0]: must be updated"))
+				g.Expect(accepted.Message).To(ContainSubstring(fmt.Sprintf("container port %d", sshContainerPort)))
+			}, "15s", "200ms").Should(Succeed())
+
+			sts := &appsv1.StatefulSet{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
 		})
 
 		It("holds a udp port and a tcp port on different numbers", func() {

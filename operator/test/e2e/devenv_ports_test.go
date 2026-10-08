@@ -17,6 +17,7 @@ import (
 	. "github.com/onsi/gomega"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
 	"github.com/suanova/cubestack/test/e2e/devenv"
@@ -63,6 +64,8 @@ const (
 	portHTTP2Container int32 = 8081
 )
 
+// describePorts is family K: the exposures an environment publishes, and the
+// shared pool the L4 ones draw their numbers from.
 func describePorts() {
 	describeExtraPorts()
 	describePoolIsShared()
@@ -93,6 +96,8 @@ func extraPorts(want *aiv1alpha1.DevEnvironment) {
 	}
 }
 
+// describeExtraPorts is K1–K4 and K6: what the exposures an environment
+// declares beyond the notebook and sshd are, and where each is published.
 func describeExtraPorts() {
 	draftCase{
 		Name:     "ports-extra",
@@ -443,6 +448,14 @@ func describeExtraPorts() {
 	// environment with no Service, no pod and no status at all. So the case is
 	// about both halves of the fix: the environment converges, and the exposure
 	// the user asked for is still published.
+	//
+	// This environment's repeat forwards to the container port it declares, which
+	// is the fold that takes nothing from the user. It is reported on Accepted
+	// rather than passed over, and the case asserts that too, because the other
+	// kind of fold — into an entry that forwards somewhere else, which the ssh
+	// bridge always does — is a spec the platform refuses to run at all
+	// (::portCollisionFindings), and a case that read the Service alone could not
+	// tell the two apart.
 	draftCase{
 		Name:     "ports-repeat",
 		Image:    devenv.MustImage("jupyter-minimal"),
@@ -460,6 +473,17 @@ func describeExtraPorts() {
 					// accepted: the environment has a status at all, which is
 					// exactly what the refused Service used to take away.
 					running(ctx, env)
+
+					// The fold is stated, not passed over: an environment that runs
+					// with the controller's value says so, and names the entry.
+					accepted := env.Condition(aiv1alpha1.ConditionAccepted)
+					Expect(accepted).NotTo(BeNil(), "Accepted is not recorded")
+					Expect(accepted.Status).To(Equal(metav1.ConditionTrue),
+						"a folded exposure left Accepted=%s (%s)", accepted.Status, accepted.Reason)
+					Expect(accepted.Reason).To(Equal(devenv.ReasonOverridden),
+						"Accepted reads %q for a spec the controller resolved", accepted.Reason)
+					Expect(accepted.Message).To(ContainSubstring("spec.ports[0]"),
+						"the fold does not name the entry it is about: %s", accepted.Message)
 
 					// The Service carries the notebook's port once — under the
 					// platform's own name, not the exposure's — so the repeat is
