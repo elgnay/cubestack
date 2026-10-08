@@ -2356,10 +2356,25 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 			Ingress:     ingress,
 			Egress: append([]networkingv1.NetworkPolicyEgressRule{
 				{
-					To: []networkingv1.NetworkPolicyPeer{{
-						NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{namespaceNameLabel: "kube-system"}},
-						PodSelector:       &metav1.LabelSelector{MatchLabels: map[string]string{"k8s-app": "kube-dns"}},
-					}},
+					// Port 53 with no peer, because the resolver's address is
+					// the cluster's to choose and no object reports it: the
+					// kubelet's --cluster-dns is what reaches a pod's
+					// resolv.conf, and it names the DNS Service's ClusterIP on
+					// one cluster, a node-local cache's address on the next
+					// (Kubernetes' nodelocaldns answers on 169.254.25.10,
+					// Cilium's on 169.254.20.10, and --localip moves it
+					// anywhere), and nothing stops an operator from setting it
+					// to something else again. A rule peering on the kube-dns
+					// pods — which is what this one used to do — admits no
+					// lookup at all wherever the pod dials a node-local cache
+					// instead, and the environment then starts, serves, and
+					// cannot resolve a single name.
+					//
+					// So the port is the scope here, not the destination. The
+					// cost is small: this platform's other egress rules all
+					// name a peer, and a tenant who could tunnel DNS out
+					// through the cluster resolver could already tunnel it
+					// through the kube-dns pods this rule would otherwise name.
 					Ports: []networkingv1.NetworkPolicyPort{
 						{Protocol: &udp, Port: &dnsPort},
 						{Protocol: &tcp, Port: &dnsPort},
@@ -2381,15 +2396,23 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 // stopped out from under whoever is using it, which is the failure this whole
 // feature exists to avoid.
 //
-// The allowance names the apiserver's address rather than widening to
+// The allowance names the apiserver's addresses rather than widening to
 // 0.0.0.0/0: there is no per-container selector to scope it to the sidecar, so
 // a rule that opened 443 to the world would open it for the environment's own
 // container too, turning every default-deny namespace into an egress-open one
-// for its tenant. The address is the kubernetes Service's ClusterIP, which is
-// where egress policy has to name the apiserver — policy matches the
-// destination before the service translation that would otherwise rewrite it to
-// a node's address, and that ClusterIP is both what the pod's
-// KUBERNETES_SERVICE_HOST says and what its client library dials.
+// for its tenant.
+//
+// It is two addresses because CNIs disagree about whether policy sees an egress
+// packet before or after the service translation that rewrites a ClusterIP to a
+// backend. Filtering before the rewrite — what this rule was first written for
+// — shows the Service's ClusterIP on the Service's own port, which is what the
+// pod's KUBERNETES_SERVICE_HOST and its client library dial. Filtering after
+// it, as Calico does, shows the endpoint on the endpoint's target port instead,
+// and a rule naming only the ClusterIP then admits nothing: every write the
+// agent makes fails, with an i/o timeout, and the feature is dead on that
+// cluster while looking configured. Naming both is what makes the allowance
+// hold on either, and both are the apiserver, so the environment's own
+// container gains no route it would not have had.
 //
 // Every conformant cluster keeps that Service at default/kubernetes; there is
 // no API that reports where it is, so the convention is what this reads. A
@@ -2438,6 +2461,39 @@ func (r *DevEnvironmentReconciler) apiserverEgress(ctx context.Context, env *aiv
 		tcp := corev1.ProtocolTCP
 		port := intstr.FromInt32(svc.Spec.Ports[i].Port)
 		ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &port})
+	}
+	// The endpoints, for the CNIs that filter after the service rewrite (see the
+	// doc comment): the apiserver's real address is there, on the endpoint's
+	// target port rather than the Service's, because the apiserver publishes the
+	// kubernetes service's endpoints itself. A cluster that turns that
+	// reconciler off (--endpoint-reconciler-type=none) never gets one, so a
+	// missing object leaves the ClusterIP allowance above as the whole rule
+	// rather than failing the reconcile.
+	//nolint:staticcheck // Endpoints is deprecated in v1.33+ but still served; it is what the post-DNAT address is read from (design §3.3).
+	endpoints := &corev1.Endpoints{}
+	if err := r.Get(ctx, client.ObjectKey{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault}, endpoints); err != nil && !apierrors.IsNotFound(err) {
+		return nil, fmt.Errorf("reading the apiserver's endpoints for the activity agent: %w", err)
+	}
+	for _, subset := range endpoints.Subsets {
+		// Ready addresses only: a NotReady apiserver is one the agent cannot
+		// use, and admitting it would only turn the timeout into a refusal.
+		for _, address := range subset.Addresses {
+			ip, err := netip.ParseAddr(address.IP)
+			if err != nil {
+				continue
+			}
+			peers = append(peers, networkingv1.NetworkPolicyPeer{
+				IPBlock: &networkingv1.IPBlock{CIDR: netip.PrefixFrom(ip, ip.BitLen()).String()},
+			})
+		}
+		for _, endpointPort := range subset.Ports {
+			protocol := endpointPort.Protocol
+			if protocol == "" {
+				protocol = corev1.ProtocolTCP
+			}
+			port := intstr.FromInt32(endpointPort.Port)
+			ports = append(ports, networkingv1.NetworkPolicyPort{Protocol: &protocol, Port: &port})
+		}
 	}
 	return []networkingv1.NetworkPolicyEgressRule{{To: peers, Ports: ports}}, nil
 }
