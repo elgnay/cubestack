@@ -1004,7 +1004,11 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 
 			// Appended, so DNS stays the first rule an operator reads.
 			Expect(np.Spec.Egress).To(HaveLen(2))
-			Expect(np.Spec.Egress[0].To[0].PodSelector.MatchLabels).To(HaveKeyWithValue("k8s-app", "kube-dns"))
+			// The DNS rule scopes by port and not by peer: where a cluster
+			// resolves is the cluster's to choose, so a peer named here would be
+			// a guess that resolves nothing wherever it guessed wrong.
+			Expect(np.Spec.Egress[0].To).To(BeEmpty())
+			Expect(np.Spec.Egress[0].Ports).To(HaveLen(2))
 			Expect(np.Spec.Egress[1]).To(Equal(agentEgress[0]))
 		})
 
@@ -1036,6 +1040,75 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			// An environment's ports vary by spec.type and spec.ports, so naming
 			// one here would admit it and silently refuse the rest.
 			Expect(r.desiredNetworkPolicy(env, nil).Spec.Ingress[0].Ports).To(BeEmpty())
+		})
+	})
+
+	Describe("apiserverEgress", func() {
+		// An Endpoints is a set: neither its addresses nor its ports carry an
+		// order, so both are listed below in an order the rendered rule must not
+		// inherit. The rule is compared against the live NetworkPolicy to decide
+		// whether to write, and that policy is owned by the environment, so a
+		// render that followed the object would buy an update — and the reconcile
+		// that write enqueues — for the apiserver publishing the same set in a
+		// different order.
+		newReconciler := func() *DevEnvironmentReconciler {
+			scheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+
+			live := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+				&corev1.Service{
+					ObjectMeta: metav1.ObjectMeta{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault},
+					Spec: corev1.ServiceSpec{
+						ClusterIPs: []string{"10.0.0.1"},
+						Ports:      []corev1.ServicePort{{Name: "https", Port: 443, Protocol: corev1.ProtocolTCP}},
+					},
+				},
+				//nolint:staticcheck // Endpoints is deprecated in v1.33+ but still served; it is what the rule reads.
+				&corev1.Endpoints{
+					ObjectMeta: metav1.ObjectMeta{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault},
+					//nolint:staticcheck // The deprecated object's own subset type.
+					Subsets: []corev1.EndpointSubset{{
+						Addresses: []corev1.EndpointAddress{{IP: "10.0.0.9"}, {IP: "10.0.0.3"}},
+						Ports: []corev1.EndpointPort{
+							{Port: 6443, Protocol: corev1.ProtocolTCP},
+							{Port: 5000, Protocol: corev1.ProtocolTCP},
+						},
+					}},
+				},
+			).Build()
+			return &DevEnvironmentReconciler{Client: live}
+		}
+
+		idleEnv := func() *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-egress", Namespace: testNamespace},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Lifecycle: &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600},
+				},
+			}
+		}
+
+		It("renders the apiserver's addresses and ports in a canonical order", func() {
+			rules, err := newReconciler().apiserverEgress(context.Background(), idleEnv())
+			Expect(err).NotTo(HaveOccurred())
+			Expect(rules).To(HaveLen(1))
+
+			tcp := corev1.ProtocolTCP
+			port := func(p int32) *intstr.IntOrString { v := intstr.FromInt32(p); return &v }
+
+			// Ascending, so one set of endpoints always renders one rule. The
+			// ClusterIP and the endpoint addresses are a single list here: which
+			// of them came from which object is not part of the contract.
+			Expect(rules[0].To).To(Equal([]networkingv1.NetworkPolicyPeer{
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.1/32"}},
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.3/32"}},
+				{IPBlock: &networkingv1.IPBlock{CIDR: "10.0.0.9/32"}},
+			}))
+			Expect(rules[0].Ports).To(Equal([]networkingv1.NetworkPolicyPort{
+				{Protocol: &tcp, Port: port(443)},
+				{Protocol: &tcp, Port: port(5000)},
+				{Protocol: &tcp, Port: port(6443)},
+			}))
 		})
 	})
 })
@@ -3177,12 +3250,12 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
-		// The environment's NetworkPolicy is default-deny egress with a single DNS
+		// The environment's NetworkPolicy is default-deny egress with a DNS
 		// allowance, and NetworkPolicy admits traffic per pod rather than per
-		// container. Without this rule the agent's PATCH is dropped, and the agent
-		// deploys, runs, looks healthy and never records anything — the one
-		// failure in this feature that is invisible from every direction.
-		It("admits the activity agent to the apiserver", func() {
+		// container. Without the apiserver rule the agent's PATCH is dropped, and
+		// the agent deploys, runs, looks healthy and never records anything — the
+		// one failure in this feature that is invisible from every direction.
+		It("admits the activity agent to the apiserver, and DNS wherever the cluster resolves", func() {
 			// The suite creates default/kubernetes (suite_test.go); read back the
 			// address it was given rather than naming one, so this asserts the
 			// controller read that Service instead of assuming an address.
@@ -3191,6 +3264,22 @@ var _ = Describe("DevEnvironment controller", func() {
 				client.ObjectKey{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault}, apiserver)).To(Succeed())
 			Expect(netip.MustParseAddr(apiserver.Spec.ClusterIP).Is4()).To(BeTrue(),
 				"envtest allocates an IPv4 service address, which is what the /32 below assumes")
+
+			// The address a CNI that filters after the service rewrite sees in place
+			// of the ClusterIP. Every cluster's kube-apiserver publishes its own
+			// address and port here — envtest's does too, which is why this reads
+			// the object rather than writing one: the test then asserts the rule
+			// against the apiserver the suite is really talking to, on the port it
+			// really listens on.
+			//nolint:staticcheck // Endpoints is deprecated in v1.33+ but still served; it is what the rule reads.
+			endpoints := &corev1.Endpoints{}
+			Expect(k8sClient.Get(ctx,
+				client.ObjectKey{Name: kubernetesServiceName, Namespace: metav1.NamespaceDefault}, endpoints)).To(Succeed())
+			Expect(endpoints.Subsets).To(HaveLen(1))
+			Expect(endpoints.Subsets[0].Addresses).To(HaveLen(1))
+			Expect(endpoints.Subsets[0].Ports).To(HaveLen(1))
+			endpointAddress := endpoints.Subsets[0].Addresses[0].IP
+			endpointPort := endpoints.Subsets[0].Ports[0].Port
 
 			env := validDevEnvironment("de-agent-netpol")
 			env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
@@ -3202,12 +3291,41 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), np)).To(Succeed())
 				// The DNS allowance stays first; the apiserver's is appended.
 				g.Expect(np.Spec.Egress).To(HaveLen(2))
+
+				// The DNS rule names no peer: where a cluster resolves is the
+				// cluster's choice — the DNS Service's ClusterIP, a node-local
+				// cache's address, whatever --cluster-dns says — and a rule
+				// peering on the kube-dns pods admits nothing at all on a
+				// cluster whose pods dial a cache instead. Port 53 is the whole
+				// of the allowance.
+				dns := np.Spec.Egress[0]
+				g.Expect(dns.To).To(BeEmpty())
+				g.Expect(dns.Ports).To(HaveLen(2))
+				g.Expect(*dns.Ports[0].Port).To(Equal(intstr.FromInt32(53)))
+				g.Expect(*dns.Ports[1].Port).To(Equal(intstr.FromInt32(53)))
+
+				// Both addresses the apiserver answers at, on both ports: the
+				// ClusterIP on the Service's port for a CNI that filters before
+				// the service rewrite, the endpoint on its target port for one
+				// that filters after it. Asserted as a set — the controller sorts
+				// both lists so that a reordered Endpoints cannot churn the
+				// render, and which of the two addresses sorts first is a
+				// property of the addresses, not a contract.
 				rule := np.Spec.Egress[1]
-				g.Expect(rule.To).To(Equal([]networkingv1.NetworkPolicyPeer{{
-					IPBlock: &networkingv1.IPBlock{CIDR: apiserver.Spec.ClusterIP + "/32"},
-				}}))
-				g.Expect(rule.Ports).To(HaveLen(1))
-				g.Expect(*rule.Ports[0].Port).To(Equal(intstr.FromInt32(443)))
+				g.Expect(rule.To).To(HaveLen(2))
+				g.Expect(rule.To).To(ContainElement(
+					networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: apiserver.Spec.ClusterIP + "/32"}}))
+				g.Expect(rule.To).To(ContainElement(
+					networkingv1.NetworkPolicyPeer{IPBlock: &networkingv1.IPBlock{CIDR: endpointAddress + "/32"}}))
+
+				tcp := corev1.ProtocolTCP
+				servicePort := intstr.FromInt32(443)
+				apiserverPort := intstr.FromInt32(endpointPort)
+				g.Expect(rule.Ports).To(HaveLen(2))
+				g.Expect(rule.Ports).To(ContainElement(
+					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &servicePort}))
+				g.Expect(rule.Ports).To(ContainElement(
+					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &apiserverPort}))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
