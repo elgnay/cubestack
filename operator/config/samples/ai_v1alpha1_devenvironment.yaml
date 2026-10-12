@@ -21,7 +21,7 @@ spec:
       vendor: nvidia             # nvidia (nvidia.com/gpu) / metax (metax-tech.com/gpu)
       count: 1                   # omit for the default of 1
       # model pins the environment to one model of the vendor above, written the
-      # way that vendor reports it. Left out, any node offering the vendor's
+      # way that vendor advertises it. Left out, any node offering the vendor's
       # accelerator will do. A model written against the wrong vendor names a
       # device no node advertises, and the environment stays Pending.
       # model: H200              # metax models look like MXC550 / MXC500

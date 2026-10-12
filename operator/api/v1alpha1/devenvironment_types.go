@@ -132,10 +132,18 @@ type GPUSpec struct {
 	// model rather than in any platform's own spelling. Omit it to take any node
 	// offering the vendor's accelerator.
 	//
+	// The advertised model is a node label's value, and the field is held to that
+	// shape — a vendor that names a card "MXC 550" advertises it as "MXC-550".
+	// The shape is enforced rather than left to select nothing, because no
+	// cluster could ever satisfy the other one; a model that is valid but absent
+	// is a different matter, and is handled below.
+	//
 	// A model no node offers is a matter of what the cluster has rather than of
 	// what the spec asks for, so the environment stays Pending with the
 	// scheduling failure reported against it — the spec is applied as written.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`
 	// +optional
 	Model string `json:"model,omitempty"`
 

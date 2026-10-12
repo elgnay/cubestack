@@ -344,6 +344,22 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-gpumodel-empty-raw",
 				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["model"] = "" },
 				"spec.resources.gpu.model"),
+			// The model becomes a node selector's value, so it is held to that
+			// shape and a value outside it is refused here rather than accepted
+			// and left to select nothing — no node can advertise it, since the
+			// label itself could not be written. A space is the mistake to write
+			// down: a product name copied out of a datasheet is the input most
+			// likely to carry one.
+			Entry("gpu model that is not a label value",
+				"de-invalid-gpumodel-space-raw",
+				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["model"] = "MXC 550" },
+				"spec.resources.gpu.model"),
+			Entry("gpu model longer than a label value",
+				"de-invalid-gpumodel-long-raw",
+				func(s map[string]any) {
+					s["resources"].(map[string]any)["gpu"].(map[string]any)["model"] = strings.Repeat("A", 64)
+				},
+				"spec.resources.gpu.model"),
 		)
 
 		// Within the block, an omitted vendor and an omitted count are defaulted —
