@@ -13,7 +13,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { CreateOptionsResponse } from "@/app/api/inferenceservices/options/route";
 import type { InferenceServiceSummary } from "@/app/api/inferenceservices/route";
+import { validationMessage, type ValidationErrorBody } from "@/lib/api-error";
 import { apiFetch } from "@/lib/base-path";
+import { copyText } from "@/lib/clipboard";
 import { useI18n } from "@/lib/i18n";
 import { platformPalette, usePlatformTheme } from "@/lib/perses/theme";
 
@@ -196,8 +198,8 @@ export default function InferenceServicesPage() {
         body: JSON.stringify({ namespace: selected.namespace, name: selected.name, overrides }),
       })
         .then(async (res) => {
-          const body = (await res.json().catch(() => ({}))) as { error?: string };
-          if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+          const body = (await res.json().catch(() => ({}))) as ValidationErrorBody;
+          if (!res.ok) throw new Error(validationMessage(t, body, res.status, "inf"));
           setScaleMsg(t("inf.scale.applied"));
           load();
         })
@@ -355,6 +357,7 @@ export default function InferenceServicesPage() {
     <DeployWizard
       key={deployOpen ? "open" : "closed"}
       open={deployOpen}
+      services={items}
       onClose={() => setDeployOpen(false)}
       onCreated={(namespace, name) => {
         selectAfterLoad.current = `${namespace}/${name}`;
@@ -569,7 +572,10 @@ function EndpointsCard({ s }: { s: InferenceServiceSummary }) {
 
 function EndpointRow({ label, value, hint }: { label: string; value: string; hint?: string }) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
+  // idle → ✓ → idle, or idle → failed, which stays long enough to be read: the
+  // Clipboard API does not exist on the plain-HTTP deployment this serves, so
+  // "nothing happened" is not an outcome the button may report as success.
+  const [copied, setCopied] = useState<"idle" | "ok" | "fail">("idle");
   return (
     <Box sx={{ mb: "12px" }}>
       <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px" }}>{label}</Typography>
@@ -578,15 +584,22 @@ function EndpointRow({ label, value, hint }: { label: string; value: string; hin
         {value !== "—" ? (
           <Button
             disableRipple
-            onClick={() => {
-              navigator.clipboard?.writeText(value).then(() => {
-                setCopied(true);
-                setTimeout(() => setCopied(false), 1200);
-              });
+            onClick={async () => {
+              const ok = await copyText(value);
+              setCopied(ok ? "ok" : "fail");
+              setTimeout(() => setCopied("idle"), ok ? 1200 : 4000);
             }}
-            sx={{ p: 0, minWidth: 0, fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--accent-strong)", textTransform: "none", "&:hover": { textDecoration: "underline" } }}
+            sx={{
+              p: 0,
+              minWidth: 0,
+              fontSize: 11,
+              fontFamily: "var(--font-mono)",
+              color: copied === "fail" ? STATUS_ERR : "var(--accent-strong)",
+              textTransform: "none",
+              "&:hover": { textDecoration: "underline" },
+            }}
           >
-            {copied ? "✓" : t("inf.endpoints.copy")}
+            {copied === "ok" ? "✓" : copied === "fail" ? t("dev.conn.copyFailed") : t("inf.endpoints.copy")}
           </Button>
         ) : null}
       </Box>
@@ -918,10 +931,13 @@ type OverrideDecl = CreateOptionsResponse["profiles"][number]["overrides"][numbe
 
 function DeployWizard({
   open,
+  services,
   onClose,
   onCreated,
 }: {
   open: boolean;
+  /** What exists now, for the name check step 1 makes against the namespace. */
+  services: InferenceServiceSummary[];
   onClose: () => void;
   onCreated: (namespace: string, name: string) => void;
 }) {
@@ -983,8 +999,16 @@ function DeployWizard({
   const setField = <K extends keyof DeployDraft>(key: K, value: DeployDraft[K]) =>
     setDraft((prev) => ({ ...prev, [key]: value }));
 
+  // The field's message promises an already-taken check, so it makes one: the
+  // namespace's services are already in hand (the table behind this dialog renders
+  // them). The same name in another namespace is a different service. Losing the
+  // race is still the server's to report — it answers `nameTaken`.
+  const nameTaken = services.some(
+    (s) => s.namespace === draft.namespace && s.name === draft.name.trim(),
+  );
   const nameValid = DNS_LABEL_RE.test(draft.name.trim());
-  const step1Valid = nameValid && draft.name.trim().length > 0 && !!draft.namespace && !!draft.profileRef;
+  const step1Valid =
+    nameValid && !nameTaken && draft.name.trim().length > 0 && !!draft.namespace && !!draft.profileRef;
   const step2Valid = !!draft.modelRef;
 
   // Default override value, or the declared default.
@@ -1003,7 +1027,7 @@ function DeployWizard({
   const next = () => {
     if (step === 1) {
       if (!step1Valid) {
-        setNameError(!nameValid);
+        setNameError(!nameValid || nameTaken);
         return;
       }
       setNameError(false);
@@ -1037,8 +1061,8 @@ function DeployWizard({
       body: JSON.stringify(body),
     })
       .then(async (res) => {
-        const data = (await res.json().catch(() => ({}))) as { error?: string; name?: string };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        const data = (await res.json().catch(() => ({}))) as ValidationErrorBody & { name?: string };
+        if (!res.ok) throw new Error(validationMessage(t, data, res.status, "inf"));
         onCreated(draft.namespace, data.name ?? draft.name.trim());
       })
       .catch((err: Error) => setCreateError(err.message))

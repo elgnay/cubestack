@@ -16,10 +16,12 @@ const OPTIONS = {
   // first entry: project-a sorts first here, and is not the answer.
   defaultNamespace: "default",
   images: [
-    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100, interface: "jupyter" },
-    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
-    { tag: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest", label: "suanova/jupyter-cuda-pytorch · NVIDIA CUDA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter" },
-    { tag: "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest", label: "suanova/ssh-maca-pytorch · Metax MACA · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100, interface: "jupyter", vendor: "cpu" },
+    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "cpu" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest", label: "suanova/jupyter-cuda-pytorch · NVIDIA CUDA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter", vendor: "nvidia" },
+    { tag: "harbor.isuanova.com/suanova/ssh-cuda-pytorch:latest", label: "suanova/ssh-cuda-pytorch · NVIDIA CUDA · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "nvidia" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-maca-pytorch:latest", label: "suanova/jupyter-maca-pytorch · Metax MACA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter", vendor: "metax" },
+    { tag: "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest", label: "suanova/ssh-maca-pytorch · Metax MACA · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "metax" },
   ],
 };
 
@@ -143,6 +145,113 @@ describe("dev environments page", () => {
     expect(container.textContent).toContain("500Gi · 按运行身份自动派生");
     expect(container.textContent).toContain("shared-models → /models (只读)");
     expect(container.textContent).toContain("debug:9229/tcp");
+
+    act(() => root.unmount());
+  });
+
+  it("reads each condition's status as text, not as the colour of a dot", async () => {
+    stubData([
+      devEnvironmentSummary({
+        name: "half-broken-env",
+        conditions: [
+          { type: "Accepted", status: "True", reason: "Accepted", message: "" },
+          { type: "RouteReady", status: "True", reason: "Published", message: "" },
+          { type: "PodScheduled", status: "True", reason: "Scheduled", message: "" },
+          { type: "Ready", status: "False", reason: "Running", message: "Environment pod is running but not ready" },
+        ],
+      }),
+    ]);
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    // The status is the whole point of the row and it used to be carried by a 6px
+    // dot alone: `Ready=False` and `Ready=True` rendered as the same word.
+    expect(container.querySelector('[data-od-id="cond-Ready"]')?.textContent).toBe("ReadyFalse");
+    expect(container.querySelector('[data-od-id="cond-Accepted"]')?.textContent).toBe("AcceptedTrue");
+
+    // The dot decorates text that already says it, so it is hidden from a screen
+    // reader rather than left as an unlabelled colour.
+    const dot = container.querySelector('[data-od-id="cond-Ready"] span');
+    expect(dot?.getAttribute("aria-hidden")).toBe("true");
+    expect(dot?.getAttribute("aria-label")).toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("prints the reason and message of a condition that is not True", async () => {
+    stubData([
+      devEnvironmentSummary({
+        name: "half-broken-env",
+        conditions: [
+          { type: "Accepted", status: "True", reason: "Accepted", message: "" },
+          // The sentence the object carries for the 503 this environment serves,
+          // and the remediation the brand gate carries. Both were unreachable
+          // from the console.
+          { type: "Ready", status: "False", reason: "Running", message: "Environment pod is running but not ready" },
+          { type: "BrandOk", status: "False", reason: "BrandMismatch", message: 'image "x" does not match gpu.vendor metax' },
+        ],
+      }),
+    ]);
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    expect(container.querySelector('[data-od-id="cond-note-Ready"]')?.textContent).toBe(
+      "Ready (Running): Environment pod is running but not ready",
+    );
+    expect(container.querySelector('[data-od-id="cond-note-BrandOk"]')?.textContent).toBe(
+      'BrandOk (BrandMismatch): image "x" does not match gpu.vendor metax',
+    );
+    // A True condition has nothing to explain, so it takes no line of its own —
+    // its reason is still reachable on hover, which is where every condition's
+    // own sentence lives.
+    expect(container.querySelector('[data-od-id="cond-note-Accepted"]')).toBeNull();
+    expect(container.querySelector('[data-od-id="cond-Accepted"]')?.getAttribute("title")).toBe("Accepted True (Accepted)");
+    expect(container.querySelector('[data-od-id="cond-Ready"]')?.getAttribute("title")).toBe(
+      "Ready False (Running) Environment pod is running but not ready",
+    );
+
+    act(() => root.unmount());
+  });
+
+  it("confirms a copy it made, and reports one it could not make", async () => {
+    stubData(devEnvironmentList());
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    // The deployment this portal serves is plain HTTP, where the Clipboard API
+    // does not exist and `document.execCommand` is the only mechanism there is.
+    // The button may not report a copy that did not happen.
+    Object.defineProperty(navigator, "clipboard", { value: undefined, configurable: true, writable: true });
+    let outcome = true;
+    let copies = 0;
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      writable: true,
+      value: () => {
+        copies += 1;
+        return outcome;
+      },
+    });
+
+    const copyBtn = () =>
+      Array.from(container.querySelectorAll("button")).find((b) =>
+        ["复制", "已复制", "复制失败,请手动选择文本"].includes(b.textContent ?? ""),
+      ) as HTMLElement;
+
+    await act(async () => {
+      copyBtn().click();
+    });
+    expect(copies).toBe(1);
+    expect(copyBtn().textContent).toBe("已复制");
+
+    // ...and when neither path can copy, it says so rather than silently doing
+    // nothing — which is what the optional-chained call did on cs7.
+    outcome = false;
+    await act(async () => {
+      copyBtn().click();
+    });
+    expect(copies).toBe(2);
+    expect(copyBtn().textContent).toBe("复制失败,请手动选择文本");
 
     act(() => root.unmount());
   });
@@ -479,16 +588,23 @@ describe("create wizard", () => {
     document.body.innerHTML = "";
   });
 
-  function renderWithBoth() {
+  /**
+   * Render the page with both options endpoints stubbed. `rejectCreate` stands in
+   * for a create the route refuses: the portal must render whatever it answers.
+   */
+  function renderWithBoth(rejectCreate?: { status: number; body: unknown }) {
     vi.stubGlobal(
       "fetch",
-      vi.fn((input: RequestInfo | URL) => {
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
         const url = String(input);
         if (url.includes("/options")) {
           return Promise.resolve({ ok: true, status: 200, json: async () => OPTIONS });
         }
         if (url.includes("/ssh-keys")) {
           return Promise.resolve({ ok: true, status: 200, json: async () => SSH_KEYS });
+        }
+        if (rejectCreate && init?.method === "POST") {
+          return Promise.resolve({ ok: false, status: rejectCreate.status, json: async () => rejectCreate.body });
         }
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ items: devEnvironmentList() }) });
       }),
@@ -605,6 +721,33 @@ describe("create wizard", () => {
   /** The image combobox's text box, on step 1. */
   function imageInput(): HTMLInputElement {
     return document.body.querySelector('[data-od-id="wizard-image"] input') as HTMLInputElement;
+  }
+
+  /** One of step 1's type buttons, by its visible name. */
+  async function clickType(name: string) {
+    await act(async () => {
+      const btn = Array.from(document.body.querySelectorAll('[data-step="1"] button')).find(
+        (b) => b.firstElementChild?.textContent === name,
+      ) as HTMLElement;
+      expect(btn).toBeTruthy();
+      btn.click();
+    });
+  }
+
+  /** The references the image combobox offers, in order, with its list opened. */
+  async function offeredImageTags(): Promise<string[]> {
+    await act(async () => {
+      imageInput().dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    });
+    const tags = Array.from(document.body.querySelectorAll('[role="option"]')).map(
+      // The option reads as the human label over the reference; the reference is
+      // what the wizard writes to spec.image.
+      (o) => o.querySelector("span")?.textContent ?? "",
+    );
+    await act(async () => {
+      imageInput().dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
+    return tags;
   }
 
   /** Step 3's workspace mount path — empty means "derive it from the identity". */
@@ -974,6 +1117,87 @@ describe("create wizard", () => {
     act(() => root.unmount());
   });
 
+  it("refuses a name already taken in the selected namespace, and only there", async () => {
+    // The list the dialog is opened from is the list the check reads: a name that
+    // exists in project-a cannot be created in project-a, while the same name in
+    // another namespace is a different environment and is no clash at all.
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // Same name as the fixture environment, which lives in project-a.
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-namespace"] [role="combobox"]') as HTMLElement).dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true }),
+      );
+    });
+    const projectA = Array.from(document.body.querySelectorAll('[role="option"]')).find((o) => o.textContent === "project-a");
+    await act(async () => {
+      (projectA as HTMLElement).click();
+    });
+    const nameInput = document.body.querySelector('input[placeholder="e.g. jupyter-nlp-ln"]') as HTMLInputElement;
+    setInput(nameInput, "jupyter-nlp-ln");
+    await nextStep();
+
+    // Step 1 holds, and says why.
+    expect(document.body.querySelector('[data-step="2"]')).toBeNull();
+    expect(document.body.querySelector('[data-od-id="field-error"]')?.textContent).toBe("名称不合法或已被占用。");
+
+    // The same name under another namespace goes through.
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-namespace"] [role="combobox"]') as HTMLElement).dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true }),
+      );
+    });
+    const def = Array.from(document.body.querySelectorAll('[role="option"]')).find((o) => o.textContent === "default");
+    await act(async () => {
+      (def as HTMLElement).click();
+    });
+    await nextStep();
+    expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("renders a refusal the route sent as a code, in the user's language", async () => {
+    // The route answers with `{ error: "nameTaken", params: { name } }` and no
+    // prose of its own, so the sentence below comes from the console's
+    // dictionary — which is the only place a user-facing string can come from.
+    const { container, root } = renderWithBoth({ status: 400, body: { error: "nameTaken", params: { name: "my-env" } } });
+    await act(async () => {});
+    await toStep3(container);
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    const shown = document.body.querySelector('[data-od-id="create-error"]') as HTMLElement;
+    expect(shown.textContent).toBe("创建失败: 环境 'my-env' 已存在。");
+
+    act(() => root.unmount());
+  });
+
+  it("names a code it has no sentence for, rather than inventing one", async () => {
+    // Version skew: this bundle predates the route. A bare code still names what
+    // was refused; "HTTP 400" names nothing.
+    const { container, root } = renderWithBoth({ status: 400, body: { error: "someFutureRefusal" } });
+    await act(async () => {});
+    await toStep3(container);
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    expect((document.body.querySelector('[data-od-id="create-error"]') as HTMLElement).textContent).toContain("someFutureRefusal");
+
+    act(() => root.unmount());
+  });
+
   it("asks for root as uid 0 alone, with no account", async () => {
     const { container, root } = renderWithBoth();
     await act(async () => {});
@@ -1213,6 +1437,128 @@ describe("create wizard", () => {
     act(() => root.unmount());
   });
 
+  it("says why an empty image blocks the step instead of refusing silently", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+    setInput(document.body.querySelector('input[placeholder="e.g. jupyter-nlp-ln"]') as HTMLInputElement, "r2-web");
+    await act(async () => {});
+
+    // Clearing the field — what its own clear button does before a new reference
+    // is typed — used to leave Next doing nothing at all: no message, no error
+    // colour, and no way to learn what was missing.
+    setInput(imageInput(), "");
+    await act(async () => {});
+    await nextStep();
+
+    expect(document.body.querySelector('[data-step="2"]')).toBeNull();
+    // The name and the namespace are filled here, so the image is the only field
+    // that can be complaining.
+    const err = document.body.querySelector('[data-od-id="field-error"]');
+    expect(err?.textContent).toBe("请填写开发镜像地址,或从平台内置镜像中选择。");
+    // Announced, not only painted.
+    expect(err?.getAttribute("role")).toBe("alert");
+
+    // A reference of any kind clears it, and the step advances.
+    setInput(imageInput(), "busybox:latest");
+    await act(async () => {});
+    await nextStep();
+    expect(document.body.querySelector('[data-step="2"]')).not.toBeNull();
+    expect(document.body.querySelector('[data-od-id="field-error"]')).toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("offers only the environment types the platform can serve", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // `vscode` is a legal spec.type that nothing publishes an image for:
+    // mainContainerPort maps it to 8080, and neither the readiness probe nor the
+    // Service can be satisfied because no shipped image binds that port. Offering
+    // the type would be offering a spec the platform cannot honour — a 0/1 pod
+    // behind a route that reports RouteReady=True and answers 503.
+    // The type cards are the buttons carrying a description line (the image
+    // combobox's own clear button sits in the same step).
+    const types = Array.from(document.body.querySelectorAll('[data-step="1"] button'))
+      .filter((b) => b.querySelector("span"))
+      .map((b) => b.firstElementChild?.textContent ?? "");
+    expect(types).toEqual(["JupyterLab", "SSH"]);
+    expect(document.body.textContent).not.toContain("VS Code");
+
+    act(() => root.unmount());
+  });
+
+  it("offers only the images that serve the chosen type", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // The wizard opens on the first catalog image — jupyter-minimal, which serves
+    // the jupyter type it also opens on — and the list holds only jupyter images.
+    expect(imageInput().value).toBe("harbor.isuanova.com/suanova/jupyter-minimal:latest");
+    expect(await offeredImageTags()).toEqual([
+      "harbor.isuanova.com/suanova/jupyter-minimal:latest",
+      "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest",
+      "harbor.isuanova.com/suanova/jupyter-maca-pytorch:latest",
+    ]);
+
+    // SSH is served by the other three, and nothing mixes the two: an ssh image
+    // under type jupyter runs sshd with nothing serving the token the operator
+    // publishes for it, which is the environment the type is supposed to describe.
+    await clickType("SSH");
+    expect(await offeredImageTags()).toEqual([
+      "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest",
+      "harbor.isuanova.com/suanova/ssh-cuda-pytorch:latest",
+      "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest",
+    ]);
+
+    act(() => root.unmount());
+  });
+
+  it("keeps the accelerator when the type changes", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // The two images of a stack differ only in the mode baked into them, so a
+    // CUDA environment moved to ssh lands on the CUDA ssh image. Following the
+    // type alone would put it on the CPU image, which the operator refuses as a
+    // brand mismatch (Accepted=False / BrandMismatch) — the same dead end
+    // reached by a different route.
+    setInput(imageInput(), "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest");
+    await act(async () => {});
+    await clickType("SSH");
+    expect(imageInput().value).toBe("harbor.isuanova.com/suanova/ssh-cuda-pytorch:latest");
+    // ...and the identity follows the image, since ubuntu/1000 is the shipped
+    // account rather than whatever the previous image implied.
+    expect(document.body.textContent).not.toContain("与当前环境类型不一致");
+
+    // A reference the platform does not publish is not the catalog's to replace:
+    // it is left exactly as typed, and nothing is claimed about what it serves,
+    // since only the catalog knows an image's interface.
+    setInput(imageInput(), "busybox:latest");
+    await act(async () => {});
+    await clickType("SSH");
+    expect(imageInput().value).toBe("busybox:latest");
+    expect(document.body.textContent).not.toContain("与当前环境类型不一致");
+
+    act(() => root.unmount());
+  });
+
   it("says when the chosen image does not serve the chosen type", async () => {
     const { container, root } = renderWithBoth();
     await act(async () => {});
@@ -1227,21 +1573,14 @@ describe("create wizard", () => {
     // An ssh image under the jupyter type is the combination the per-interface
     // vendor pairs make expressible, and the one nothing can serve: the
     // operator would publish a jupyter token for an image whose sshd is all
-    // that starts.
-    setInput(
-      document.body.querySelector('[data-od-id="wizard-image"] input') as HTMLInputElement,
-      "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest",
-    );
+    // that starts. The list no longer offers it, so the user has to type it —
+    // which is exactly the case the hint is for.
+    setInput(imageInput(), "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest");
     await act(async () => {});
     expect(document.body.textContent).toContain("与当前环境类型不一致");
 
     // Choosing the type the image was built for settles it.
-    await act(async () => {
-      const sshType = Array.from(document.body.querySelectorAll('[data-step="1"] button')).find((b) =>
-        b.textContent?.startsWith("SSH"),
-      ) as HTMLElement;
-      sshType.click();
-    });
+    await clickType("SSH");
     expect(document.body.textContent).not.toContain("与当前环境类型不一致");
 
     act(() => root.unmount());

@@ -13,12 +13,12 @@ const OPTIONS = {
   // though project-a sorts first, which is the point of the field.
   defaultNamespace: "default",
   images: [
-    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100, interface: "jupyter" },
-    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
-    { tag: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest", label: "suanova/jupyter-cuda-pytorch · NVIDIA CUDA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter" },
-    { tag: "harbor.isuanova.com/suanova/ssh-cuda-pytorch:latest", label: "suanova/ssh-cuda-pytorch · NVIDIA CUDA · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
-    { tag: "harbor.isuanova.com/suanova/jupyter-maca-pytorch:latest", label: "suanova/jupyter-maca-pytorch · Metax MACA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter" },
-    { tag: "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest", label: "suanova/ssh-maca-pytorch · Metax MACA · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100, interface: "jupyter", vendor: "cpu" },
+    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "cpu" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest", label: "suanova/jupyter-cuda-pytorch · NVIDIA CUDA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter", vendor: "nvidia" },
+    { tag: "harbor.isuanova.com/suanova/ssh-cuda-pytorch:latest", label: "suanova/ssh-cuda-pytorch · NVIDIA CUDA · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "nvidia" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-maca-pytorch:latest", label: "suanova/jupyter-maca-pytorch · Metax MACA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter", vendor: "metax" },
+    { tag: "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest", label: "suanova/ssh-maca-pytorch · Metax MACA · SSH (ubuntu)", user: "ubuntu", interface: "ssh", vendor: "metax" },
   ],
 };
 
@@ -394,5 +394,47 @@ test.describe("dev environments landing (mocked data)", () => {
     for (const key of ["mountPath", "volumes", "env", "command", "args", "ports"]) {
       expect(posts[0]).not.toHaveProperty(key);
     }
+  });
+});
+
+test.describe("platform chrome", () => {
+  test("paints a ?theme= override before hydration and keeps it", async ({ page }) => {
+    // The root layout's inline script stamps `?theme=` before the first paint and
+    // never writes it to localStorage — so a console that derives the theme from
+    // storage on mount paints the override away again a few milliseconds later
+    // (measured on cs7, `?theme=dark` with nothing stored: dark at 1ms, light at
+    // 3ms). Recording every write to the attribute is the only way to see that
+    // from the outside.
+    await page.addInitScript(() => {
+      const writes: string[] = [];
+      (window as unknown as { themeWrites: string[] }).themeWrites = writes;
+      new MutationObserver((records) => {
+        for (const record of records) {
+          if (record.attributeName === "data-theme") writes.push((record.target as HTMLElement).dataset.theme ?? "");
+        }
+      }).observe(document, { attributes: true, subtree: true, attributeFilter: ["data-theme"] });
+    });
+    await stubList(page, { items: devEnvironmentList() });
+    // pinLocale stores `light`, so the override has something to win against.
+    await page.goto("/cubestack/dev-environments?theme=dark");
+
+    // The bootstrap writes once; every component that reads the theme re-stamps
+    // it on mount, which is a write of the same value. Waiting for that second
+    // write is what makes the assertions below about the console and not about
+    // the pre-hydration paint they would otherwise race.
+    await expect
+      .poll(() => page.evaluate(() => (window as unknown as { themeWrites: string[] }).themeWrites.length))
+      .toBeGreaterThan(1);
+
+    // The mounted console must leave the override alone. Read from storage
+    // instead, this is `light` — the theme pinLocale stored — which is the whole
+    // defect: the override is stamped for a paint or two and then written over.
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+    const writes = await page.evaluate(() => (window as unknown as { themeWrites: string[] }).themeWrites);
+    expect([...new Set(writes)]).toEqual(["dark"]);
+
+    // ...and the toggle still answers, from an overridden first paint.
+    await page.locator('[data-od-id="theme-toggle"]').click();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "light");
   });
 });

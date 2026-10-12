@@ -36,7 +36,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { DevEnvironmentSummary } from "@/app/api/devenvironments/route";
 import type { DevEnvImageOption, DevEnvOptionsResponse } from "@/app/api/devenvironments/options/route";
 import type { SshKeySecretOption } from "@/app/api/devenvironments/ssh-keys/route";
+import { validationMessage, type ValidationErrorBody } from "@/lib/api-error";
 import { apiFetch } from "@/lib/base-path";
+import { copyText } from "@/lib/clipboard";
 import { PLATFORM_GID, PLATFORM_UID, PLATFORM_USER } from "@/lib/devenvironments/images";
 import { useI18n } from "@/lib/i18n";
 
@@ -243,8 +245,8 @@ export default function DevEnvironmentsPage() {
         body: JSON.stringify({ namespace: e.namespace, name: e.name }),
       })
         .then(async (res) => {
-          const body = (await res.json().catch(() => ({}))) as { error?: string };
-          if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+          const body = (await res.json().catch(() => ({}))) as ValidationErrorBody;
+          if (!res.ok) throw new Error(validationMessage(t, body, res.status, "dev"));
           load();
         })
         .catch((err: Error) => window.alert(err.message));
@@ -259,13 +261,13 @@ export default function DevEnvironmentsPage() {
         body: JSON.stringify({ namespace, name, running }),
       })
         .then(async (res) => {
-          const body = (await res.json().catch(() => ({}))) as { error?: string };
-          if (!res.ok) throw new Error(body.error ?? `HTTP ${res.status}`);
+          const body = (await res.json().catch(() => ({}))) as ValidationErrorBody;
+          if (!res.ok) throw new Error(validationMessage(t, body, res.status, "dev"));
           load();
         })
         .catch((err: Error) => window.alert(err.message));
     },
-    [load],
+    [load, t],
   );
 
   return (
@@ -399,6 +401,7 @@ export default function DevEnvironmentsPage() {
       <CreateWizard
         key={wizardOpen ? "open" : "closed"}
         open={wizardOpen}
+        environments={items}
         onClose={() => setWizardOpen(false)}
         onCreated={(namespace, name) => {
           selectAfterLoad.current = `${namespace}/${name}`;
@@ -685,7 +688,11 @@ function Kvs({ rows }: { rows: Array<[string, string]> }) {
 
 function EndpointRow({ label, value }: { label: string; value: string }) {
   const { t } = useI18n();
-  const [copied, setCopied] = useState(false);
+  // idle → copied → idle, or idle → failed, which stays long enough to be read
+  // and to be retried by hand: the clipboard is unavailable on the plain-HTTP
+  // deployment this serves, so a silent no-op is the one outcome a copy button
+  // may not have.
+  const [copied, setCopied] = useState<"idle" | "ok" | "fail">("idle");
   return (
     <Box sx={{ mb: "12px" }}>
       <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px" }}>{label}</Typography>
@@ -693,15 +700,22 @@ function EndpointRow({ label, value }: { label: string; value: string }) {
         <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1, minWidth: 0 }}>{value}</Box>
         <Button
           disableRipple
-          onClick={() => {
-            navigator.clipboard?.writeText(value).then(() => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1200);
-            });
+          onClick={async () => {
+            const ok = await copyText(value);
+            setCopied(ok ? "ok" : "fail");
+            setTimeout(() => setCopied("idle"), ok ? 1200 : 4000);
           }}
-          sx={{ p: 0, minWidth: 0, fontSize: 11, fontFamily: "var(--font-mono)", color: "var(--accent-strong)", textTransform: "none", "&:hover": { textDecoration: "underline" } }}
+          sx={{
+            p: 0,
+            minWidth: 0,
+            fontSize: 11,
+            fontFamily: "var(--font-mono)",
+            color: copied === "fail" ? STATUS_ERR : "var(--accent-strong)",
+            textTransform: "none",
+            "&:hover": { textDecoration: "underline" },
+          }}
         >
-          {copied ? t("dev.conn.copied") : t("dev.conn.copy")}
+          {copied === "ok" ? t("dev.conn.copied") : copied === "fail" ? t("dev.conn.copyFailed") : t("dev.conn.copy")}
         </Button>
       </Box>
     </Box>
@@ -813,53 +827,83 @@ function SpecCard({ e }: { e: DevEnvironmentSummary }) {
   return (
     <Card title={t("dev.spec.title")} meta={t("dev.spec.meta")}>
       <Kvs rows={rows} />
-      <Box sx={{ display: "flex", gap: "8px", flexWrap: "wrap", px: "18px", py: "12px", borderTop: 1, borderColor: "divider" }}>
+      <Box sx={{ display: "flex", flexDirection: "column", gap: "8px", px: "18px", py: "12px", borderTop: 1, borderColor: "divider" }}>
         {e.conditions.length === 0 ? (
           <Typography data-od-id="env-conds-empty" sx={{ fontSize: 12, color: "text.secondary" }}>{t("dev.cond.empty")}</Typography>
         ) : (
-          e.conditions.map((c) => {
-            // Green only for an observed True condition; False (a real failure
-            // or an expected non-ready state like a stopped Ready) and Unknown
-            // (pending) get distinct non-success styling.
-            const cls = c.status === "True" ? "ok" : c.status === "Unknown" ? "pending" : "err";
-            const [chip, dot] =
-              cls === "ok"
-                ? [STATUS_OK, STATUS_OK]
-                : cls === "pending"
-                  ? [STATUS_WARN, STATUS_WARN]
-                  : [soft(STATUS_ERR, 55), STATUS_ERR];
-            return (
-              <Box
-                key={c.type}
-                data-od-id={`cond-${c.type}`}
-                component="span"
-                sx={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "6px",
-                  px: "9px",
-                  py: "2px",
-                  borderRadius: 999,
-                  fontSize: 12,
-                  bgcolor: cls === "ok" ? soft(STATUS_OK) : soft(chip),
-                  color: cls === "ok" ? "inherit" : `color-mix(in oklch, ${chip} 66%, var(--fg))`,
-                  whiteSpace: "nowrap",
-                }}
-              >
-                <Box
-                  component="span"
-                  sx={{
-                    width: 6,
-                    height: 6,
-                    borderRadius: "50%",
-                    bgcolor: dot,
-                    flex: "none",
-                  }}
-                />
-                {c.type}
-              </Box>
-            );
-          })
+          <>
+            <Box sx={{ display: "flex", gap: "8px", flexWrap: "wrap" }}>
+              {e.conditions.map((c) => {
+                // Green only for an observed True condition; False (a real failure
+                // or an expected non-ready state like a stopped Ready) and Unknown
+                // (pending) get distinct non-success styling.
+                const cls = c.status === "True" ? "ok" : c.status === "Unknown" ? "pending" : "err";
+                const [chip, dot] =
+                  cls === "ok"
+                    ? [STATUS_OK, STATUS_OK]
+                    : cls === "pending"
+                      ? [STATUS_WARN, STATUS_WARN]
+                      : [soft(STATUS_ERR, 55), STATUS_ERR];
+                // The object's own sentence about this condition, in the shape
+                // `kubectl describe` prints it. It is the diagnosis for whatever
+                // the environment is doing wrong — a Ready=False reads "the pod
+                // is running but not ready", which is what a 503 from the route
+                // means — and until now nothing in the console reached it.
+                const detail = [c.reason ? `(${c.reason})` : "", c.message].filter(Boolean).join(" ");
+                return (
+                  <Box
+                    key={c.type}
+                    data-od-id={`cond-${c.type}`}
+                    component="span"
+                    // A hover on the pill answers for every condition, including
+                    // the True ones, which carry no line of their own.
+                    title={detail ? `${c.type} ${c.status} ${detail}` : undefined}
+                    sx={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      px: "9px",
+                      py: "2px",
+                      borderRadius: 999,
+                      fontSize: 12,
+                      bgcolor: cls === "ok" ? soft(STATUS_OK) : soft(chip),
+                      color: cls === "ok" ? "inherit" : `color-mix(in oklch, ${chip} 66%, var(--fg))`,
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    <Box
+                      component="span"
+                      // Decorative once the status is text beside it: hue was the
+                      // only carrier, which reads as nothing to a screen reader and
+                      // little to a colour-blind one.
+                      aria-hidden="true"
+                      sx={{
+                        width: 6,
+                        height: 6,
+                        borderRadius: "50%",
+                        bgcolor: dot,
+                        flex: "none",
+                      }}
+                    />
+                    {c.type}
+                    {/* The status itself, as the object states it. It is a
+                        Kubernetes enum, so it reads the same in every locale —
+                        the way an unrecognised phase already does. */}
+                    <Box component="span" sx={{ fontWeight: 600, opacity: 0.75 }}>{c.status}</Box>
+                  </Box>
+                );
+              })}
+            </Box>
+            {e.conditions
+              .filter((c) => c.status !== "True" && (c.reason || c.message))
+              .map((c) => (
+                <Typography key={c.type} data-od-id={`cond-note-${c.type}`} sx={{ fontSize: 11.5, color: "text.secondary", lineHeight: 1.6 }}>
+                  <Box component="span" sx={{ fontFamily: "var(--font-mono)" }}>{c.type}</Box>
+                  {c.reason ? <Box component="span" sx={{ fontFamily: "var(--font-mono)" }}>{` (${c.reason})`}</Box> : null}
+                  {c.message ? `: ${c.message}` : ""}
+                </Typography>
+              ))}
+          </>
         )}
       </Box>
     </Card>
@@ -893,6 +937,16 @@ const IDLE_TIMEOUT_MAX = 2147483647;
 const ENV_NAME_RE = /^[-._a-zA-Z][-._a-zA-Z0-9]*$/;
 const PORT_TYPES = ["http", "tcp", "udp"] as const;
 type PortType = (typeof PORT_TYPES)[number];
+
+// The types the wizard offers, which is not the CRD's enum: `vscode` is a legal
+// spec.type the platform cannot serve. mainContainerPort maps it to 8080 and the
+// readiness probe and the Service both target that port, but no published image
+// binds it — the catalog is jupyter (8888) and ssh images, so a `vscode`
+// environment is created 0/1 with a route that 503s while reporting
+// RouteReady=True. Offering it would be offering a spec the platform cannot
+// honour, so it is dropped here rather than left as a trap; the CRD keeps the
+// value, and an object applied by hand still renders with its own badge.
+const WIZARD_TYPES = ["jupyter", "ssh"] as const;
 
 // The repeatable rows of step 3. Each carries an id so a deletion addresses the
 // row by identity rather than by an index captured when the row was rendered.
@@ -996,10 +1050,13 @@ function identityOf(image: DevEnvImageOption | undefined) {
 
 function CreateWizard({
   open,
+  environments,
   onClose,
   onCreated,
 }: {
   open: boolean;
+  /** What exists now, for the name check step 1 makes against the namespace. */
+  environments: DevEnvironmentSummary[];
   onClose: () => void;
   onCreated: (namespace: string, name: string) => void;
 }) {
@@ -1046,6 +1103,7 @@ function CreateWizard({
   const [sshSecretsLoading, setSshSecretsLoading] = useState(false);
   const [sshSecretsError, setSshSecretsError] = useState<string | null>(null);
   const [nameError, setNameError] = useState(false);
+  const [imageError, setImageError] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
 
@@ -1166,8 +1224,18 @@ function CreateWizard({
       tag === prev.image ? prev : { ...prev, image: tag, ...identityOf(options?.images.find((i) => i.tag === tag)) },
     );
 
+  // The name is checked against the target namespace's existing environments, not
+  // only against the DNS-1123 pattern: the field's own message promises an
+  // already-taken check ("Invalid or already-taken name"), and the list is already
+  // in hand — the table behind this dialog renders it. Same name in another
+  // namespace is a different environment and is not a clash. This is a
+  // convenience: an environment created by someone else in the meantime is still
+  // the server's to refuse, and its `nameTaken` is what the user then reads.
+  const nameTaken = environments.some(
+    (e) => e.namespace === draft.namespace && e.name === draft.name.trim(),
+  );
   const nameValid = DNS_LABEL_RE.test(draft.name.trim()) && draft.name.trim().length > 0;
-  const step1Valid = nameValid && !!draft.namespace && !!draft.image;
+  const step1Valid = nameValid && !nameTaken && !!draft.namespace && !!draft.image;
   // Client-side validation mirrors the server (POST) rules so a user cannot
   // advance or submit out-of-range / fractional GPU or storage values. A card
   // count is only asked for, and only checked, when an accelerator is wanted:
@@ -1248,10 +1316,12 @@ function CreateWizard({
   const next = () => {
     if (step === 1) {
       if (!step1Valid) {
-        setNameError(!nameValid);
+        setNameError(!nameValid || nameTaken);
+        setImageError(!draft.image);
         return;
       }
       setNameError(false);
+      setImageError(false);
     } else if (step === 2) {
       setGpuError(!gpuValid);
       setStorageError(!storageValid);
@@ -1353,8 +1423,8 @@ function CreateWizard({
       body: JSON.stringify(body),
     })
       .then(async (res) => {
-        const data = (await res.json().catch(() => ({}))) as { error?: string; name?: string };
-        if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+        const data = (await res.json().catch(() => ({}))) as ValidationErrorBody & { name?: string };
+        if (!res.ok) throw new Error(validationMessage(t, data, res.status, "dev"));
         onCreated(draft.namespace, data.name ?? draft.name.trim());
       })
       .catch((err: Error) => setCreateError(err.message))
@@ -1371,9 +1441,32 @@ function CreateWizard({
   // The interface the chosen image was built for, when the catalog knows it. The
   // image and the type are two independent choices, and the vendor images come
   // in per-interface pairs, so the two can disagree: an ssh image under type
-  // jupyter is a token nothing serves. The catalog is what makes that visible,
-  // so it is said rather than left to be met on the cluster.
+  // jupyter is a token nothing serves. The list below offers only the images
+  // that serve the chosen type, so this can only speak for a reference the user
+  // typed in by hand — which is left alone and reported rather than corrected.
   const imageInterface = options?.images.find((i) => i.tag === draft.image)?.interface;
+
+  // The images that can serve the chosen type. CUBESTACK_IMAGE is baked into
+  // each image, so an image built for one interface cannot serve the other: an
+  // ssh image under type jupyter runs sshd with nothing serving the token the
+  // operator publishes for it, and a jupyter image under type ssh runs a
+  // notebook nobody can reach.
+  const imageOptions = (options?.images ?? []).filter((img) => img.interface === draft.type);
+
+  // Switching the type keeps the vendor when the catalog has the pair: the two
+  // images of a stack differ only in the mode baked into them, so a CUDA
+  // environment moved to ssh lands on ssh-cuda-pytorch rather than on the CPU
+  // image, which the operator would refuse as a brand mismatch. A reference the
+  // user typed in by hand is their own and is left alone.
+  const switchType = (tp: Draft["type"]) =>
+    setDraft((prev) => {
+      const current = options?.images.find((i) => i.tag === prev.image);
+      if (!current || current.interface === tp) return { ...prev, type: tp };
+      const pair =
+        options?.images.find((i) => i.vendor === current.vendor && i.interface === tp) ??
+        options?.images.find((i) => i.interface === tp);
+      return pair ? { ...prev, type: tp, image: pair.tag, ...identityOf(pair) } : { ...prev, type: tp };
+    });
 
   // What the user will see on the confirm step. Built by pushing into a typed
   // array rather than spreading, so the conditional rows stay [string, string].
@@ -1464,13 +1557,13 @@ function CreateWizard({
                       : undefined
                   }
                 >
-                  <Box sx={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px" }}>
-                    {(["jupyter", "ssh", "vscode"] as const).map((tp) => (
+                  <Box sx={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: "10px" }}>
+                    {WIZARD_TYPES.map((tp) => (
                       <Box
                         key={tp}
                         component="button"
                         type="button"
-                        onClick={() => setField("type", tp)}
+                        onClick={() => switchType(tp)}
                         sx={{
                           border: 1,
                           borderColor: draft.type === tp ? "primary.main" : "divider",
@@ -1493,13 +1586,22 @@ function CreateWizard({
                     ))}
                   </Box>
                 </WizField>
-                <WizField label={t("dev.wizard.image")} hint={t("dev.wizard.imageHint")}>
+                <WizField
+                  label={t("dev.wizard.image")}
+                  hint={t("dev.wizard.imageHint")}
+                  // An empty image is the one required field on this step that
+                  // failed silently: clearing it (which is what the field's own
+                  // clear button does before a new reference is typed) left Next
+                  // with nothing to say, and no way to learn why.
+                  error={imageError}
+                  errorText={t("dev.wizard.errImage")}
+                >
                   <Autocomplete
                     freeSolo
                     size="small"
                     fullWidth
                     data-od-id="wizard-image"
-                    options={options.images.map((img) => img.tag)}
+                    options={imageOptions.map((img) => img.tag)}
                     value={draft.image}
                     inputValue={draft.image}
                     onChange={(_, v) => setImageTag(v ?? "")}
@@ -1992,7 +2094,9 @@ function WizField({
       <Typography sx={{ fontSize: 12.5, fontWeight: 550, mb: "7px" }}>{label}</Typography>
       {children}
       {error && errorText ? (
-        <Typography data-od-id="field-error" sx={{ fontSize: 11.5, color: soft(STATUS_ERR, 75), fontWeight: 550, mt: "6px" }}>
+        // Announced when it appears: a wizard step that refuses to advance has to
+        // say why, and the helper text is the only thing that does.
+        <Typography role="alert" data-od-id="field-error" sx={{ fontSize: 11.5, color: soft(STATUS_ERR, 75), fontWeight: 550, mt: "6px" }}>
           {errorText}
         </Typography>
       ) : hint ? (
