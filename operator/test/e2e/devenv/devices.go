@@ -36,10 +36,20 @@ func (s *Suite) DeviceCapacity(ctx context.Context) (map[corev1.ResourceName]int
 // request for two, so a sum would admit a case that then sits Pending — the
 // outcome the gate exists to prevent.
 //
-// A cordoned node is left out. It goes on reporting its allocatable, but the
-// scheduler will not place a pod on one, so counting it is the same mistake in a
-// different shape: a cluster whose only device node is cordoned has no usable
-// device whatever the arithmetic says.
+// A node the environment's pod cannot be placed on is left out, which is a wider
+// class than it first looks. A cordoned node goes on reporting its allocatable
+// while the scheduler will refuse it, and so does a tainted one: the pod carries
+// no tolerations, because nothing in the controller sets any, so a NoSchedule or
+// NoExecute taint bars it just as surely. Counting either is the same mistake in
+// a different shape — a cluster whose only device node is cordoned or tainted
+// has no usable device whatever the arithmetic says.
+//
+// Both taints a node reports while it is not serving are NoExecute, so requiring
+// the Ready condition as well would catch nothing this does not. Not checking it
+// is deliberate rather than an omission, and the reason is worth stating: it
+// could only ever exclude a node the rest of this function counted, so it would
+// add a way for the gate to call a device absent without adding a way for it to
+// notice one.
 func maxAllocatable(ctx context.Context, c client.Client) (map[corev1.ResourceName]int64, error) {
 	var nodes corev1.NodeList
 	if err := c.List(ctx, &nodes); err != nil {
@@ -48,7 +58,7 @@ func maxAllocatable(ctx context.Context, c client.Client) (map[corev1.ResourceNa
 	out := make(map[corev1.ResourceName]int64, len(nodes.Items))
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
-		if n.Spec.Unschedulable {
+		if n.Spec.Unschedulable || hasBlockingTaint(n.Spec.Taints) {
 			continue
 		}
 		for name, q := range n.Status.Allocatable {
@@ -58,4 +68,19 @@ func maxAllocatable(ctx context.Context, c client.Client) (map[corev1.ResourceNa
 		}
 	}
 	return out, nil
+}
+
+// hasBlockingTaint reports whether any of taints has an effect that keeps a pod
+// off a node regardless of what it requests.
+//
+// PreferNoSchedule is not one of them and is deliberately not treated as one: it
+// is a preference the scheduler weighs against the rest of the cluster, so
+// calling it a bar would stand a case down on a cluster that could have run it.
+func hasBlockingTaint(taints []corev1.Taint) bool {
+	for _, t := range taints {
+		if t.Effect == corev1.TaintEffectNoSchedule || t.Effect == corev1.TaintEffectNoExecute {
+			return true
+		}
+	}
+	return false
 }
