@@ -187,6 +187,20 @@ spec:
                         format: int32
                         minimum: 1
                         type: integer
+                      model:
+                        description: |-
+                          Model restricts the environment to a single GPU model the vendor offers,
+                          e.g. MXC550. It has to name a model of the declared vendor
+                          (spec.resources.gpu.vendor), and is matched against the model the cluster
+                          advertises for that vendor, so it is written as that vendor reports the
+                          model rather than in any platform's own spelling. Omit it to take any node
+                          offering the vendor's accelerator.
+
+                          A model no node offers is a matter of what the cluster has rather than of
+                          what the spec asks for, so the environment stays Pending with the
+                          scheduling failure reported against it — the spec is applied as written.
+                        minLength: 1
+                        type: string
                       vendor:
                         default: nvidia
                         description: |-

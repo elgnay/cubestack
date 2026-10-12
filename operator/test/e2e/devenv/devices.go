@@ -3,6 +3,7 @@ package devenv
 import (
 	"context"
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -58,7 +59,7 @@ func maxAllocatable(ctx context.Context, c client.Client) (map[corev1.ResourceNa
 	out := make(map[corev1.ResourceName]int64, len(nodes.Items))
 	for i := range nodes.Items {
 		n := &nodes.Items[i]
-		if n.Spec.Unschedulable || hasBlockingTaint(n.Spec.Taints) {
+		if !schedulable(n) {
 			continue
 		}
 		for name, q := range n.Status.Allocatable {
@@ -68,6 +69,59 @@ func maxAllocatable(ctx context.Context, c client.Client) (map[corev1.ResourceNa
 		}
 	}
 	return out, nil
+}
+
+// DeviceModels answers which models of a device the cluster offers: the distinct
+// values of label on the schedulable nodes that advertise resource, sorted.
+//
+// It exists for the one case that cannot be written any other way — the case that
+// pins an environment to a model. The model space is the vendor's, and a name
+// written into the test is one this cluster may not offer, so the case would
+// assert the cluster's inventory rather than the platform's behaviour. Asking
+// what is there is also the only shape in which the label the platform matches
+// against is checked against a real device plugin's own: the value came from the
+// node, not from this repository.
+//
+// A node advertising no model contributes nothing, so a cluster whose plugin
+// writes no product label yields an empty answer rather than a wrong one. That
+// the two are different is the caller's to keep, and the reason the answer is
+// empty rather than a placeholder is that there is no model to pin an
+// environment to — which is a fact about the cluster.
+func (s *Suite) DeviceModels(ctx context.Context, resource corev1.ResourceName, label string) ([]string, error) {
+	var nodes corev1.NodeList
+	if err := s.Client.List(ctx, &nodes); err != nil {
+		return nil, fmt.Errorf("listing nodes: %w", err)
+	}
+	seen := make(map[string]bool, len(nodes.Items))
+	var out []string
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		q := n.Status.Allocatable[resource]
+		if !schedulable(n) || q.IsZero() {
+			continue
+		}
+		model := n.Labels[label]
+		if model == "" || seen[model] {
+			continue
+		}
+		seen[model] = true
+		out = append(out, model)
+	}
+	// Sorted rather than in the API server's order, so that a caller taking one
+	// takes the same one every run: a case asserting against the value it asked
+	// for cannot have that value change between the create and the assertion.
+	slices.Sort(out)
+	return out, nil
+}
+
+// schedulable reports whether the environment's pod could be placed on n.
+//
+// One predicate rather than the expression written wherever a node is counted,
+// because which nodes count is a single decision: a node left out of one reading
+// and counted by another would have the two answer different questions about the
+// same cluster.
+func schedulable(n *corev1.Node) bool {
+	return !n.Spec.Unschedulable && !hasBlockingTaint(n.Spec.Taints)
 }
 
 // hasBlockingTaint reports whether any of taints has an effect that keeps a pod

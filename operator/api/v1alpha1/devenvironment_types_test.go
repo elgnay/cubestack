@@ -34,6 +34,11 @@ import (
 const (
 	testPortName = "app"
 	testDevImage = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
+
+	// testGPUModelMXC550 is a real model name of a real vendor, so the round-trip
+	// test would catch the API rewriting a value in the shape the clusters
+	// actually advertise rather than only in a synthetic one.
+	testGPUModelMXC550 = "MXC550"
 )
 
 // testAPIVersion derives from SchemeGroupVersion to avoid repeating the group
@@ -331,6 +336,14 @@ var _ = Describe("DevEnvironment", func() {
 				"de-invalid-gpucount-zero-raw",
 				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["count"] = 0 },
 				"spec.resources.gpu.count"),
+			// The model carries its own non-empty rule: an empty string would be
+			// a legal-looking pin that names no model and so matches no node,
+			// which is the failure this field exists to express rather than hide.
+			// Omitting the key is how an environment leaves the model open.
+			Entry("empty gpu model",
+				"de-invalid-gpumodel-empty-raw",
+				func(s map[string]any) { s["resources"].(map[string]any)["gpu"].(map[string]any)["model"] = "" },
+				"spec.resources.gpu.model"),
 		)
 
 		// Within the block, an omitted vendor and an omitted count are defaulted —
@@ -347,6 +360,33 @@ var _ = Describe("DevEnvironment", func() {
 			Expect(got.Spec.Resources.GPU).NotTo(BeNil())
 			Expect(got.Spec.Resources.GPU.Vendor).To(Equal(AcceleratorVendorNvidia))
 			Expect(got.Spec.Resources.GPU.Count).To(Equal(ptrTo(int32(2))))
+			// The model is the exception, and deliberately so: there is no
+			// default to give it. A defaulted model would pin every environment
+			// that names none to one card the platform picked, which is exactly
+			// the choice the field exists to leave to the user.
+			Expect(got.Spec.Resources.GPU.Model).To(BeEmpty())
+
+			Expect(k8sClient.Delete(ctx, de)).To(Succeed())
+		})
+
+		// The model is free-form — the cluster's own device plugin decides which
+		// names exist, and a new SKU must not need an operator release — so the
+		// API's whole job is to carry it through unaltered. Anything that
+		// normalised the value would stop a model the cluster advertises from
+		// ever matching.
+		It("round-trips a declared gpu model verbatim", func() {
+			de := validDevEnvironment("de-gpu-model-roundtrip")
+			de.Spec.Resources.GPU = &GPUSpec{
+				Vendor: AcceleratorVendorMetax, Model: testGPUModelMXC550, Count: ptrTo(int32(2)),
+			}
+
+			Expect(k8sClient.Create(ctx, de)).To(Succeed())
+
+			got := &DevEnvironment{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: de.Name, Namespace: de.Namespace}, got)).To(Succeed())
+			Expect(got.Spec.Resources.GPU).NotTo(BeNil())
+			Expect(got.Spec.Resources.GPU.Vendor).To(Equal(AcceleratorVendorMetax))
+			Expect(got.Spec.Resources.GPU.Model).To(Equal(testGPUModelMXC550))
 
 			Expect(k8sClient.Delete(ctx, de)).To(Succeed())
 		})
