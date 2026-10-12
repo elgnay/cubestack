@@ -699,7 +699,7 @@ func (e *Environment) RestartPod(ctx context.Context) error {
 	return nil
 }
 
-// requiredConditions are the four the controller sets on a DevEnvironment, each
+// requiredConditions are the ones the controller sets on a DevEnvironment, each
 // of which has to hold before a case can mean anything.
 //
 // Accepted is in the list because it is the condition that says the spec written
@@ -709,7 +709,6 @@ func (e *Environment) RestartPod(ctx context.Context) error {
 // healthy while nothing answers.
 var requiredConditions = []string{
 	aiv1alpha1.ConditionAccepted,
-	aiv1alpha1.ConditionPodScheduled,
 	aiv1alpha1.ConditionRouteReady,
 	aiv1alpha1.ConditionReady,
 }

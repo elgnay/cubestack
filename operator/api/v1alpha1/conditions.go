@@ -82,10 +82,6 @@ const (
 	// recreation. (InferenceService)
 	ConditionProfileDrifted ConditionType = "ProfileDrifted"
 
-	// ConditionPodScheduled indicates that the Pod has been scheduled.
-	// (DevEnvironment)
-	ConditionPodScheduled ConditionType = "PodScheduled"
-
 	// ConditionAccepted indicates that the controller applies the spec as
 	// written. False means the spec states something the controller refuses to
 	// run and only the user can correct it — today a GPU vendor its image does

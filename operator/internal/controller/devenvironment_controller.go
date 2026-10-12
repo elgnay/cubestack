@@ -142,9 +142,6 @@ const (
 	reasonFailed                 = "Failed"
 	reasonDeleting               = "Deleting"
 	reasonIdleTimeout            = "IdleTimeout"
-	reasonScheduled              = "Scheduled"
-	reasonNotScheduled           = "NotScheduled"
-	reasonNotCreated             = "PodNotCreated"
 	reasonAccepted               = "Accepted"
 	reasonOverridden             = "Overridden"
 	reasonBrandMismatch          = "BrandMismatch"
@@ -485,7 +482,6 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		// The phase and Ready name the first finding, as each gate did on its own
 		// before they were folded together; Accepted carries every one of them.
 		setAcceptedCondition(&desired.Status.Conditions, metav1.ConditionFalse, blocking[0].reason, findingsMessage(blocking))
-		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionPodScheduled)
 		meta.RemoveStatusCondition(&desired.Status.Conditions, aiv1alpha1.ConditionRouteReady)
 		desired.Status.Endpoints = nil
 		setPhase(&desired.Status, aiv1alpha1.PhaseFailed, blocking[0].reason)
@@ -574,7 +570,6 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	setPodScheduledCondition(&desired.Status.Conditions, pod)
 	r.setPhaseAndReady(&env, &desired.Status, pod)
 	// The phase is the one statement of what state the environment is in, so what
 	// an address means follows from it rather than being decided again here.
@@ -1773,7 +1768,7 @@ type specFinding struct {
 // What is out of scope is as deliberate as what is in it: an environment whose
 // only symptom is cluster state — a storage class nothing provisions, a gateway
 // that is not ready — has not disagreed with the controller about anything, and
-// the conditions that observe that state report it (PodScheduled, RouteReady).
+// the condition that observes that state reports it (RouteReady).
 func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	var findings []specFinding
 	// The two refusals come first: a finding that fails the environment decides
@@ -4629,25 +4624,6 @@ func setAcceptedCondition(conditions *[]metav1.Condition, status metav1.Conditio
 	meta.SetStatusCondition(conditions, metav1.Condition{
 		Type: aiv1alpha1.ConditionAccepted, Status: status, Reason: reason, Message: message,
 	})
-}
-
-// setPodScheduledCondition sets the PodScheduled condition from the observed
-// pod.
-func setPodScheduledCondition(conditions *[]metav1.Condition, pod *corev1.Pod) {
-	switch {
-	case pod == nil:
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionPodScheduled, Status: metav1.ConditionFalse, Reason: reasonNotCreated, Message: "The environment pod has not been created yet",
-		})
-	case pod.Spec.NodeName == "":
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionPodScheduled, Status: metav1.ConditionFalse, Reason: reasonNotScheduled, Message: "The environment pod is not scheduled to a node yet",
-		})
-	default:
-		meta.SetStatusCondition(conditions, metav1.Condition{
-			Type: aiv1alpha1.ConditionPodScheduled, Status: metav1.ConditionTrue, Reason: reasonScheduled, Message: "The environment pod is scheduled",
-		})
-	}
 }
 
 // setDevEnvironmentRouteReadyCondition sets the RouteReady condition from the gateway

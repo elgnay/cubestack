@@ -50,11 +50,6 @@ import (
 // honoured, the cluster unable to serve it — is reached through resources
 // instead. Both keep the contract's shape, which is what the row is for.
 
-// reasonNotScheduled is the reason the controller records when the environment's
-// pod exists and no node has taken it. It is not the scheduler's own reason —
-// that one is on the pod, and E9 asserts both.
-const reasonNotScheduled = "NotScheduled"
-
 // describeAccepted declares family E. It is called from the conformance
 // container so it inherits that container's guard against running without
 // DEVENV_E2E.
@@ -456,16 +451,14 @@ func describeAccepted() {
 
 							Expect(env.Object().Status.Phase.Name).To(Equal(aiv1alpha1.PhasePending),
 								"an unschedulable environment is waiting, not failed")
-							scheduled := env.Condition(aiv1alpha1.ConditionPodScheduled)
-							Expect(scheduled).NotTo(BeNil())
-							Expect(scheduled.Status).To(Equal(metav1.ConditionFalse))
-							Expect(scheduled.Reason).To(Equal(reasonNotScheduled))
 
 							// And the failure is observable, not merely true: the
 							// scheduler's own reason names what it could not find
 							// room for, which is the difference between a user
 							// knowing to lower the request and being told to try
-							// again.
+							// again. It is also the only place that reason is
+							// recorded — the DevEnvironment's own conditions say
+							// the environment is waiting, not why.
 							pod, err := env.Pod(ctx)
 							Expect(err).NotTo(HaveOccurred())
 							cond := podCondition(pod, corev1.PodScheduled)

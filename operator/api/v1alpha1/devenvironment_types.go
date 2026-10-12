@@ -504,8 +504,7 @@ type DevEnvironmentStatus struct {
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 
-	// Conditions: Accepted / PodScheduled / RouteReady / Ready (type constants
-	// below).
+	// Conditions: Accepted / RouteReady / Ready (type constants below).
 	// +listType=map
 	// +listMapKey=type
 	// +optional

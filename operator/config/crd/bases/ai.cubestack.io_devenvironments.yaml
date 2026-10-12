@@ -598,9 +598,8 @@ spec:
             description: status defines the observed state of DevEnvironment
             properties:
               conditions:
-                description: |-
-                  Conditions: Accepted / PodScheduled / RouteReady / Ready (type constants
-                  below).
+                description: 'Conditions: Accepted / RouteReady / Ready (type constants
+                  below).'
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.

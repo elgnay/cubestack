@@ -935,13 +935,16 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 	Describe("setPhase", func() {
 		It("keeps LastTransitionTime stable while the phase name is unchanged", func() {
 			status := &aiv1alpha1.DevEnvironmentStatus{}
-			setPhase(status, aiv1alpha1.PhasePending, reasonPending)
+			setPhase(status, aiv1alpha1.PhaseStopped, reasonStopped)
 			first := status.Phase.LastTransitionTime
 
-			setPhase(status, aiv1alpha1.PhasePending, reasonNotScheduled)
+			// The same phase reached another way: a user's stop and the idle
+			// timeout are both Stopped, and the reason is the only thing that
+			// tells them apart.
+			setPhase(status, aiv1alpha1.PhaseStopped, reasonIdleTimeout)
 
 			Expect(status.Phase.LastTransitionTime).To(BeIdenticalTo(first))
-			Expect(status.Phase.Reason).To(Equal(reasonNotScheduled))
+			Expect(status.Phase.Reason).To(Equal(reasonIdleTimeout))
 		})
 
 		It("bumps LastTransitionTime when the phase name changes", func() {
@@ -3851,7 +3854,6 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhasePending))
-				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
@@ -3867,7 +3869,6 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
-				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})
@@ -3903,7 +3904,6 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
 				g.Expect(got.Status.Phase).NotTo(BeNil())
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
-				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
 		})

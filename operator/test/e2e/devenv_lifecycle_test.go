@@ -612,9 +612,9 @@ const (
 // can check rather than a race. What it checks is the part of their relationship
 // that holds in every state:
 //
-//   - a Ready that is true says the environment is Running, its pod is scheduled
-//     and it published somewhere to connect to, so any of those saying otherwise
-//     is the platform describing one environment two ways;
+//   - a Ready that is true says the environment is Running and it published
+//     somewhere to connect to, so either of those saying otherwise is the
+//     platform describing one environment two ways;
 //   - a Ready that is false implies nothing about the phase, and deliberately:
 //     a pod that is Running but not yet ready is phase Running with Ready false
 //     — the platform reporting the workload as up and the connection as not yet
@@ -632,14 +632,6 @@ func phaseAgreement(st aiv1alpha1.DevEnvironmentStatus) error {
 	}
 	if st.Phase.Name != aiv1alpha1.PhaseRunning {
 		return fmt.Errorf("Ready is true while the phase is %s (%s)", st.Phase.Name, st.Phase.Reason)
-	}
-	scheduled := meta.FindStatusCondition(st.Conditions, aiv1alpha1.ConditionPodScheduled)
-	if scheduled == nil {
-		return errors.New("Ready is true while PodScheduled is not recorded")
-	}
-	if scheduled.Status != metav1.ConditionTrue {
-		return fmt.Errorf("Ready is true while PodScheduled is %s (%s)",
-			scheduled.Status, scheduled.Reason)
 	}
 	if len(st.Endpoints) == 0 {
 		return errors.New("Ready is true with no endpoint published, so nothing connects")
