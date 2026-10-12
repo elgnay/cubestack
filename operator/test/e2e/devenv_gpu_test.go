@@ -21,14 +21,21 @@ import (
 
 // Family N: the GPU.
 //
-// Two things about a GPU environment are worth a cluster-level case, and only one
-// of them can be asked anywhere. The first is that a spec naming a vendor's GPU
-// gets one: scheduled onto a node that advertises the device, with the resource
-// accounted to it, and visible to the tools and the framework the image is built
-// around. That needs a node with the device, so those cases stand down where
-// there is none.
+// Three things about a GPU environment are worth a cluster-level case, and only
+// one of them can be asked anywhere. The first is that a spec naming a vendor's
+// GPU gets one: scheduled onto a node that advertises the device, with the
+// resource accounted to it, and visible to the tools and the framework the image
+// is built around. That needs a node with the device, so those cases stand down
+// where there is none.
 //
-// The second is what happens when the request cannot be met at all — the platform
+// The second is that those observations are the device's rather than the image's
+// — that the same tool, asked in the same image with nothing allocated to it,
+// does not answer the same way. Without it the first is an assertion no cluster
+// could fail, which is the same as no assertion at all. It needs the device too,
+// for the reason given at describeGPUVendorAbsent, and the pair is the only
+// place in this repository where a vendor tool is run without a device.
+//
+// The third is what happens when the request cannot be met at all — the platform
 // applies the spec as written, and the cluster says why it cannot serve it. That
 // case needs no hardware, and it is here so that family N is never an empty run
 // on a cluster without a GPU.
@@ -121,11 +128,25 @@ func describeGPU() {
 
 			for _, v := range gpuVendors {
 				describeGPUVendor(v)
+				describeGPUVendorAbsent(v)
 			}
 			// Deliberately no device label: this case is about the resource's name
 			// in the scheduler's own message, not about the resource being present.
 			describeGPUShortfall()
 		})
+}
+
+// gpuAvailable reports whether this cluster can serve the one device every case
+// in the vendor's pair asks for.
+//
+// One predicate behind both gates rather than the expression written twice,
+// because the control is only meaningful where the case it controls runs: two
+// copies could drift into a cluster where the positive case runs and its control
+// skips, which would leave the positive case exactly as unfalsifiable as it was
+// before the control existed. The two gates do say different things when they
+// fail, and that is the reason they are still separate closures.
+func gpuAvailable(v gpuVendor) bool {
+	return deviceCapacity[v.resource] >= int64(gpuCount)
 }
 
 func describeGPUVendor(v gpuVendor) {
@@ -138,7 +159,7 @@ func describeGPUVendor(v gpuVendor) {
 				d.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{Vendor: v.vendor, Count: &gpuCount}
 			},
 			Available: func(context.Context) string {
-				if deviceCapacity[v.resource] >= int64(gpuCount) {
+				if gpuAvailable(v) {
 					return ""
 				}
 				return fmt.Sprintf("no schedulable node advertises %s; this case needs %d",
@@ -184,6 +205,74 @@ func describeGPUVendor(v gpuVendor) {
 					Expect(strings.TrimSpace(out)).To(Equal(fmt.Sprintf("%d", gpuCount)),
 						"the torch in %s counts a different number of devices from the spec", v.image)
 				})
+			},
+		}.declare()
+	})
+}
+
+// describeGPUVendorAbsent is the control for N2.
+//
+// N2 accepts a tool that exited 0 having printed something as a device being
+// there. That is only a statement about the device if the same tool, asked in
+// the same image with nothing allocated, does not answer the same way — and
+// nothing measured that. The tool is run inside the gated case, so the only two
+// outcomes a cluster could produce were "the device is present" and "the tool
+// was never asked", and an environment requesting no GPU was not a spec any case
+// wrote. A positive case whose assertion the image alone could satisfy is a case
+// that cannot fail, and no run before this one could have told the difference.
+//
+// The environment is the positive case's with one thing missing: no
+// `resources.gpu` block. That is a spec the platform accepts — the brand check
+// exempts an environment that asks for no GPU — so it schedules on a node with
+// no device, which is what makes the comparison possible at all. The pod is then
+// asserted to name no device, so the case cannot pass by being handed one the
+// spec did not ask for.
+//
+// Gated on the device being present, like the case it controls. Where no node
+// advertises the resource N2 does not run either, and a control with nothing to
+// compare against is a second copy of the negative case rather than a control.
+func describeGPUVendorAbsent(v gpuVendor) {
+	Describe(v.device+"-absent", Label(devenv.LabelDevice(v.device)), Ordered, func() {
+		draftCase{
+			Name:     "gpu-" + v.device + "-absent",
+			Image:    devenv.MustImage(v.image),
+			Identity: devenv.NonRoot,
+			// No Shape: the catalogue's manifest is already an environment that
+			// asks for no GPU, and that absence is the whole of the case.
+			Available: func(context.Context) string {
+				if gpuAvailable(v) {
+					return ""
+				}
+				return fmt.Sprintf(
+					"no schedulable node advertises %s, so N2 does not run here either and this "+
+						"control would have nothing to compare against", v.resource)
+			},
+			Cases: func(open func() *devenv.Environment) {
+				It("N5 asks the same tool where no device was allocated",
+					func(ctx SpecContext) {
+						env := open()
+						running(ctx, env)
+
+						pod, err := env.Pod(ctx)
+						Expect(err).NotTo(HaveOccurred(),
+							"reading the pod %s is running as", env.Name)
+						assertPodNotAllocated(pod, v.resource)
+
+						// N2's predicate, negated — the coupling is the point
+						// rather than an accident. The claim under test is that
+						// the device is what decides N2's answer, so what has to
+						// hold is that N2's answer does not hold here; and an N2
+						// later tightened to a parsed output line has to tighten
+						// this with it, which one negation in one place makes hard
+						// to forget.
+						res := sshRun(ctx, env, v.tool)
+						Expect(res.ExitCode != 0 || strings.TrimSpace(res.Stdout) == "").To(BeTrue(),
+							"%s exited 0 and printed %d bytes in an environment that was allocated no device.\n"+
+								"That is what N2 accepts as a device being present, so N2 cannot tell the "+
+								"device from its absence and has to be tightened to a parsed line. "+
+								"What the tool printed to stdout:\n%s",
+							v.tool, len(res.Stdout), res.Stdout)
+					})
 			},
 		}.declare()
 	})
