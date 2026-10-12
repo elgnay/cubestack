@@ -38,7 +38,11 @@ export interface DevEnvironmentSummary {
     cpu: string;
     memory: string;
   };
-  storage: { size: string; mountPath: string | null } | null;
+  // pvcRetention is what deleting the environment does to the workspace claim:
+  // "delete" reclaims it, "retain" keeps it as workspace-<name>-0. Stated for
+  // every environment that has a workspace, including the ones that never named
+  // it — the CRD's default is delete, so an absent field reads as delete.
+  storage: { size: string; mountPath: string | null; pvcRetention: "retain" | "delete" } | null;
   // spec.volumes: extra PVCs mounted alongside the workspace.
   volumes: Array<{ name: string; pvcName: string; mountPath: string; readOnly: boolean }>;
   // Variable *names* only — a value can be a registry token (HF_TOKEN), and the
@@ -87,7 +91,7 @@ interface DevEnvSpec {
   image?: string;
   running?: boolean;
   resources?: DevEnvResources;
-  storage?: { size?: string; mountPath?: string };
+  storage?: { size?: string; mountPath?: string; pvcRetention?: string };
   volumes?: Array<{ name?: string; pvcName?: string; mountPath?: string; readOnly?: boolean }>;
   ports?: Array<{ name?: string; type?: string; containerPort?: number }>;
   runtime?: { env?: Array<{ name?: string }>; command?: string[]; args?: string[] };
@@ -136,7 +140,14 @@ function project(env: DevEnv): DevEnvironmentSummary {
       // A null mountPath is "not stated": the controller derives the path — and
       // the container's HOME — from the runtime identity, so the panel must not
       // invent "/workspace". A jupyter environment's workspace is /home/jovyan.
-      ? { size: spec.storage.size ?? "10Gi", mountPath: spec.storage.mountPath?.trim() || null }
+      ? {
+          size: spec.storage.size ?? "10Gi",
+          mountPath: spec.storage.mountPath?.trim() || null,
+          // Anything that is not the CRD's other value is the default the
+          // schema would have applied, including a field an older object never
+          // carried: the delete path reads this, so it must never be "unknown".
+          pvcRetention: spec.storage.pvcRetention === "retain" ? ("retain" as const) : ("delete" as const),
+        }
       : null,
     volumes: (spec.volumes ?? []).map((v) => ({
       name: v.name ?? "",
@@ -216,6 +227,10 @@ const RUNTIME_USER_MAX = 32;
 // int32 is a uid or gid, and a value past it would be rejected by the API
 // server as an opaque 422 rather than here.
 const RUN_AS_ID_MAX = 2147483647;
+// spec.lifecycle.idleTimeout is an int32 in seconds with no narrower bound in the
+// CRD, so that is its ceiling: a larger value would reach the API server and come
+// back as an opaque 422 the user cannot act on.
+const IDLE_TIMEOUT_MAX = 2147483647;
 const DEVENV_TYPES = ["jupyter", "ssh", "vscode"] as const;
 // The accelerator is a single choice, "none" included, mirroring
 // spec.resources.gpu.vendor plus the absence of the block.
@@ -224,6 +239,12 @@ const ACCELERATORS = ["none", "nvidia", "metax"] as const;
 // else — an invalid name would surface as an opaque 422 on the CR, not here.
 const ENV_NAME_RE = /^[-._a-zA-Z][-._a-zA-Z0-9]*$/;
 const PORT_TYPES = ["http", "tcp", "udp"] as const;
+// spec.network.rdmaType's own enum, mirrored from the CRD (roce is the default
+// fabric; infiniband is the other choice the operator knows).
+const RDMA_TYPES = ["roce", "infiniband"] as const;
+// spec.storage.pvcRetention's own enum (delete is the default: the claim is
+// provisioned for the environment, so it is reclaimed with it).
+const PVC_RETENTIONS = ["retain", "delete"] as const;
 
 /**
  * Split a command line into argv: whitespace separates, and single or double
@@ -287,6 +308,11 @@ interface CreateBody {
   cpu?: string;
   memory?: string;
   storageGi?: number;
+  // spec.storage.pvcRetention: what deleting the environment does to the
+  // workspace claim. Absent = delete (the CRD's default), so only "retain" is
+  // ever written — the body states the decision the user made, and leaving the
+  // default unsaid keeps it the platform's default rather than the caller's.
+  pvcRetention?: string; // → spec.storage.pvcRetention
   idleTimeout?: number;
   // The runtime identity (spec.runtime). All optional: a client that states
   // none gets the image catalog's identity, as before. Named after the CR's own
@@ -303,6 +329,18 @@ interface CreateBody {
   command?: string; // → spec.runtime.command (one command line, split here)
   args?: string; // → spec.runtime.args (one command line, split here)
   ports?: Array<{ name?: string; containerPort?: number; type?: string }>; // → spec.ports[]
+  // spec.network: RDMA access. rdmaEnabled gates the block; rdmaType names the
+  // fabric the environment joins (roce is the CRD's default). Absent / false =
+  // no RDMA, so the block is omitted rather than written as a false flag.
+  rdmaEnabled?: boolean; // → spec.network.rdmaEnabled
+  rdmaType?: string; // → spec.network.rdmaType
+  // spec.ssh: independent of the environment's type — ssh.enabled opens the SSH
+  // endpoint on any type (a jupyter + ssh environment), and authorizedKeysSecret
+  // points at the user's own key Secret. Absent / false = no ssh block (the
+  // type-ssh case is already exposed unconditionally by the operator).
+  sshEnabled?: boolean; // → spec.ssh.enabled
+  sshKeysSecret?: string; // → spec.ssh.authorizedKeysSecret.name
+  sshKeysKey?: string; // → spec.ssh.authorizedKeysSecret.key
 }
 
 /**
@@ -346,8 +384,8 @@ export const POST = withAuth(async (req) => {
       return ValidationError("storageGi 需在 20–800 之间。");
     }
     const idleTimeout = body.idleTimeout === undefined ? 0 : body.idleTimeout;
-    if (!Number.isInteger(idleTimeout) || idleTimeout < 0) {
-      return ValidationError("idleTimeout 需为非负整数(秒)。");
+    if (!Number.isInteger(idleTimeout) || idleTimeout < 0 || idleTimeout > IDLE_TIMEOUT_MAX) {
+      return ValidationError(`idleTimeout 需为 0–${IDLE_TIMEOUT_MAX} 之间的整数(秒),0 表示不启用。`);
     }
 
     // The runtime identity. An empty account is "not stated", not an account:
@@ -392,6 +430,17 @@ export const POST = withAuth(async (req) => {
     // would prune it rather than complain.
     if (workspacePath && body.storageGi === undefined) {
       return ValidationError("workspace 挂载路径需与持久化存储(storageGi)同时提交。");
+    }
+    // spec.storage.pvcRetention, like mountPath, exists only inside spec.storage:
+    // a retention policy for a claim that was never asked for decides nothing.
+    // "delete" is the CRD's default and is accepted, but only "retain" is
+    // written — see the spec literal below.
+    const pvcRetention = body.pvcRetention ?? "delete";
+    if (!(PVC_RETENTIONS as readonly string[]).includes(pvcRetention)) {
+      return ValidationError(`pvcRetention 必须为 ${PVC_RETENTIONS.join(" / ")} 之一。`);
+    }
+    if (body.pvcRetention !== undefined && body.storageGi === undefined) {
+      return ValidationError("pvcRetention 需与持久化存储(storageGi)同时提交。");
     }
 
     const volumes: Array<{ name: string; pvcName: string; mountPath: string }> = [];
@@ -487,6 +536,30 @@ export const POST = withAuth(async (req) => {
       ports.push({ name, type, containerPort });
     }
 
+    // spec.network: RDMA. The block is written only when rdmaEnabled; rdmaType
+    // names the fabric and defaults to roce (the CRD's default). A fabric no
+    // node advertises does not fail the write — the environment simply stays
+    // Pending — so the value is checked for shape here, not for availability.
+    const rdmaEnabled = body.rdmaEnabled === true;
+    const rdmaType = body.rdmaType ?? "roce";
+    if (rdmaEnabled && !(RDMA_TYPES as readonly string[]).includes(rdmaType)) {
+      return ValidationError(`rdmaType 必须为 ${RDMA_TYPES.join(" / ")} 之一。`);
+    }
+
+    // spec.ssh: written only when sshEnabled (independent of type — a jupyter or
+    // vscode environment can still expose SSH). When a key Secret is named it
+    // must also name a data entry (the CRD requires self.key != ""); the Secret
+    // itself must carry the operator's delegation label, which the operator
+    // checks, not this route.
+    const sshEnabled = body.sshEnabled === true;
+    let sshAuthorizedKeysSecret: { name: string; key: string } | undefined;
+    if (sshEnabled && body.sshKeysSecret) {
+      if (!body.sshKeysKey) {
+        return ValidationError("sshKeysKey 必须指定 Secret 的数据条目。");
+      }
+      sshAuthorizedKeysSecret = { name: body.sshKeysSecret, key: body.sshKeysKey };
+    }
+
     const core = getCoreClient();
     const co = getCustomObjectsClient();
 
@@ -563,11 +636,35 @@ export const POST = withAuth(async (req) => {
         },
         ...(runtime ? { runtime } : {}),
         ...(body.storageGi !== undefined
-          ? { storage: { size: `${body.storageGi}Gi`, ...(workspacePath ? { mountPath: workspacePath } : {}) } }
+          ? {
+              storage: {
+                size: `${body.storageGi}Gi`,
+                ...(workspacePath ? { mountPath: workspacePath } : {}),
+                // Written only when the workspace is to outlive the environment:
+                // "delete" is what the CRD applies anyway, and saying it here
+                // would put the platform's default in the user's mouth.
+                ...(pvcRetention === "retain" ? { pvcRetention } : {}),
+              },
+            }
           : {}),
         ...(volumes.length ? { volumes } : {}),
         ...(ports.length ? { ports } : {}),
         lifecycle: { idleTimeout },
+        // Written only when RDMA is on: absence is the one spelling of "no
+        // RDMA", so a false flag is never sent for the operator to interpret.
+        ...(rdmaEnabled ? { network: { rdmaEnabled: true, rdmaType } } : {}),
+        // Written only when sshEnabled: absence is the one spelling of "no ssh
+        // switch", so a false flag is never sent. The type-ssh case is already
+        // exposed unconditionally by the operator, so this block only carries
+        // the explicit switch and the optional user-supplied key Secret.
+        ...(sshEnabled
+          ? {
+              ssh: {
+                enabled: true,
+                ...(sshAuthorizedKeysSecret ? { authorizedKeysSecret: sshAuthorizedKeysSecret } : {}),
+              },
+            }
+          : {}),
       },
     };
 

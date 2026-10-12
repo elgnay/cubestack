@@ -35,6 +35,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import type { DevEnvironmentSummary } from "@/app/api/devenvironments/route";
 import type { DevEnvImageOption, DevEnvOptionsResponse } from "@/app/api/devenvironments/options/route";
+import type { SshKeySecretOption } from "@/app/api/devenvironments/ssh-keys/route";
 import { apiFetch } from "@/lib/base-path";
 import { PLATFORM_GID, PLATFORM_UID, PLATFORM_USER } from "@/lib/devenvironments/images";
 import { useI18n } from "@/lib/i18n";
@@ -213,13 +214,29 @@ export default function DevEnvironmentsPage() {
     return true;
   });
 
+  /**
+   * What deleting this environment does to its workspace, stated as the
+   * consequence for this environment rather than as the field that decides it:
+   * pvcRetention is chosen once, in the wizard, and never seen again — naming it
+   * at the moment of deletion tells the user nothing. The claim name is the same
+   * one the StatefulSet provisions (workspace-<name>-0), which is how a retained
+   * workspace can be found again after the environment is gone.
+   */
+  const deletePrompt = (e: DevEnvironmentSummary) => {
+    if (!e.storage) return t("dev.delete.confirm", { name: e.name });
+    const claim = `workspace-${e.name}-0`;
+    return e.storage.pvcRetention === "retain"
+      ? t("dev.delete.confirmRetain", { name: e.name, size: e.storage.size, claim })
+      : t("dev.delete.confirmDelete", { name: e.name, size: e.storage.size, claim });
+  };
+
   const runAction = (e: DevEnvironmentSummary, act: string) => {
     if (act === "stop") {
       patch({ namespace: e.namespace, name: e.name, running: false });
     } else if (act === "start") {
       patch({ namespace: e.namespace, name: e.name, running: true });
     } else if (act === "del") {
-      if (!window.confirm(t("dev.delete.confirm", { name: e.name }))) return;
+      if (!window.confirm(deletePrompt(e))) return;
       apiFetch("/api/devenvironments", {
         method: "DELETE",
         headers: { "Content-Type": "application/json" },
@@ -522,12 +539,13 @@ const tdSx = {
 };
 
 /**
- * A row's kebab menu. What an environment offers follows from its phase rather
- * than its type: a Running one can only be stopped, since its work is live; a
- * Stopped one can be started again — or deleted, the one destructive choice,
- * which is why it sits behind a separator; and one that is Pending or
- * Terminating is mid-transition, where the controller rather than the user
- * decides what happens next, so the menu stays shut.
+ * A row's kebab menu. Start and stop follow from the phase rather than the type:
+ * a Running environment can only be stopped, since its work is live; a Stopped
+ * one can be started again. Deleting is outside that gate — it is offered in
+ * every phase, including the ones the console does not know (an empty phase, a
+ * Failed one), because an environment a user can see is one they must be able to
+ * remove: a phase allowlist would otherwise leave a stuck object that no console
+ * action can reach, and the storage behind it unreclaimable too.
  *
  * The menu itself is a MUI `Menu` rather than the prototype's absolutely
  * positioned box: the table sits in a scroll container, which would clip a
@@ -536,7 +554,8 @@ const tdSx = {
 function RowActions({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: DevEnvironmentSummary, act: string) => void }) {
   const { t } = useI18n();
   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
-  const actionable = e.phase === "Running" || e.phase === "Stopped";
+  const canStop = e.phase === "Running";
+  const canStart = e.phase === "Stopped";
   const itemSx = {
     fontSize: 12.5,
     fontWeight: 550,
@@ -560,7 +579,6 @@ function RowActions({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: DevEnvi
       <Button
         size="small"
         data-od-id={`env-ops-${e.name}`}
-        disabled={!actionable}
         aria-label={t("dev.col.ops")}
         aria-haspopup="menu"
         aria-expanded={anchor ? "true" : "false"}
@@ -604,26 +622,24 @@ function RowActions({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: DevEnvi
           list: { sx: { py: "4px", px: "4px" } },
         }}
       >
-        {e.phase === "Running" ? (
+        {canStop ? (
           <MenuItem data-od-id={`act-stop-${e.name}`} onClick={() => run("stop")} sx={itemSx}>
             {t("dev.act.stop")}
           </MenuItem>
         ) : null}
-        {e.phase === "Stopped" ? (
+        {canStart ? (
           <MenuItem data-od-id={`act-start-${e.name}`} onClick={() => run("start")} sx={itemSx}>
             {t("dev.act.start")}
           </MenuItem>
         ) : null}
-        {e.phase === "Stopped" ? <Divider sx={{ my: "4px", mx: "6px" }} /> : null}
-        {e.phase === "Stopped" ? (
-          <MenuItem
-            data-od-id={`act-del-${e.name}`}
-            onClick={() => run("del")}
-            sx={{ ...itemSx, color: soft(STATUS_ERR, 70), "&:hover": { bgcolor: soft(STATUS_ERR, 10), color: soft(STATUS_ERR, 70) } }}
-          >
-            {t("dev.act.delete")}
-          </MenuItem>
-        ) : null}
+        {canStop || canStart ? <Divider sx={{ my: "4px", mx: "6px" }} /> : null}
+        <MenuItem
+          data-od-id={`act-del-${e.name}`}
+          onClick={() => run("del")}
+          sx={{ ...itemSx, color: soft(STATUS_ERR, 70), "&:hover": { bgcolor: soft(STATUS_ERR, 10), color: soft(STATUS_ERR, 70) } }}
+        >
+          {t("dev.act.delete")}
+        </MenuItem>
       </Menu>
     </Box>
   );
@@ -711,6 +727,15 @@ function ConnectionCard({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: Dev
             />
           ) : null}
           <Typography sx={{ fontSize: 11, color: "text.secondary", lineHeight: 1.7 }}>{t("dev.conn.guide")}</Typography>
+          {/* Said only when it is true of this environment: the idle clause used
+              to be part of the guide, so an environment created with the timeout
+              disabled still claimed an expiry on the same screen that showed
+              "disabled". */}
+          {e.idleTimeout > 0 ? (
+            <Typography sx={{ fontSize: 11, color: "text.secondary", lineHeight: 1.7 }}>
+              {t("dev.conn.idle", { minutes: String(Math.round(e.idleTimeout / 60)) })}
+            </Typography>
+          ) : null}
         </Box>
       </Card>
     );
@@ -719,7 +744,12 @@ function ConnectionCard({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: Dev
     <Card title={t("dev.conn.title")} meta={t("dev.conn.meta")}>
       <Box sx={{ px: "18px", py: "20px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: "16px" }}>
         <Typography sx={{ fontSize: 13, color: "text.secondary" }}>
-          {t("dev.conn.none", { phase: e.phase ?? "—" })}
+          {/* The line states a phase only when the environment reports one: an
+              environment whose controller failed before the status write has
+              none, and interpolating it made the card read "The environment is
+              —". What is true without a phase is that there is nothing to
+              connect to yet. */}
+          {e.phase ? t("dev.conn.none", { phase: e.phase }) : t("dev.conn.noPhase")}
         </Typography>
         {e.phase === "Stopped" ? (
           <Button
@@ -748,9 +778,14 @@ function SpecCard({ e }: { e: DevEnvironmentSummary }) {
     [
       t("dev.spec.storage"),
       // A null mountPath is not "/workspace": the controller derives it from the
-      // runtime identity, and for a jupyter image that is /home/jovyan.
+      // runtime identity, and for a jupyter image that is /home/jovyan. The
+      // retention policy is named only when it is the unusual one — delete is
+      // the CRD's default and what most environments carry, and it is stated
+      // where it matters, in the delete confirmation.
       e.storage
-        ? `${e.storage.size} · ${e.storage.mountPath ?? t("dev.spec.mountPathDerived")}`
+        ? `${e.storage.size} · ${e.storage.mountPath ?? t("dev.spec.mountPathDerived")}${
+            e.storage.pvcRetention === "retain" ? ` · ${t("dev.spec.storageRetained")}` : ""
+          }`
         : t("dev.spec.idleOff"),
     ],
     [t("dev.spec.idle"), e.idleTimeout === 0 ? t("dev.spec.idleOff") : t("dev.spec.idleMin", { minutes: String(Math.round(e.idleTimeout / 60)) })],
@@ -849,6 +884,10 @@ const DNS_LABEL_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
 const RUNTIME_USER_RE = /^[a-z_][a-z0-9_-]*$/;
 const RUNTIME_USER_MAX = 32;
 const RUN_AS_ID_MAX = 2147483647;
+// spec.lifecycle.idleTimeout is an int32 in seconds, 0 meaning "never shut down",
+// and the CRD bounds it no further, so an int32 is the ceiling. Mirrored from the
+// create route, so the custom box cannot walk the user to a 400.
+const IDLE_TIMEOUT_MAX = 2147483647;
 // The create route's own rules, mirrored so the wizard cannot walk the user to a
 // spec the server would refuse. corev1.EnvVar.name, and the CRD's port type enum.
 const ENV_NAME_RE = /^[-._a-zA-Z][-._a-zA-Z0-9]*$/;
@@ -886,7 +925,16 @@ interface Draft {
   cpu: string;
   memory: string;
   storageGi: number;
+  // spec.storage.pvcRetention: what deleting the environment does to the
+  // workspace claim. "delete" is the CRD's default and the one the wizard opens
+  // on, stated rather than implied so the choice is visible before it is made.
+  pvcRetention: "retain" | "delete";
   idle: number;
+  // The presets cover the common choices; the custom branch carries everything
+  // else, in minutes as typed — held as a string like the uid/gid boxes, since
+  // an empty box is not 0 (which means "never shut down").
+  idleCustom: boolean;
+  idleMinutes: string;
   // The runtime identity. uid and gid are held as strings, not numbers: a
   // number field would turn an empty box into 0, and 0 is not a missing uid —
   // it is the request to run as root.
@@ -911,6 +959,20 @@ interface Draft {
   args: string;
   command: string;
   ports: PortRow[];
+  // spec.network: RDMA access, independent of the accelerator. rdmaEnabled gates
+  // the block; rdmaType names the fabric, defaulting to roce (the CRD default).
+  // A fabric no node advertises does not fail the write — the environment stays
+  // Pending — so the choice is offered with a hint rather than hidden.
+  rdmaEnabled: boolean;
+  rdmaType: "roce" | "infiniband";
+  // spec.ssh: independent of the environment's type. sshEnabled opens the SSH
+  // endpoint on any type (a jupyter + ssh environment); sshKeysSecret /
+  // sshKeysKey point at the user's own key Secret — one of the labelled Secrets
+  // in the namespace, with a data entry to mount as authorized_keys. Empty means
+  // "let the operator mint a keypair" (the default).
+  sshEnabled: boolean;
+  sshKeysSecret: string;
+  sshKeysKey: string;
 }
 
 // CPU is picked in cores and memory follows it: the platform offers 1x, 2x or 4x
@@ -957,7 +1019,10 @@ function CreateWizard({
     cpu: "2",
     memory: "4Gi",
     storageGi: 200,
+    pvcRetention: "delete",
     idle: 0,
+    idleCustom: false,
+    idleMinutes: "",
     runAsRoot: false,
     runtimeUser: "",
     runAsUser: String(PLATFORM_UID),
@@ -968,7 +1033,18 @@ function CreateWizard({
     args: "",
     command: "",
     ports: [],
+    rdmaEnabled: false,
+    rdmaType: "roce",
+    sshEnabled: false,
+    sshKeysSecret: "",
+    sshKeysKey: "",
   });
+  // The labelled key Secrets in the current namespace, for the SSH picker.
+  // Loaded on demand (when the SSH toggle is turned on) rather than with the
+  // other options, because it depends on the namespace the user picks in step 1.
+  const [sshSecrets, setSshSecrets] = useState<SshKeySecretOption[]>([]);
+  const [sshSecretsLoading, setSshSecretsLoading] = useState(false);
+  const [sshSecretsError, setSshSecretsError] = useState<string | null>(null);
   const [nameError, setNameError] = useState(false);
   const [createBusy, setCreateBusy] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -984,7 +1060,10 @@ function CreateWizard({
         setLoadError(null);
         setDraft((prev) => ({
           ...prev,
-          namespace: d.namespaces[0]?.name ?? "",
+          // The namespace the API offers as the starting point — `default`, or
+          // the platform's configured one. Not "the first that sorts": on a
+          // CubeStack install that was a platform namespace.
+          namespace: d.defaultNamespace ?? "",
           image: d.images[0]?.tag ?? "",
           ...identityOf(d.images[0]),
         }));
@@ -998,6 +1077,66 @@ function CreateWizard({
   }, [open]);
 
   const setField = <K extends keyof Draft>(key: K, value: Draft[K]) => setDraft((prev) => ({ ...prev, [key]: value }));
+
+  // Loads the labelled key Secrets for one namespace, so the SSH picker can
+  // offer only the Secrets the operator will actually mount. Runs on demand
+  // (when the SSH toggle is turned on) and again if the namespace changes while
+  // SSH is on. A failure or an empty list does not block the step — the user can
+  // still create the environment without a bring-your-own key (the operator
+  // mints a keypair in that case) — so the picker degrades to a hint.
+  const loadSshSecrets = useCallback(async (namespace: string) => {
+    if (!namespace) {
+      setSshSecrets([]);
+      return;
+    }
+    setSshSecretsLoading(true);
+    setSshSecretsError(null);
+    try {
+      const res = await apiFetch(`/api/devenvironments/ssh-keys?namespace=${encodeURIComponent(namespace)}`);
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+      const d = (await res.json()) as { secrets: SshKeySecretOption[] };
+      setSshSecrets(d.secrets ?? []);
+    } catch (err) {
+      setSshSecrets([]);
+      setSshSecretsError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setSshSecretsLoading(false);
+    }
+  }, []);
+
+  // The namespace is picked in step 1; the SSH picker (step 3) is scoped to it.
+  // Changing the namespace while SSH is on invalidates the loaded key Secrets,
+  // so they are cleared and re-fetched for the new namespace.
+  const changeNamespace = (namespace: string) => {
+    setDraft((prev) => ({ ...prev, namespace, sshKeysSecret: "", sshKeysKey: "" }));
+    if (draft.sshEnabled) {
+      void loadSshSecrets(namespace);
+    }
+  };
+
+  // The SSH toggle: turning it on loads the labelled key Secrets for the current
+  // namespace (so the picker can offer them); turning it off clears the
+  // bring-your-own key selection.
+  const toggleSsh = (enabled: boolean) => {
+    setDraft((prev) => ({
+      ...prev,
+      sshEnabled: enabled,
+      ...(enabled ? {} : { sshKeysSecret: "", sshKeysKey: "" }),
+    }));
+    if (enabled) {
+      void loadSshSecrets(draft.namespace);
+    }
+  };
+
+  // Selecting a key Secret also picks its first data entry as the default
+  // authorized_keys key, so the user only has to change it if the Secret holds
+  // several entries.
+  const changeSshSecret = (name: string) => {
+    const secret = sshSecrets.find((s) => s.name === name);
+    setDraft((prev) => ({ ...prev, sshKeysSecret: name, sshKeysKey: secret?.keys[0] ?? "" }));
+  };
 
   // Monotonic ids for the step-3 rows, so a row keeps its identity across
   // edits and a deletion removes the row that was clicked rather than whatever
@@ -1036,9 +1175,19 @@ function CreateWizard({
   const gpuRequested = draft.accelerator !== "none";
   const gpuValid = !gpuRequested || (Number.isInteger(draft.gpuCount) && draft.gpuCount >= 1 && draft.gpuCount <= 16);
   const storageValid = Number.isInteger(draft.storageGi) && draft.storageGi >= 20 && draft.storageGi <= 800;
-  const step2Valid = gpuValid && storageValid;
+  // spec.lifecycle.idleTimeout is whatever the user needs it to be, not one of
+  // four values: 30 minutes — the shortest preset — is short enough to stop an
+  // environment someone is reading a notebook in. The custom box is minutes, as
+  // the presets are, and is bounded only by the int32 the CRD holds.
+  const idleMinutes = draft.idleMinutes.trim();
+  const idleCustomValid =
+    /^\d+$/.test(idleMinutes) && Number(idleMinutes) * 60 <= IDLE_TIMEOUT_MAX;
+  const idleValid = !draft.idleCustom || idleCustomValid;
+  const idleTimeoutSeconds = draft.idleCustom ? Number(idleMinutes) * 60 : draft.idle;
+  const step2Valid = gpuValid && storageValid && idleValid;
   const [gpuError, setGpuError] = useState(false);
   const [storageError, setStorageError] = useState(false);
+  const [idleError, setIdleError] = useState(false);
 
   // Root is expressed as uid 0 alone, so the identity the user typed is kept in
   // the draft and only overridden for display and for submission. Turning root
@@ -1106,6 +1255,7 @@ function CreateWizard({
     } else if (step === 2) {
       setGpuError(!gpuValid);
       setStorageError(!storageValid);
+      setIdleError(!idleValid);
       if (!step2Valid) return;
     } else if (step === 3) {
       setAccountError(!accountValid);
@@ -1125,6 +1275,7 @@ function CreateWizard({
     // manipulated directly.
     setGpuError(!gpuValid);
     setStorageError(!storageValid);
+    setIdleError(!idleValid);
     setAccountError(!accountValid);
     setUidGidError(!uidGidValid);
     setMountPathError(!mountPathValid);
@@ -1146,7 +1297,11 @@ function CreateWizard({
       cpu: draft.cpu,
       memory: draft.memory,
       storageGi: draft.storageGi,
-      idleTimeout: draft.idle,
+      // Sent only when the workspace is to outlive the environment: delete is
+      // the CRD's default, and stating it would put a decision in the body the
+      // user never made.
+      ...(draft.pvcRetention === "retain" ? { pvcRetention: "retain" } : {}),
+      idleTimeout: idleTimeoutSeconds,
       // Root is requested by runAsUser 0 alone; the operator serves "root" and
       // ignores spec.runtime.user, so no account is sent with it — sending one
       // would only be reported back as an overridden field.
@@ -1177,6 +1332,20 @@ function CreateWizard({
             })),
           }
         : {}),
+      // spec.network: sent only when RDMA is on; rdmaType names the fabric the
+      // environment joins. Off, the block is absent — the one spelling of no RDMA.
+      ...(draft.rdmaEnabled ? { rdmaEnabled: true, rdmaType: draft.rdmaType } : {}),
+      // spec.ssh: sent only when SSH is on (independent of type). The bring-your-
+      // own key Secret is included only when one is chosen; otherwise the operator
+      // mints a keypair for the environment.
+      ...(draft.sshEnabled
+        ? {
+            sshEnabled: true,
+            ...(draft.sshKeysSecret
+              ? { sshKeysSecret: draft.sshKeysSecret, sshKeysKey: draft.sshKeysKey }
+              : {}),
+          }
+        : {}),
     };
     apiFetch("/api/devenvironments", {
       method: "POST",
@@ -1199,6 +1368,12 @@ function CreateWizard({
     t("dev.wizard.step.confirm"),
   ];
   const labelFor = (tag: string) => options?.images.find((i) => i.tag === tag)?.label ?? tag;
+  // The interface the chosen image was built for, when the catalog knows it. The
+  // image and the type are two independent choices, and the vendor images come
+  // in per-interface pairs, so the two can disagree: an ssh image under type
+  // jupyter is a token nothing serves. The catalog is what makes that visible,
+  // so it is said rather than left to be met on the cluster.
+  const imageInterface = options?.images.find((i) => i.tag === draft.image)?.interface;
 
   // What the user will see on the confirm step. Built by pushing into a typed
   // array rather than spreading, so the conditional rows stay [string, string].
@@ -1211,7 +1386,11 @@ function CreateWizard({
     [t("dev.wizard.cpu"), t("dev.cpu.cores", { n: draft.cpu })],
     [t("dev.wizard.memory"), draft.memory],
     [t("dev.wizard.storage"), `${draft.storageGi}Gi`],
-    [t("dev.wizard.idle"), draft.idle === 0 ? t("dev.spec.idleOff") : t("dev.spec.idleMin", { minutes: String(draft.idle / 60) })],
+    [
+      t("dev.wizard.pvcRetention"),
+      draft.pvcRetention === "retain" ? t("dev.wizard.pvcRetentionRetain") : t("dev.wizard.pvcRetentionDelete"),
+    ],
+    [t("dev.wizard.idle"), idleTimeoutSeconds === 0 ? t("dev.spec.idleOff") : t("dev.spec.idleMin", { minutes: String(idleTimeoutSeconds / 60) })],
     [
       t("dev.wizard.identity"),
       draft.runAsRoot
@@ -1230,6 +1409,15 @@ function CreateWizard({
   if (draft.args.trim()) summaryRows.push([t("dev.wizard.args"), draft.args.trim()]);
   if (filledPorts.length) {
     summaryRows.push([t("dev.wizard.ports"), filledPorts.map((r) => `${r.name.trim()}:${r.port.trim()}/${r.type}`).join(" · ")]);
+  }
+  if (draft.rdmaEnabled) {
+    summaryRows.push([t("dev.wizard.rdma"), draft.rdmaType === "roce" ? "RoCE" : "InfiniBand"]);
+  }
+  if (draft.sshEnabled) {
+    summaryRows.push([
+      t("dev.wizard.ssh"),
+      draft.sshKeysSecret ? `${draft.sshKeysSecret}:${draft.sshKeysKey}` : t("dev.wizard.sshKeysPlatform"),
+    ]);
   }
 
   return (
@@ -1262,13 +1450,20 @@ function CreateWizard({
                   <TextField size="small" fullWidth autoFocus value={draft.name} onChange={(e) => setField("name", e.target.value)} placeholder="e.g. jupyter-nlp-ln" />
                 </WizField>
                 <WizField label={t("dev.wizard.namespace")}>
-                  <Select size="small" fullWidth value={draft.namespace} onChange={(e) => setField("namespace", e.target.value)}>
+                  <Select size="small" fullWidth data-od-id="wizard-namespace" value={draft.namespace} onChange={(e) => changeNamespace(e.target.value)}>
                     {options.namespaces.map((n) => (
                       <MenuItem key={n.name} value={n.name}>{n.name}</MenuItem>
                     ))}
                   </Select>
                 </WizField>
-                <WizField label={t("dev.wizard.type")}>
+                <WizField
+                  label={t("dev.wizard.type")}
+                  hint={
+                    imageInterface && imageInterface !== draft.type
+                      ? t("dev.wizard.typeMismatch", { interface: t(`dev.wizard.type.${imageInterface}`) })
+                      : undefined
+                  }
+                >
                   <Box sx={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: "10px" }}>
                     {(["jupyter", "ssh", "vscode"] as const).map((tp) => (
                       <Box
@@ -1368,13 +1563,47 @@ function CreateWizard({
                     <TextField size="small" fullWidth type="number" inputProps={{ min: 20, max: 800 }} value={draft.storageGi} onChange={(e) => setField("storageGi", Number(e.target.value))} />
                   </WizField>
                   <WizField label={t("dev.wizard.idle")} hint={t("dev.wizard.idleHint")}>
-                    <Select size="small" fullWidth value={draft.idle} onChange={(e) => setField("idle", Number(e.target.value))}>
-                      <MenuItem value={0}>{t("dev.wizard.idle0")}</MenuItem>
-                      <MenuItem value={1800}>30</MenuItem>
-                      <MenuItem value={3600}>60</MenuItem>
-                      <MenuItem value={14400}>240</MenuItem>
+                    <Select
+                      size="small"
+                      fullWidth
+                      data-od-id="wizard-idle"
+                      value={draft.idleCustom ? "custom" : String(draft.idle)}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        // Choosing custom keeps whatever was in the minutes box,
+                        // so switching back and forth does not lose the value.
+                        setDraft((prev) =>
+                          v === "custom"
+                            ? { ...prev, idleCustom: true, idleMinutes: prev.idleMinutes || (prev.idle ? String(prev.idle / 60) : "") }
+                            : { ...prev, idleCustom: false, idle: Number(v) },
+                        );
+                      }}
+                    >
+                      <MenuItem value="0">{t("dev.wizard.idle0")}</MenuItem>
+                      <MenuItem value="1800">30</MenuItem>
+                      <MenuItem value="3600">60</MenuItem>
+                      <MenuItem value="14400">240</MenuItem>
+                      <MenuItem value="custom">{t("dev.wizard.idleCustom")}</MenuItem>
                     </Select>
                   </WizField>
+                  {draft.idleCustom ? (
+                    <WizField
+                      label={t("dev.wizard.idleMinutes")}
+                      hint={t("dev.wizard.idleMinutesHint")}
+                      error={idleError && !idleCustomValid}
+                      errorText={t("dev.wizard.errIdleCustom")}
+                    >
+                      <TextField
+                        size="small"
+                        fullWidth
+                        type="number"
+                        inputProps={{ min: 0 }}
+                        data-od-id="wizard-idle-minutes"
+                        value={draft.idleMinutes}
+                        onChange={(e) => setField("idleMinutes", e.target.value)}
+                      />
+                    </WizField>
+                  ) : null}
                 </Box>
               </Box>
             )}
@@ -1396,6 +1625,18 @@ function CreateWizard({
                       onChange={(e) => setField("mountPath", e.target.value)}
                       placeholder={derivedMountPath}
                     />
+                  </WizField>
+                  <WizField label={t("dev.wizard.pvcRetention")} hint={t("dev.wizard.pvcRetentionHint")}>
+                    <Select
+                      size="small"
+                      fullWidth
+                      data-od-id="wizard-pvc-retention"
+                      value={draft.pvcRetention}
+                      onChange={(e) => setField("pvcRetention", e.target.value as Draft["pvcRetention"])}
+                    >
+                      <MenuItem value="delete">{t("dev.wizard.pvcRetentionDelete")}</MenuItem>
+                      <MenuItem value="retain">{t("dev.wizard.pvcRetentionRetain")}</MenuItem>
+                    </Select>
                   </WizField>
                   <WizField label={t("dev.wizard.pvcs")} error={pvcError} errorText={t("dev.wizard.errPvc")}>
                     {draft.pvcs.map((r) => (
@@ -1552,6 +1793,69 @@ function CreateWizard({
                     ))}
                     <AddRowButton label={t("dev.wizard.addPort")} onClick={() => addRow("ports", { name: "", port: "", type: "http" })} />
                   </WizField>
+                </WizSection>
+
+                <WizSection odId="sec-rdma" title={t("dev.wizard.rdma")} badge="network">
+                  <Box sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "12px", py: "8px" }}>
+                    <Box>
+                      <Box sx={{ fontSize: 12.5 }}>{t("dev.wizard.rdmaEnabled")}</Box>
+                      <Box sx={{ fontSize: 11, color: "text.secondary", mt: "2px" }}>{t("dev.wizard.rdmaHint")}</Box>
+                    </Box>
+                    <Switch size="small" checked={draft.rdmaEnabled} onChange={(e) => setField("rdmaEnabled", e.target.checked)} data-od-id="wizard-rdma" />
+                  </Box>
+                  {draft.rdmaEnabled ? (
+                    <WizField label={t("dev.wizard.rdmaType")} hint={t("dev.wizard.rdmaTypeHint")}>
+                      <Select size="small" value={draft.rdmaType} onChange={(e) => setField("rdmaType", e.target.value as Draft["rdmaType"])} data-od-id="wizard-rdma-type">
+                        <MenuItem value="roce">RoCE</MenuItem>
+                        <MenuItem value="infiniband">InfiniBand</MenuItem>
+                      </Select>
+                    </WizField>
+                  ) : null}
+                </WizSection>
+
+                <WizSection odId="sec-ssh" title={t("dev.wizard.ssh")} badge="ssh">
+                  <Box sx={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: "12px", py: "8px" }}>
+                    <Box>
+                      <Box sx={{ fontSize: 12.5 }}>{t("dev.wizard.sshEnabled")}</Box>
+                      <Box sx={{ fontSize: 11, color: "text.secondary", mt: "2px" }}>{t("dev.wizard.sshHint")}</Box>
+                    </Box>
+                    <Switch size="small" checked={draft.sshEnabled} onChange={(e) => toggleSsh(e.target.checked)} data-od-id="wizard-ssh" />
+                  </Box>
+                  {draft.sshEnabled ? (
+                    <WizField label={t("dev.wizard.sshKeysSecret")} hint={t("dev.wizard.sshKeysSecretHint")}>
+                      {sshSecretsLoading ? (
+                        <Typography sx={{ fontSize: 12, color: "text.secondary" }} data-od-id="wizard-ssh-keys-loading">
+                          {t("dev.wizard.sshKeysLoading")}
+                        </Typography>
+                      ) : sshSecretsError ? (
+                        <Typography sx={{ fontSize: 12, color: "text.secondary" }} data-od-id="wizard-ssh-keys-error">
+                          {t("dev.wizard.sshKeysError", { error: sshSecretsError })}
+                        </Typography>
+                      ) : sshSecrets.length === 0 ? (
+                        <Typography sx={{ fontSize: 12, color: "text.secondary" }} data-od-id="wizard-ssh-keys-empty">
+                          {t("dev.wizard.sshKeysEmpty")}
+                        </Typography>
+                      ) : (
+                        <>
+                          <Select size="small" fullWidth value={draft.sshKeysSecret} onChange={(e) => changeSshSecret(e.target.value)} data-od-id="wizard-ssh-secret">
+                            <MenuItem value="">{t("dev.wizard.sshKeysPlatform")}</MenuItem>
+                            {sshSecrets.map((s) => (
+                              <MenuItem key={s.name} value={s.name}>{s.name}</MenuItem>
+                            ))}
+                          </Select>
+                          {draft.sshKeysSecret ? (
+                            <WizField label={t("dev.wizard.sshKeysKey")} hint={t("dev.wizard.sshKeysKeyHint")}>
+                              <Select size="small" value={draft.sshKeysKey} onChange={(e) => setField("sshKeysKey", e.target.value)} data-od-id="wizard-ssh-key">
+                                {(sshSecrets.find((s) => s.name === draft.sshKeysSecret)?.keys ?? []).map((k) => (
+                                  <MenuItem key={k} value={k}>{k}</MenuItem>
+                                ))}
+                              </Select>
+                            </WizField>
+                          ) : null}
+                        </>
+                      )}
+                    </WizField>
+                  ) : null}
                 </WizSection>
               </Box>
             )}

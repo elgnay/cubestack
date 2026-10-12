@@ -29,7 +29,7 @@ function stubCluster() {
         },
         spec: {
           type: "jupyter",
-          image: "harbor.isuanova.com/suanova/base-cuda:latest",
+          image: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest",
           running: true,
           resources: { gpu: { vendor: "nvidia", count: 2 }, cpu: "16", memory: "64Gi" },
           storage: { size: "200Gi", mountPath: "/home/ubuntu" },
@@ -100,7 +100,7 @@ describe("GET /api/devenvironments", () => {
       name: "jupyter-nlp-ln",
       namespace: "project-a",
       type: "jupyter",
-      image: "harbor.isuanova.com/suanova/base-cuda:latest",
+      image: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest",
       running: true,
       resources: { gpu: { vendor: "nvidia", count: 2 }, cpu: "16", memory: "64Gi" },
       storage: { size: "200Gi", mountPath: "/home/ubuntu" },
@@ -130,7 +130,9 @@ describe("GET /api/devenvironments", () => {
           metadata: { name: "pinned", namespace: "project-a" },
           spec: {
             type: "ssh",
-            storage: { size: "100Gi", mountPath: "/data" },
+            // The workspace is to outlive the environment, so the projection
+            // has to carry that rather than the schema default.
+            storage: { size: "100Gi", mountPath: "/data", pvcRetention: "retain" },
             volumes: [{ name: "data-cache", pvcName: "data-cache", mountPath: "/cache", readOnly: true }],
             ports: [{ name: "api", containerPort: 8080 }],
             runtime: { env: [{ name: "HF_TOKEN" }, { name: "HF_HOME" }], command: ["python", "-m", "jupyter", "lab"], args: ["--port", "8080"] },
@@ -152,7 +154,7 @@ describe("GET /api/devenvironments", () => {
     const body = await (await GET(await authedGet(), undefined)).json();
     const [pinned, derived] = body.items;
 
-    expect(pinned.storage).toEqual({ size: "100Gi", mountPath: "/data" });
+    expect(pinned.storage).toEqual({ size: "100Gi", mountPath: "/data", pvcRetention: "retain" });
     expect(pinned.volumes).toEqual([{ name: "data-cache", pvcName: "data-cache", mountPath: "/cache", readOnly: true }]);
     // The type is defaulted the way the CRD does; the env value is not
     // projected at all — a value can be a registry token, and the names are
@@ -163,7 +165,9 @@ describe("GET /api/devenvironments", () => {
     expect(pinned.args).toEqual(["--port", "8080"]);
     expect(pinned.jupyterTokenSecret).toBeNull();
 
-    expect(derived.storage).toEqual({ size: "100Gi", mountPath: null });
+    // Never "unknown": the workspace of an object that predates the field is
+    // reclaimed by the schema default, and the delete path reads this.
+    expect(derived.storage).toEqual({ size: "100Gi", mountPath: null, pvcRetention: "delete" });
     expect(derived.jupyterTokenSecret).toEqual({ name: "derived-jupyter-token", namespace: "project-a" });
   });
 
@@ -254,6 +258,19 @@ describe("POST /api/devenvironments", () => {
     expect(createNamespacedCustomObject).not.toHaveBeenCalled();
   });
 
+  it("takes any idle timeout an int32 can hold, and refuses what it cannot", async () => {
+    // spec.lifecycle.idleTimeout is an int32 in seconds, 0 meaning "never shut
+    // down", and the CRD bounds it no further — so the wizard's four presets are
+    // not the API's rule. Anything wider than an int32 would come back from the
+    // API server as an opaque 422, which is what this bound exists to prevent.
+    expect(await postedSpec({ idleTimeout: 300 })).toMatchObject({ lifecycle: { idleTimeout: 300 } });
+    expect(await postedSpec({ idleTimeout: 2147483647 })).toMatchObject({ lifecycle: { idleTimeout: 2147483647 } });
+
+    expect(await rejectedPost({ idleTimeout: -1 })).toContain("idleTimeout");
+    expect(await rejectedPost({ idleTimeout: 1.5 })).toContain("idleTimeout");
+    expect(await rejectedPost({ idleTimeout: 2147483648 })).toContain("idleTimeout");
+  });
+
   it("creates the CR with CRD-backed fields and carries over optional cpu/memory", async () => {
     createNamespacedCustomObject.mockResolvedValue({});
     listClusterCustomObject.mockResolvedValue({ items: [{ metadata: { name: "jupyter-nlp-ln", namespace: "project-a" } }] });
@@ -265,7 +282,7 @@ describe("POST /api/devenvironments", () => {
           name: "jupyter-recsys",
           namespace: "project-a",
           type: "jupyter",
-          image: "harbor.isuanova.com/suanova/base-cuda:latest",
+          image: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest",
           accelerator: "nvidia",
           gpuCount: 4,
           cpu: "64",
@@ -286,7 +303,7 @@ describe("POST /api/devenvironments", () => {
       metadata: { name: "jupyter-recsys", namespace: "project-a" },
       spec: {
         type: "jupyter",
-        image: "harbor.isuanova.com/suanova/base-cuda:latest",
+        image: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest",
         running: true,
         resources: { gpu: { vendor: "nvidia", count: 4 }, cpu: "64", memory: "256Gi" },
         // Derived from the image, never sent by the client: the self-authored
@@ -546,6 +563,37 @@ describe("POST /api/devenvironments", () => {
     expect(pinned.storage).toEqual({ size: "100Gi", mountPath: "/data" });
   });
 
+  it("states storage.pvcRetention only when the workspace is to outlive the environment", async () => {
+    // "delete" is what the CRD applies to an absent field, so writing it would
+    // put the platform's default in the user's mouth; the body names only the
+    // decision that changes the outcome.
+    const retained = await postedSpec({ pvcRetention: "retain" });
+    expect(retained.storage).toEqual({ size: "100Gi", pvcRetention: "retain" });
+
+    const explicitlyDefault = await postedSpec({ pvcRetention: "delete" });
+    expect(explicitlyDefault.storage).toEqual({ size: "100Gi" });
+
+    const silent = await postedSpec({});
+    expect(silent.storage).toEqual({ size: "100Gi" });
+  });
+
+  it("rejects a pvcRetention outside the CRD's enum, or with no claim behind it", async () => {
+    expect(await rejectedPost({ pvcRetention: "keep" })).toContain("pvcRetention");
+    // spec.storage.pvcRetention lives inside spec.storage, so a policy with no
+    // size beside it decides nothing — the API server would prune the block.
+    const { POST } = await importRoute();
+    const res = await POST(
+      await authedRequest({
+        method: "POST",
+        body: JSON.stringify({ name: "ok-name", namespace: "project-a", type: "ssh", image: "img", pvcRetention: "retain" }),
+      }),
+      undefined,
+    );
+    expect(res.status).toBe(400);
+    expect(createNamespacedCustomObject).not.toHaveBeenCalled();
+    expect((await res.json()).error).toContain("pvcRetention");
+  });
+
   it("rejects a workspace path that is not absolute, or that has no claim behind it", async () => {
     expect(await rejectedPost({ mountPath: "data" })).toContain("绝对路径");
     expect(await rejectedPost({ mountPath: "/" })).toContain("绝对路径");
@@ -711,6 +759,46 @@ describe("POST /api/devenvironments", () => {
     // its name and number alone.
     const spec = await postedSpec({ ports: [{ type: "tcp" }] });
     expect("ports" in spec).toBe(false);
+  });
+
+  it("states spec.network only when RDMA is on, defaulting the fabric to roce", async () => {
+    const withRdma = await postedSpec({ rdmaEnabled: true });
+    // The block is written only when rdmaEnabled; the fabric defaults to roce,
+    // the CRD's default, so a client that only flips the switch still states a
+    // valid fabric.
+    expect(withRdma.network).toEqual({ rdmaEnabled: true, rdmaType: "roce" });
+
+    const explicit = await postedSpec({ rdmaEnabled: true, rdmaType: "infiniband" });
+    expect(explicit.network).toEqual({ rdmaEnabled: true, rdmaType: "infiniband" });
+
+    // Off: the block is absent, not a false flag the operator would have to read.
+    const off = await postedSpec({});
+    expect("network" in off).toBe(false);
+  });
+
+  it("rejects an rdmaType outside the CRD's enum", async () => {
+    expect(await rejectedPost({ rdmaEnabled: true, rdmaType: "ethernet" })).toContain("rdmaType");
+  });
+
+  it("states spec.ssh only when SSH is on, with the optional bring-your-own key Secret", async () => {
+    const withSsh = await postedSpec({ sshEnabled: true });
+    // The block is written only when sshEnabled; with no bring-your-own key
+    // Secret, the operator mints a keypair for the environment.
+    expect(withSsh.ssh).toEqual({ enabled: true });
+
+    const withKey = await postedSpec({ sshEnabled: true, sshKeysSecret: "alice-keys", sshKeysKey: "alice@laptop" });
+    expect(withKey.ssh).toEqual({
+      enabled: true,
+      authorizedKeysSecret: { name: "alice-keys", key: "alice@laptop" },
+    });
+
+    // Off: the block is absent, not a false flag the operator would have to read.
+    const off = await postedSpec({});
+    expect("ssh" in off).toBe(false);
+  });
+
+  it("rejects a bring-your-own key Secret that names no data entry", async () => {
+    expect(await rejectedPost({ sshEnabled: true, sshKeysSecret: "alice-keys" })).toContain("sshKeysKey");
   });
 });
 

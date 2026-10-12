@@ -12,10 +12,24 @@ import { devEnvironmentList, devEnvironmentSummary } from "@/test/fixtures/deven
 
 const OPTIONS = {
   namespaces: [{ name: "project-a" }, { name: "default" }],
+  // The API names the starting point rather than leaving the wizard to take the
+  // first entry: project-a sorts first here, and is not the answer.
+  defaultNamespace: "default",
   images: [
-    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100 },
-    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu" },
-    { tag: "harbor.isuanova.com/suanova/base-cuda:latest", label: "suanova/base-cuda · NVIDIA CUDA (ubuntu)", user: "ubuntu" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-minimal:latest", label: "suanova/jupyter-minimal · CPU · JupyterLab (jovyan)", user: "jovyan", runAsGroup: 100, interface: "jupyter" },
+    { tag: "harbor.isuanova.com/suanova/ssh-ubuntu22.04:latest", label: "suanova/ssh-ubuntu22.04 · CPU · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
+    { tag: "harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest", label: "suanova/jupyter-cuda-pytorch · NVIDIA CUDA · JupyterLab (ubuntu)", user: "ubuntu", interface: "jupyter" },
+    { tag: "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest", label: "suanova/ssh-maca-pytorch · Metax MACA · SSH (ubuntu)", user: "ubuntu", interface: "ssh" },
+  ],
+};
+
+// The labelled key Secrets the wizard's SSH picker loads when the SSH toggle is
+// turned on (served by /api/devenvironments/ssh-keys).
+const SSH_KEYS = {
+  namespace: "project-a",
+  secrets: [
+    { name: "alice-keys", keys: ["alice@laptop", "alice@phone"] },
+    { name: "bob-keys", keys: ["bob@desktop"] },
   ],
 };
 
@@ -98,7 +112,7 @@ describe("dev environments page", () => {
     expect(container.textContent).toContain("连接信息");
     expect(container.textContent).toContain("https://dev.cubestack.local/ws/jupyter-nlp-ln");
     expect(container.textContent).toContain("规格与状态");
-    expect(container.textContent).toContain("harbor.isuanova.com/suanova/base-cuda:latest");
+    expect(container.textContent).toContain("harbor.isuanova.com/suanova/jupyter-cuda-pytorch:latest");
     // The GPU environment's accelerator, and the stopped one's absence of one.
     expect(container.textContent).toContain("1 × nvidia");
     expect(container.textContent).toContain("无加速卡");
@@ -222,11 +236,16 @@ describe("dev environments page", () => {
     act(() => root.unmount());
   });
 
-  it("gives a row only the actions its phase allows", async () => {
+  it("gates start/stop on the phase and never gates delete on it", async () => {
     stubData([
       devEnvironmentSummary(),
       devEnvironmentSummary({ name: "sleeping-env", phase: "Stopped", endpoints: [], conditions: [] }),
       devEnvironmentSummary({ name: "booting-env", phase: "Pending", endpoints: [], conditions: [] }),
+      // The two phases the console does not offer a transition for. An empty
+      // phase is what a controller failure before the status write leaves
+      // behind; Failed is what the controller writes when it refuses the spec.
+      devEnvironmentSummary({ name: "phaseless-env", phase: null, endpoints: [], conditions: [] }),
+      devEnvironmentSummary({ name: "failed-env", phase: "Failed", endpoints: [], conditions: [] }),
     ]);
     const { container, root } = renderPage();
     await act(async () => {});
@@ -237,22 +256,98 @@ describe("dev environments page", () => {
       });
     const item = (kind: string, name: string) => document.body.querySelector(`[data-od-id="act-${kind}-${name}"]`);
 
-    // Running: stop, and nothing else. Deleting an environment that is in the
-    // middle of work is not a choice a row should put one click away.
+    // Running: stop, and no start — but the way out is still there.
     open("jupyter-nlp-ln");
     expect(item("stop", "jupyter-nlp-ln")).not.toBeNull();
     expect(item("start", "jupyter-nlp-ln")).toBeNull();
-    expect(item("del", "jupyter-nlp-ln")).toBeNull();
+    expect(item("del", "jupyter-nlp-ln")).not.toBeNull();
 
-    // Stopped: start, plus the one destructive choice.
+    // Stopped: start, and delete.
     open("sleeping-env");
     expect(item("start", "sleeping-env")).not.toBeNull();
     expect(item("del", "sleeping-env")).not.toBeNull();
     expect(item("stop", "sleeping-env")).toBeNull();
 
-    // Pending: mid-transition, where the controller rather than the user decides
-    // what happens next — so there is no menu to open.
-    expect(kebab(container, "booting-env").disabled).toBe(true);
+    // Pending, empty and Failed: no transition to offer — the controller owns
+    // that — but the environment is still one the user can remove.
+    for (const name of ["booting-env", "phaseless-env", "failed-env"]) {
+      expect(kebab(container, name).disabled).toBe(false);
+      open(name);
+      expect(item("start", name)).toBeNull();
+      expect(item("stop", name)).toBeNull();
+      expect(item("del", name)).not.toBeNull();
+    }
+
+    act(() => root.unmount());
+  });
+
+  it("deletes an environment whose phase the controller never wrote", async () => {
+    const deletes: Array<Record<string, unknown> | undefined> = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === "DELETE") {
+          deletes.push(JSON.parse(String(init.body)));
+          return { ok: true, status: 200, json: async () => ({ ok: true }) };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            items: [devEnvironmentSummary({ name: "phaseless-env", phase: null, endpoints: [], conditions: [] })],
+          }),
+        };
+      }),
+    );
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { root } = renderPage();
+    await act(async () => {});
+
+    rowAct("phaseless-env", "del");
+    await act(async () => {});
+
+    // Without this the object is a dead end: no phase the menu could match, and
+    // no other delete path in the console.
+    expect(deletes).toEqual([{ namespace: "project-a", name: "phaseless-env" }]);
+
+    act(() => root.unmount());
+  });
+
+  it("does not read a missing phase into the connection card's copy", async () => {
+    stubData([
+      devEnvironmentSummary({ name: "phaseless-env", phase: null, endpoints: [], conditions: [] }),
+    ]);
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    // "The environment is —" is what interpolating a null phase rendered.
+    expect(container.textContent).toContain("环境尚未上报状态");
+    expect(container.textContent).not.toContain("环境当前—");
+
+    act(() => root.unmount());
+  });
+
+  it("claims an idle expiry only for an environment that has one", async () => {
+    // The guide used to state the idle clause unconditionally, so an
+    // environment created with the timeout disabled carried it on the same
+    // screen that showed "disabled" — and named an auth proxy a cluster
+    // without the Agent Router does not have.
+    stubData([devEnvironmentSummary({ name: "never-idle-env", idleTimeout: 0 })]);
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    expect(container.textContent).not.toContain("空闲超时生效");
+    expect(container.textContent).not.toContain("AI Gateway 鉴权代理");
+
+    act(() => root.unmount());
+  });
+
+  it("states the idle timeout the environment carries, in minutes", async () => {
+    stubData([devEnvironmentSummary({ name: "idle-env", idleTimeout: 3600 })]);
+    const { container, root } = renderPage();
+    await act(async () => {});
+
+    expect(container.textContent).toContain("超过 60 分钟无活动即停止");
 
     act(() => root.unmount());
   });
@@ -297,6 +392,35 @@ describe("dev environments page", () => {
     rowAct("ssh-dataset-prep", "del");
     await act(async () => {});
     expect(deletes).toHaveLength(0);
+
+    act(() => root.unmount());
+  });
+
+  it("names the workspace consequence of a delete, per that environment's policy", async () => {
+    stubData([
+      devEnvironmentSummary({ name: "kept-env", phase: "Stopped", endpoints: [], conditions: [], storage: { size: "20Gi", mountPath: null, pvcRetention: "retain" } }),
+      devEnvironmentSummary({ name: "purged-env", phase: "Stopped", endpoints: [], conditions: [], storage: { size: "200Gi", mountPath: null, pvcRetention: "delete" } }),
+    ]);
+    const prompts: string[] = [];
+    // Answering "no" keeps the request off the wire: what is under test is the
+    // sentence the user reads at the moment of the decision, not the delete.
+    vi.spyOn(window, "confirm").mockImplementation((message?: string) => {
+      prompts.push(String(message));
+      return false;
+    });
+    const { root } = renderPage();
+    await act(async () => {});
+
+    rowAct("kept-env", "del");
+    rowAct("purged-env", "del");
+
+    // A retained workspace outlives the environment and nothing else names it,
+    // so the confirmation does — it is how one is found again.
+    expect(prompts[0]).toContain("workspace-kept-env-0");
+    expect(prompts[0]).toContain("20Gi");
+    // The default policy is stated as the loss it is, not as the field name.
+    expect(prompts[1]).toContain("workspace-purged-env-0");
+    expect(prompts[1]).toContain("200Gi");
 
     act(() => root.unmount());
   });
@@ -362,6 +486,9 @@ describe("create wizard", () => {
         const url = String(input);
         if (url.includes("/options")) {
           return Promise.resolve({ ok: true, status: 200, json: async () => OPTIONS });
+        }
+        if (url.includes("/ssh-keys")) {
+          return Promise.resolve({ ok: true, status: 200, json: async () => SSH_KEYS });
         }
         return Promise.resolve({ ok: true, status: 200, json: async () => ({ items: devEnvironmentList() }) });
       }),
@@ -506,6 +633,63 @@ describe("create wizard", () => {
     const [, init] = call as [RequestInfo | URL, RequestInit];
     return JSON.parse(init.body as string);
   }
+
+  it("takes an idle timeout that is not one of the four presets", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep2(container);
+
+    // The presets are offered, plus the custom case: the CRD takes any second
+    // count, and 30 minutes — the shortest preset — is short enough to stop an
+    // environment someone is reading a notebook in.
+    const idle = step2Selects()[3];
+    expect(idle.textContent).toBe("不启用");
+    expect(await selectOption(idle, "自定义…")).toEqual(["不启用", "30", "60", "240", "自定义…"]);
+
+    // The custom branch is minutes, as the presets are, and reaches the API as
+    // seconds.
+    setInput(document.body.querySelector('[data-od-id="wizard-idle-minutes"] input') as HTMLInputElement, "5");
+
+    await nextStep();
+    expect(document.body.querySelector('[data-step="3"]')).not.toBeNull();
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    expect(createdBody()).toMatchObject({ idleTimeout: 300 });
+
+    act(() => root.unmount());
+  });
+
+  it("blocks the step on a custom idle that is not a whole number of minutes", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep2(container);
+
+    await selectOption(step2Selects()[3], "自定义…");
+    const minutes = document.body.querySelector('[data-od-id="wizard-idle-minutes"] input') as HTMLInputElement;
+
+    // Empty is not 0: 0 means "never shut down", which the presets state.
+    await nextStep();
+    expect(document.body.querySelector('[data-step="3"]')).toBeNull();
+    expect(document.body.textContent).toContain("请输入非负整数分钟数");
+
+    setInput(minutes, "1.5");
+    await nextStep();
+    expect(document.body.querySelector('[data-step="3"]')).toBeNull();
+
+    setInput(minutes, "-30");
+    await nextStep();
+    expect(document.body.querySelector('[data-step="3"]')).toBeNull();
+
+    setInput(minutes, "30");
+    await nextStep();
+    expect(document.body.querySelector('[data-step="3"]')).not.toBeNull();
+
+    act(() => root.unmount());
+  });
 
   it("offers 1/2/4/8/16 cores, and lists only the memory sizes those cores allow", async () => {
     const { container, root } = renderWithBoth();
@@ -964,6 +1148,159 @@ describe("create wizard", () => {
     setInput(rowInputs("port-num")[0], "9229");
     await nextStep();
     expect(document.body.querySelector('[data-step="4"]')).not.toBeNull();
+
+    act(() => root.unmount());
+  });
+
+  it("sends spec.network only when the RDMA toggle is on", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep3(container);
+
+    // The RDMA toggle is off by default, so no network reaches the body.
+    // Flipping it on exposes the fabric select and writes spec.network.
+    const rdmaSwitch = document.body.querySelector('[data-od-id="wizard-rdma"] input') as HTMLInputElement;
+    await act(async () => {
+      rdmaSwitch.click();
+    });
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    expect(createdBody()).toMatchObject({ rdmaEnabled: true, rdmaType: "roce" });
+
+    act(() => root.unmount());
+  });
+
+  it("sends spec.ssh with a bring-your-own key Secret when SSH is on", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep3(container);
+
+    // Turning on the SSH toggle loads the labelled key Secrets for the namespace
+    // and exposes the picker (independent of the environment's type).
+    const sshSwitch = document.body.querySelector('[data-od-id="wizard-ssh"] input') as HTMLInputElement;
+    await act(async () => {
+      sshSwitch.click();
+    });
+    // Let the ssh-keys fetch resolve before interacting with the picker.
+    await act(async () => {});
+
+    // Select a labelled key Secret; the key defaults to its first data entry.
+    // The picker opens from its inner combobox, as MUI attaches the mousedown
+    // handler there and the od-id sits on the field root.
+    const sshSecretSelect = document.body.querySelector(
+      '[data-od-id="wizard-ssh-secret"] [role="combobox"]',
+    ) as HTMLElement;
+    expect(sshSecretSelect).not.toBeNull();
+    await selectOption(sshSecretSelect, "alice-keys");
+
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    const body = createdBody();
+    expect(body).toMatchObject({
+      sshEnabled: true,
+      sshKeysSecret: "alice-keys",
+      sshKeysKey: "alice@laptop",
+    });
+
+    act(() => root.unmount());
+  });
+
+  it("says when the chosen image does not serve the chosen type", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // The catalog opens on a jupyter image under the jupyter type: nothing to say.
+    expect(document.body.textContent).not.toContain("与当前环境类型不一致");
+
+    // An ssh image under the jupyter type is the combination the per-interface
+    // vendor pairs make expressible, and the one nothing can serve: the
+    // operator would publish a jupyter token for an image whose sshd is all
+    // that starts.
+    setInput(
+      document.body.querySelector('[data-od-id="wizard-image"] input') as HTMLInputElement,
+      "harbor.isuanova.com/suanova/ssh-maca-pytorch:latest",
+    );
+    await act(async () => {});
+    expect(document.body.textContent).toContain("与当前环境类型不一致");
+
+    // Choosing the type the image was built for settles it.
+    await act(async () => {
+      const sshType = Array.from(document.body.querySelectorAll('[data-step="1"] button')).find((b) =>
+        b.textContent?.startsWith("SSH"),
+      ) as HTMLElement;
+      sshType.click();
+    });
+    expect(document.body.textContent).not.toContain("与当前环境类型不一致");
+
+    act(() => root.unmount());
+  });
+
+  it("opens the wizard on the namespace the API offers, not the first it lists", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await act(async () => {
+      (container.querySelector('[data-od-id="create-env-btn"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    // project-a sorts first in the options; the API's default is `default`. On
+    // a real install the first entry used to be a platform namespace, which an
+    // untouched wizard then created the environment in.
+    const namespace = document.body.querySelector('[data-od-id="wizard-namespace"] [role="combobox"]') as HTMLElement;
+    expect(namespace.textContent).toBe("default");
+    // Every namespace the API offered is still selectable.
+    expect(await selectOption(namespace, "project-a")).toEqual(["project-a", "default"]);
+
+    act(() => root.unmount());
+  });
+
+  it("sends spec.storage.pvcRetention when the workspace is to outlive the environment", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep3(container);
+
+    // The control opens on the CRD's default (delete), which the body does not
+    // state: absent and delete mean the same thing to the API server.
+    await nextStep();
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+    expect("pvcRetention" in createdBody()).toBe(false);
+
+    act(() => root.unmount());
+  });
+
+  it("keeps the workspace when the user asks for it, and says so on the confirm step", async () => {
+    const { container, root } = renderWithBoth();
+    await act(async () => {});
+    await toStep3(container);
+
+    const retention = document.body.querySelector('[data-od-id="wizard-pvc-retention"] [role="combobox"]') as HTMLElement;
+    expect(retention).not.toBeNull();
+    // The two-way choice names the consequence, not the field.
+    expect(await selectOption(retention, "保留工作区卷")).toEqual(["随环境一并删除(默认)", "保留工作区卷"]);
+
+    await nextStep();
+    expect(document.body.textContent).toContain("保留工作区卷");
+    await act(async () => {
+      (document.body.querySelector('[data-od-id="wizard-create"]') as HTMLElement).click();
+    });
+    await act(async () => {});
+
+    expect(createdBody()).toMatchObject({ storageGi: 200, pvcRetention: "retain" });
 
     act(() => root.unmount());
   });
