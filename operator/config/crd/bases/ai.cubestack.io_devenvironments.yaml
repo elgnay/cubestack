@@ -665,7 +665,10 @@ spec:
                   URL, the SSH address, and any extra application port exposures. The list is
                   withheld while the environment is stopped: nothing is listening behind the
                   routes, so an address published then would lead nowhere. It is restored when
-                  the environment starts again, the SSH address on the port it held.
+                  the environment starts again, each exposure back on the listener port it
+                  held — the endpoint's own ListenerPort, which is the allocation. The port
+                  inside Address is not the same one under every dataplane: a Service
+                  recreated with different nodePorts renumbers it.
                 items:
                   description: |-
                     Endpoint describes an access address of the environment: the web (Jupyter)

@@ -2904,29 +2904,34 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(svc.Spec.Ports[0].TargetPort.IntVal).To(Equal(int32(8080)))
 		})
 
-		// spec.ports is free to name a port the platform already publishes, and
-		// the platform publishes two the user did not write: the type's main port
-		// and, with ssh, the number sshd is bridged from. A Service may not carry
-		// one (port, protocol) twice — the API server refuses the write outright,
-		// and that error aborts the reconcile before its status write — so the
-		// list dedupes the way the container port list does (::desiredContainerPorts).
-		// The exposure is not lost by that: the Service keeps publishing the
-		// number, and a route names a Service port by number, not by name.
+		// spec.ports is free to name a port the list already carries: one the
+		// platform publishes on its own account (the type's main port, and the
+		// number sshd is bridged from when one is exposed), or one an earlier
+		// entry declared. A Service may not carry one (port, protocol) twice —
+		// the API server refuses the write outright, and that error aborts the
+		// reconcile before its status write — so the list dedupes the way the
+		// container port list does (::desiredContainerPorts). The exposure is not
+		// lost by that: the Service keeps publishing the number, and a route
+		// names a Service port by number, not by name. What a fold costs the
+		// exposure is ::portCollisionFindings's to decide and report.
 		It("publishes each Service port once, per protocol", func() {
 			svc := render(func(env *aiv1alpha1.DevEnvironment) {
 				env.Spec.Type = aiv1alpha1.DevEnvironmentTypeJupyter
 				env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
 				env.Spec.Ports = []aiv1alpha1.PortSpec{
 					{Name: "jupyter-again", Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 8888},
-					{Name: "sshd-again", Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshServicePort},
+					{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					{Name: "metrics-again", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
 					{Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 8888},
 				}
 			})
-			// Both repeats of a platform-published port are gone; the udp entry
-			// on the same number as the notebook is a different port and stays.
+			// Both repeats are gone — one of the platform's main port, one of the
+			// metrics entry before it — and the udp entry on the same number as
+			// the notebook is a different port and stays.
 			Expect(svc.Spec.Ports).To(Equal([]corev1.ServicePort{
 				{Name: mainPortName, Port: 8888, TargetPort: intstr.FromInt32(8888), Protocol: corev1.ProtocolTCP},
 				{Name: sshPortName, Port: sshServicePort, TargetPort: intstr.FromInt32(sshContainerPort), Protocol: corev1.ProtocolTCP},
+				{Name: testMetricsPortName, Port: 9090, TargetPort: intstr.FromInt32(9090), Protocol: corev1.ProtocolTCP},
 				{Name: testSyslogPortName, Port: 8888, TargetPort: intstr.FromInt32(8888), Protocol: corev1.ProtocolUDP},
 			}))
 		})

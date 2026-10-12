@@ -367,13 +367,23 @@ func describeHttpStop() {
 						"the stopped environment's route reads %s (%s)",
 						routeReady.Status, routeReady.Reason)
 
+					// The pods the stop left behind, which the start has to replace.
+					// Read here rather than carried over from the case before, because
+					// it is the one moment this case can see them: the pod a stop is
+					// deleting goes on reading as a healthy environment until its grace
+					// period runs out, so a wait for "Running" that did not exclude it
+					// would be satisfied by the environment the stop just took away —
+					// and the 200 below would come from a container on its way out.
+					was, err := env.PodUIDs(ctx)
+					Expect(err).NotTo(HaveOccurred())
+
 					// The start gives the address back, answering. Withheld is a
 					// statement about the phase, and not a withdrawal the next start
 					// has to earn back from something the stop took away: the route
 					// and the ListenerSet were kept, and the address is recomputed
 					// from them.
 					Expect(env.SetRunning(ctx, true)).To(Succeed())
-					running(ctx, env)
+					runningOn(ctx, env, was...)
 					back, ok := env.WebEndpoint()
 					Expect(ok).To(BeTrue(), "status published no %q endpoint after the restart (has %v)",
 						env.Image.Type, env.EndpointNames())
