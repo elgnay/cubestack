@@ -205,6 +205,37 @@ func assertPodAllocated(pod *corev1.Pod, device corev1.ResourceName, want int64)
 	}
 }
 
+// assertPodNotAllocated asserts the container was rendered asking for none of
+// the device's extended resource.
+//
+// The premise of a case about a device's absence, and checked on the rendered pod
+// rather than on the spec it came from: what such a case has to rule out is the
+// platform handing over something the spec never asked for, and the pod is where
+// that would show.
+//
+// Both halves, for the reason assertPodAllocated checks both: a request and a
+// limit are written separately, and either one on its own is a device the
+// environment did not ask for.
+func assertPodNotAllocated(pod *corev1.Pod, device corev1.ResourceName) {
+	GinkgoHelper()
+	Expect(pod.Spec.Containers).NotTo(BeEmpty(),
+		"the pod renders no container, so nothing was asked for anything either way")
+	container := pod.Spec.Containers[0]
+
+	for _, half := range []struct {
+		what string
+		list corev1.ResourceList
+	}{
+		{"requests", container.Resources.Requests},
+		{"limits", container.Resources.Limits},
+	} {
+		_, ok := half.list[device]
+		Expect(ok).To(BeFalse(),
+			"the container's %s name %s, in an environment whose spec asks for no GPU: %v",
+			half.what, device, half.list)
+	}
+}
+
 // deviceCapacity is what the cluster advertises, and the answer to the only
 // question a device case can ask before it creates anything. Filled in by
 // probeDevices from each device family's BeforeAll.
