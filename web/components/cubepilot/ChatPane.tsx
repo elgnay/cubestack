@@ -92,10 +92,17 @@ const LIST_COL_MIN = 120;
 const LIST_COL_MAX = 460;
 
 const chatGridSx = (listW: number): SxProps<Theme> => ({
+  // The grid takes the height the pane's flex column leaves it, and its single
+  // row takes the grid's: the card stretches into whatever is left instead of
+  // being handed a number that only holds while the head keeps its height.
+  flex: 1,
+  minHeight: 0,
   display: "grid",
   gridTemplateColumns: `${listW}px 16px minmax(0,1fr)`,
-  alignItems: "start",
-  "@media (max-width: 1180px)": { gridTemplateColumns: "1fr" },
+  gridTemplateRows: "minmax(0, 1fr)",
+  // Narrow: the list sits above the card, so the rows go back to their content
+  // and the page scrolls as it always did.
+  "@media (max-width: 1180px)": { flex: "none", gridTemplateColumns: "1fr", gridTemplateRows: "auto" },
 });
 
 // 14px glyphs for the composer's sampling-params chip (DSH access-mode look).
@@ -107,6 +114,30 @@ const SLIDERS_ICON = (
 const CHEVRON_DOWN_ICON = (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
     <path d="M6 9l6 6 6-6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+  </svg>
+);
+// The room's height toggle: corners out take the rows the page head and its tab
+// row were using, corners in give them back.
+const ROOM_EXPAND_ICON = (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path
+      d="M3 9V3h6M21 9V3h-6M3 15v6h6M21 15v6h-6"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
+  </svg>
+);
+const ROOM_RESTORE_ICON = (
+  <svg width="14" height="14" viewBox="0 0 24 24" fill="none" aria-hidden>
+    <path
+      d="M9 3v6H3M15 3v6h6M9 21v-6H3M15 21v-6h6"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    />
   </svg>
 );
 
@@ -222,7 +253,16 @@ const ATTACH_EVENTS = new Set<AgentSseEvent["type"]>([
   "question_resolved",
 ]);
 
-export function ChatPane() {
+/** What only the page can do for this pane: fold its own head and tab row away
+ *  so the conversation has their height. The page owns the flag (the head is
+ *  its markup), so the pane just reports the ask — and without the props, as in
+ *  the floating panel, the control is not offered at all. */
+interface ChatPaneProps {
+  roomExpanded?: boolean;
+  onToggleRoom?: () => void;
+}
+
+export function ChatPane({ roomExpanded = false, onToggleRoom }: ChatPaneProps = {}) {
   const { t } = useI18n();
   const { showToast, toastView } = useToast();
 
@@ -1910,7 +1950,21 @@ export function ChatPane() {
             : { tone: "done", key: "cubepilot.chat.statusDone" };
 
   return (
-    <Box>
+    // The pane fills the height the page's flex column leaves it: this wrapper
+    // is the flex item, the grid below takes the height it is given, and the
+    // card stretches inside the grid's single row.
+    <Box
+      sx={{
+        flex: 1,
+        minHeight: 0,
+        display: "flex",
+        flexDirection: "column",
+        "@media (max-width: 1180px)": { flex: "none", display: "block" },
+      }}
+    >
+      {/* The chat tab's own line, and it stays the chat tab's: it says what this
+          conversation is, so it is part of the room and lives inside it — it is
+          still there when the page folds its head away for the room. */}
       <Box data-od-id="chat-sub" sx={{ fontSize: 12, color: "text.secondary", mb: "14px" }}>
         {t("cubepilot.chat.sub")}
       </Box>
@@ -1918,7 +1972,10 @@ export function ChatPane() {
 
       <Box sx={chatGridSx(listW)}>
         {/* ── objects ── */}
-        <Box data-od-id="object-list" sx={{ "@media (max-width: 1180px)": { mb: "14px" } }}>
+        <Box
+          data-od-id="object-list"
+          sx={{ "@media (max-width: 1180px)": { mb: "14px" } }}
+        >
           <Box sx={groupLabelSx}>{t("cubepilot.chat.objectsAgents")}</Box>
           <Box
             component="button"
@@ -1941,7 +1998,9 @@ export function ChatPane() {
               "&:hover": { borderColor: isAgent ? VIOLET_BORDER : "text.primary" },
             }}
           >
-            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px" }}>
+            {/* Wraps rather than overflowing: this column is the reader's to
+                drag narrow, and the badge is long in some languages. */}
+            <Box sx={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "8px", flexWrap: "wrap" }}>
               <Box sx={{ fontSize: 13.5, fontWeight: 600 }}>CubePilot</Box>
               <Box
                 sx={{
@@ -2062,18 +2121,17 @@ export function ChatPane() {
         />
 
         {/* ── chat card ── */}
-        {/* The card fills the viewport below the app chrome (237px above:
-            sticky topbar + page head + tabs + pane sub; the chat tab has no
-            page bottom padding), so the thread is the flex filler that
-            scrolls inside its own scrollbar and the floating composer sits
-            at the window's bottom edge. */}
+        {/* The card stretches into whatever height the flex column above
+            leaves it — the head is text, so its height is whatever a given
+            language needs — and the thread is the flex filler that scrolls
+            inside its own scrollbar, with the composer at the card's bottom
+            edge. */}
         <Card
           data-od-id="chat-card"
           sx={{
             display: "flex",
             flexDirection: "column",
-            height: "calc(100dvh - 237px)",
-            minHeight: 480,
+            minHeight: 320,
             // Visible so the floating composer's shadow is not clipped at the
             // card's bottom edge.
             overflow: "visible",
@@ -2110,7 +2168,10 @@ export function ChatPane() {
               </Box>
               <Box sx={{ minWidth: 0 }}>
                 <Box sx={{ fontSize: 14, fontWeight: 650 }}>{objName}</Box>
-                <Box sx={{ fontSize: 11, color: "text.secondary" }}>{objRole}</Box>
+                {/* Ready is the one phase the Pill beside the name already says;
+                    every other phase says more here than a Pill can (not
+                    provisioned, starting with a wait, failed). */}
+                {isAgent && agentReady ? null : <Box sx={{ fontSize: 11, color: "text.secondary" }}>{objRole}</Box>}
               </Box>
               {objKind ? (
                 isAgent ? (
@@ -2124,57 +2185,79 @@ export function ChatPane() {
                 )
               ) : null}
             </Box>
-            {isModel && svc && endpoint ? (
-              <Box
-                data-od-id="pg-endpoint"
-                sx={{
-                  display: "inline-flex",
-                  alignItems: "center",
-                  gap: "8px",
-                  ml: "auto",
-                  maxWidth: "100%",
-                  ...monoSx,
-                  fontSize: 11,
-                  color: "text.secondary",
-                  bgcolor: "var(--surface)",
-                  border: 1,
-                  borderColor: "divider",
-                  borderRadius: 6,
-                  px: "8px",
-                  py: "4px",
-                }}
-              >
-                <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                  {endpointText}
+            {/* The identity stays left and the actions stay right: the endpoint
+                chip, the clears, and the room's own height control after them. */}
+            <Box sx={{ ml: "auto", display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap", maxWidth: "100%" }}>
+              {isModel && svc && endpoint ? (
+                <Box
+                  data-od-id="pg-endpoint"
+                  sx={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    gap: "8px",
+                    maxWidth: "100%",
+                    ...monoSx,
+                    fontSize: 11,
+                    color: "text.secondary",
+                    bgcolor: "var(--surface)",
+                    border: 1,
+                    borderColor: "divider",
+                    borderRadius: 6,
+                    px: "8px",
+                    py: "4px",
+                  }}
+                >
+                  <Box component="span" sx={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {endpointText}
+                  </Box>
+                  <CopyBtn
+                    text={copied === "endpoint" ? t("cubepilot.playground.copied") : t("cubepilot.playground.copy")}
+                    onClick={() => copyEndpoint(endpointText, "endpoint")}
+                  />
                 </Box>
-                <CopyBtn
-                  text={copied === "endpoint" ? t("cubepilot.playground.copied") : t("cubepilot.playground.copy")}
-                  onClick={() => copyEndpoint(endpointText, "endpoint")}
-                />
-              </Box>
-            ) : null}
-            {/* Model side only: the agent's conversation lives in the runtime under
-                one fixed key, so there is nothing here it could clear. */}
-            {isModel ? (
-              <Btn variant="secondary" small onClick={clearChat} data-od-id="clear-chat">
-                {t("cubepilot.playground.clear")}
-              </Btn>
-            ) : null}
-            {/* The agent side's own clear. Its transcript is not here — it is in
-                the runtime under one fixed key — so this one DELETEs the session
-                rather than dropping a local copy, which is why it is a different
-                control with a different question in front of it. */}
-            {isAgent ? (
-              <Btn
-                variant="secondary"
-                small
-                onClick={() => void clearAgentSession()}
-                disabled={clearing || !agentSessionKey}
-                data-od-id="clear-agent"
-              >
-                {t(clearing ? "cubepilot.chat.clearing" : "cubepilot.chat.clear")}
-              </Btn>
-            ) : null}
+              ) : null}
+              {/* Model side only: the agent's conversation lives in the runtime under
+                  one fixed key, so there is nothing here it could clear. */}
+              {isModel ? (
+                <Btn variant="secondary" small onClick={clearChat} data-od-id="clear-chat">
+                  {t("cubepilot.playground.clear")}
+                </Btn>
+              ) : null}
+              {/* The agent side's own clear. Its transcript is not here — it is in
+                  the runtime under one fixed key — so this one DELETEs the session
+                  rather than dropping a local copy, which is why it is a different
+                  control with a different question in front of it. */}
+              {isAgent ? (
+                <Btn
+                  variant="secondary"
+                  small
+                  onClick={() => void clearAgentSession()}
+                  disabled={clearing || !agentSessionKey}
+                  data-od-id="clear-agent"
+                >
+                  {t(clearing ? "cubepilot.chat.clearing" : "cubepilot.chat.clear")}
+                </Btn>
+              ) : null}
+              {/* The page head and the tab row are 100px the conversation can
+                  have: the page folds them away on this ask, and this button is
+                  the way back. Narrow layouts scroll instead, so it is not
+                  offered there. */}
+              {onToggleRoom ? (
+                <Btn
+                  variant="ghost"
+                  small
+                  onClick={onToggleRoom}
+                  // The name only: a title carrying the same words would be read
+                  // out twice, and this glyph has no second thing to say.
+                  aria-label={t(roomExpanded ? "cubepilot.chat.roomRestore" : "cubepilot.chat.roomExpand")}
+                  aria-expanded={roomExpanded}
+                  data-od-id="toggle-room"
+                  sx={{ "@media (max-width: 1180px)": { display: "none" } }}
+                >
+                  {roomExpanded ? ROOM_RESTORE_ICON : ROOM_EXPAND_ICON}
+                </Btn>
+              ) : null}
+            </Box>
           </Box>
 
           <Box
