@@ -18,6 +18,7 @@ import { Readable } from "node:stream";
 
 import { getCoreClient, getKubeConfig } from "@/lib/kubernetes";
 import { logger } from "@/lib/log";
+import type { GatewayModel } from "./types";
 
 /** Namespace the AI Gateway Service is expected to live in
  *  (CUBESTACK_GATEWAY_NAMESPACE overrides the default). */
@@ -57,6 +58,9 @@ function safeRead(path: string): string | undefined {
  * reachable base: an in-cluster DNS URL when running in the cluster, or an
  * API-server service-proxy URL off-cluster. Null when nothing is found or the
  * cluster cannot be listed.
+ *
+ * The answer is memoized (see BASE_TTL_MS): discovery is a Service LIST, and
+ * every gateway call used to pay for one.
  */
 async function discoverGatewayBase(): Promise<GatewayBase | null> {
   try {
@@ -80,6 +84,35 @@ async function discoverGatewayBase(): Promise<GatewayBase | null> {
   }
 }
 
+/** How long a resolved base is reused. Short enough that a gateway installed
+ *  after the portal is picked up without a restart. */
+const BASE_TTL_MS = 30_000;
+let baseCache: { base: GatewayBase | null; loadedAt: number } | null = null;
+/** The discovery in flight: a cold portal answers several requests at once, and
+ *  each used to run its own LIST. */
+let baseInflight: Promise<GatewayBase | null> | null = null;
+
+/** How long the gateway's model catalog is reused. A catalog answer is stable
+ *  for far longer than this, and every read of it used to be a live call that
+ *  a slow gateway could hold for the whole timeout. */
+const CATALOG_TTL_MS = 30_000;
+/** A failed catalog call is remembered only briefly: enough to stop a burst of
+ *  reads from hammering a gateway that is down, short enough to notice it
+ *  coming back. */
+const CATALOG_ERROR_TTL_MS = 5_000;
+let catalogCache: { models: GatewayModel[] | null; loadedAt: number; ttlMs: number } | null = null;
+/** The catalog call in flight, so concurrent readers share it instead of each
+ *  waiting the gateway out (a cache alone only helps once an answer exists). */
+let catalogInflight: Promise<GatewayModel[] | null> | null = null;
+
+/** Clear the memoized base and catalog (tests; a gateway that moved). */
+export function clearGatewayCaches(): void {
+  baseCache = null;
+  baseInflight = null;
+  catalogCache = null;
+  catalogInflight = null;
+}
+
 /**
  * Resolve the gateway base. CUBESTACK_GATEWAT_URL wins; otherwise the
  * ai-gateway Service is discovered (see discoverGatewayBase); in-cluster,
@@ -91,19 +124,74 @@ export async function resolveGatewayBase(): Promise<GatewayBase | null> {
     logger("gateway").debug("base from CUBESTACK_GATEWAT_URL", { url: explicit });
     return { url: explicit.replace(/\/+$/, ""), via: "direct", configured: true };
   }
-  const discovered = await discoverGatewayBase();
-  if (discovered) {
-    logger("gateway").debug("base discovered from the Service", { url: discovered.url, via: discovered.via });
-    return discovered;
+  const cached = baseCache;
+  if (cached && Date.now() - cached.loadedAt < BASE_TTL_MS) return cached.base;
+  if (baseInflight) return baseInflight;
+  const flight = (async (): Promise<GatewayBase | null> => {
+    const discovered = await discoverGatewayBase();
+    if (discovered) {
+      logger("gateway").debug("base discovered from the Service", { url: discovered.url, via: discovered.via });
+      baseCache = { base: discovered, loadedAt: Date.now() };
+      return discovered;
+    }
+    if (inCluster()) {
+      logger("gateway").debug("base from the well-known in-cluster name", { url: DEFAULT_GATEWAY_BASE });
+      const base: GatewayBase = { url: DEFAULT_GATEWAY_BASE, via: "direct" };
+      baseCache = { base, loadedAt: Date.now() };
+      return base;
+    }
+    logger("gateway").warn("no gateway base resolved — system model list and playground chat are unavailable", {
+      hint: "set CUBESTACK_GATEWAT_URL or install the gateway in " + GATEWAY_NAMESPACE,
+    });
+    baseCache = { base: null, loadedAt: Date.now() };
+    return null;
+  })();
+  baseInflight = flight;
+  try {
+    return await flight;
+  } finally {
+    if (baseInflight === flight) baseInflight = null;
   }
-  if (inCluster()) {
-    logger("gateway").debug("base from the well-known in-cluster name", { url: DEFAULT_GATEWAY_BASE });
-    return { url: DEFAULT_GATEWAY_BASE, via: "direct" };
+}
+
+/**
+ * The AI Gateway's model catalog, memoized so neither a slow gateway nor a burst
+ * of reads pays for the same call repeatedly. Null when the gateway could not be
+ * reached or did not answer a list — the caller decides what that means (the
+ * chat tab reads it as "no platform models", the playground answers 502).
+ */
+export async function gatewayCatalog(timeoutMs = 2500): Promise<GatewayModel[] | null> {
+  const cached = catalogCache;
+  if (cached && Date.now() - cached.loadedAt < cached.ttlMs) return cached.models;
+  if (catalogInflight) return catalogInflight;
+  const flight = (async (): Promise<GatewayModel[] | null> => {
+    let models: GatewayModel[] | null = null;
+    try {
+      const res = await gatewayFetch("/v1/models", { signal: AbortSignal.timeout(timeoutMs) });
+      if (res.ok) {
+        const body = (await res.json()) as { data?: Array<{ id?: unknown; owned_by?: unknown }> };
+        if (Array.isArray(body.data)) {
+          models = body.data
+            .filter((m): m is { id: string; owned_by?: unknown } => typeof m?.id === "string" && m.id.length > 0)
+            .map((m) => ({ id: m.id, ownedBy: typeof m.owned_by === "string" ? m.owned_by : "" }));
+        }
+      } else {
+        logger("gateway").warn("model catalog unavailable: the gateway answered an error", { status: res.status });
+      }
+    } catch (e) {
+      // Worth saying out loud: this call sits on the config read's path, and a
+      // silent empty list used to hide a gateway that was down for days.
+      logger("gateway").warn("model catalog unavailable", { url: (await resolveGatewayBase())?.url ?? "-", error: String(e) });
+    }
+    catalogCache = { models, loadedAt: Date.now(), ttlMs: models === null ? CATALOG_ERROR_TTL_MS : CATALOG_TTL_MS };
+    return models;
+  })();
+  catalogInflight = flight;
+  try {
+    return await flight;
+  } finally {
+    if (catalogInflight === flight) catalogInflight = null;
   }
-  logger("gateway").warn("no gateway base resolved — system model list and playground chat are unavailable", {
-    hint: "set CUBESTACK_GATEWAT_URL or install the gateway in " + GATEWAY_NAMESPACE,
-  });
-  return null;
 }
 
 /** Bearer header for the gateway when CUBESTACK_GATEWAY_TOKEN is set. */
@@ -191,7 +279,28 @@ function apiServerFetch(url: string, init: RequestInit): Promise<Response> {
         })
       : undefined;
     const req = isHttps ? httpsRequest({ ...base, agent }) : httpRequest(base);
+    // The caller's signal has to reach this path too: it is the slowest way to
+    // the gateway (through the API server), and a stalled response would hold the
+    // caller — and its stream — open past the timeout it asked for. Both halves
+    // are covered: the request before the headers, the body after them.
+    const signal = init.signal ?? null;
+    let response: (Readable & { destroy: (error?: Error) => void }) | null = null;
+    const onAbort = () => {
+      const error = new Error("gateway request aborted");
+      if (response) response.destroy(error);
+      else req.destroy(error);
+      reject(error);
+    };
+    if (signal) {
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+      req.on("close", () => signal.removeEventListener("abort", onAbort));
+    }
     req.on("response", (res) => {
+      response = res as Readable & { destroy: (error?: Error) => void };
       resolve(new Response(Readable.toWeb(res as Readable) as ReadableStream<Uint8Array>, {
         status: res.statusCode ?? 0,
         headers: toResponseHeaders(res.headers),

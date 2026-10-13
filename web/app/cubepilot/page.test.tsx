@@ -21,12 +21,22 @@ function stubApi(
     catalogUnavailable?: boolean;
     /** Fails the config read, so the config pane shows its load-error card. */
     configUnavailable?: boolean;
+    /** Makes the config read REJECT (a transport failure, not an HTTP error). */
+    configThrows?: boolean;
     stream?: "end" | "error" | "stall" | "terminal";
     activePolls?: number;
     transcript?: Array<{ role: string; content: string }>;
+    /** A conversation the runtime already holds, served to the mount's own read.
+     *  `transcript` is the other case: it only exists once this test has sent a
+     *  turn, so a mount read cannot satisfy an adoption assertion by accident. */
+    history?: Array<{ role: string; content: string }>;
+    /** When set, a history answer waits for the test to release it (in order). */
+    historyPending?: Array<(items: unknown) => void>;
     attach?: { events?: unknown[]; emit?: (ev: unknown) => void; calls?: number };
     /** When set, a status answer waits for the test to release it (in order). */
     agentStatusPending?: Array<(s: unknown) => void>;
+    /** When set, a config answer waits for the test to release it (in order). */
+    configPending?: Array<(c: unknown) => void>;
     /** Counts POST /messages, so a test can assert that nothing was sent. */
     turnPosts?: { n: number };
     /** The instance state the status route reports (defaults to Ready). */
@@ -54,6 +64,14 @@ function stubApi(
         return json({ taskTemplates: [] });
       if (url.includes("/api/cubepilot/tasks")) return json({ tasks: [], reports: [] });
       if (url.includes("/api/cubepilot/agent/config")) {
+        if (opts.configThrows) throw new TypeError("fetch failed");
+        if (opts.configPending) {
+          return new Promise((resolve) => {
+            opts.configPending?.push((body: unknown) =>
+              resolve({ ok: true, status: 200, json: async () => body }),
+            );
+          });
+        }
         if (opts.configUnavailable) {
           return {
             ok: false,
@@ -198,6 +216,14 @@ function stubApi(
         if (!sent) return json({ active: false });
         turnPolls += 1;
         return json({ active: turnPolls <= opts.activePolls });
+      }
+      if (url.endsWith("/messages") && opts.historyPending) {
+        return new Promise((resolve) => {
+          opts.historyPending?.push((items: unknown) => resolve(json({ items })));
+        });
+      }
+      if (url.endsWith("/messages") && opts.history) {
+        return json({ items: opts.history });
       }
       if (url.endsWith("/messages") && opts.transcript) {
         // The runtime writes a turn as it goes, so the stub's transcript only
@@ -966,8 +992,10 @@ describe("cubepilot page", () => {
   });
 
   it("keeps the newest status when answers land out of order", async () => {
-    // A slow poll must not put an older phase back on screen: the guidance
-    // would reappear after the assistant was already up.
+    // A slow read must not put an older phase back on screen: the guidance
+    // would reappear after the assistant was already up. The read that comes
+    // back first here is the poll's — the pane polls while it has no phase yet,
+    // and the mount's own read is held until the end.
     const pending: Array<(s: unknown) => void> = [];
     stubApi(EXTERNAL_ONLY, { agentStatus: { exists: true, phase: "Creating" }, agentStatusPending: pending });
     const { container, root } = renderPage();
@@ -975,18 +1003,104 @@ describe("cubepilot page", () => {
     // The mount's own read is held too, so nothing has a phase yet.
     expect(container.querySelector('[data-od-id="agent-not-ready"]')).not.toBeNull();
 
-    // The mount's read is still out when a poll's answer (Ready) comes back.
-    expect(await waitFor(() => pending.length >= 2, 300)).toBe(true);
-    act(() => pending[1]?.({ exists: true, phase: "Ready" }));
+    // The poll's read is issued while the mount's is still out (5s interval).
+    // Three are out by then: the chat pane's mount read, the config pane's own
+    // read, and the poll's.
+    expect(await waitFor(() => pending.length >= 3, 200)).toBe(true);
+    // Answer everything but the oldest read: the phase is known now.
+    act(() =>
+      pending.forEach((release, i) => {
+        if (i > 0) release({ exists: true, phase: "Ready" });
+      }),
+    );
     await act(async () => {});
     expect(await waitFor(() => container.querySelector('[data-od-id="agent-not-ready"]') === null)).toBe(true);
 
-    // The older answer lands late and is dropped.
+    // The oldest answer lands late and is dropped.
     act(() => pending[0]?.({ exists: true, phase: "Creating" }));
     await act(async () => {});
     expect(container.querySelector('[data-od-id="agent-not-ready"]')).toBeNull();
     act(() => root.unmount());
   }, 45000);
+
+  it("shows the instance phase as soon as the status answer lands, with config still out", async () => {
+    // The phase must not wait for the whole meta read. Config carries the AI
+    // Gateway's model catalog, which a slow gateway holds for up to its 2.5s
+    // bound; the loading line used to survive that read and only cleared when
+    // the 5s status poll came around.
+    const statusPending: Array<(s: unknown) => void> = [];
+    const configPending: Array<(c: unknown) => void> = [];
+    stubApi(EXTERNAL_ONLY, { agentStatusPending: statusPending, configPending });
+    const { container, root } = renderPage();
+    await act(async () => {});
+    expect(container.textContent).toContain("实例状态加载中");
+
+    // Every status answer that is out — the mount's read and the auto-select's —
+    // comes back Ready while config has not answered yet.
+    expect(statusPending.length).toBeGreaterThan(0);
+    act(() => statusPending.forEach((release) => release({ exists: true, phase: "Ready" })));
+    await act(async () => {});
+
+    expect(container.textContent).not.toContain("实例状态加载中");
+    expect(configPending.length).toBeGreaterThan(0); // still out: that is the point
+    act(() => root.unmount());
+  });
+
+  it("keeps the status when a neighboring read throws", async () => {
+    // The status leg publishes on its own, and the meta it returns must keep
+    // that status: a throwing config read used to hand back `status: null`, so
+    // the caller read the instance as absent and ran a second round of reads
+    // for something it already knew.
+    stubApi(EXTERNAL_ONLY, { history: [{ role: "user", content: "历史消息乙" }], configThrows: true });
+    const { container, root } = renderPage();
+    await act(async () => {});
+    await waitFor(() => false, 10);
+
+    const configReads = (globalThis.fetch as unknown as { mock: { calls: Array<[unknown]> } }).mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes("/api/cubepilot/agent/config")).length;
+    // Two readers on this page: the chat pane's meta read and the config pane's
+    // own. A third meant a failed neighbor had thrown the status away.
+    expect(configReads).toBe(2);
+    expect(container.textContent).toContain("历史消息乙");
+    act(() => root.unmount());
+  });
+
+  it("does not start a second history read while one is still out", async () => {
+    // Two reads in flight can land out of order and jump the transcript
+    // backwards, so the pane runs them one at a time (the e2e suite pins this
+    // too: "never runs two history reads at once"). Selecting the assistant
+    // again — which is what the object list's click does — must join the read
+    // the mount already started, not start its own.
+    const historyPending: Array<(items: unknown) => void> = [];
+    stubApi(EXTERNAL_ONLY, { historyPending });
+    const { container, root } = renderPage();
+    await act(async () => {});
+    act(() => (container.querySelector('[data-od-id="obj-cubepilot"]') as HTMLElement).click());
+    await act(async () => {});
+
+    const reads = (globalThis.fetch as unknown as { mock: { calls: Array<[unknown]> } }).mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.endsWith("/messages")).length;
+    expect(reads).toBe(1);
+    act(() => root.unmount());
+  });
+
+  it("does not read the agent meta twice for one open", async () => {
+    // Two readers exist on this page: the chat pane's meta read, and the config
+    // pane's read of the same endpoint for its model card. Opening the pane used
+    // to add a third — the mount effect loaded the meta and then auto-selected
+    // the assistant, which loaded it again, and the duplicate answers superseded
+    // each other while queueing on the server.
+    stubApi(EXTERNAL_ONLY, {});
+    const { root } = renderPage();
+    await act(async () => {});
+    const configReads = (globalThis.fetch as unknown as { mock: { calls: Array<[unknown]> } }).mock.calls
+      .map((call) => String(call[0]))
+      .filter((url) => url.includes("/api/cubepilot/agent/config")).length;
+    expect(configReads).toBe(2);
+    act(() => root.unmount());
+  });
 
   it("keeps the turn status with the composer, not above the thread", async () => {
     // The status is read exactly when a long turn has been quiet and the reader

@@ -280,6 +280,19 @@ export function ChatPane() {
   /** Only the newest status read may be applied: a slow poll can land after a
    *  newer one and put an older phase back on screen. */
   const statusGenRef = useRef(0);
+  /** The newest read that actually landed. A read that lands first is applied
+   *  even while a slower one is still out — which is what lets the pane show the
+   *  phase without waiting for the whole meta read (config carries the AI
+   *  Gateway's catalog, held for up to its 2.5s bound). */
+  const statusAppliedRef = useRef(0);
+  /** The meta read in flight, so the mount's own load and the auto-select's
+   *  share one round of requests instead of firing several — whose answers
+   *  would then supersede each other and queue on the server. */
+  const metaInflightRef = useRef<Promise<AgentMeta> | null>(null);
+  /** The history reads in flight, by session key: a second read started while
+   *  one is out joins it. Two in flight can land out of order and jump the
+   *  transcript backwards. */
+  const historyInflightRef = useRef(new Map<string, Promise<boolean>>());
   /** Set when the last select skipped its restore because there was no
    *  instance — the one case a start that finishes later owes a restore. */
   const awaitingInstanceRef = useRef(false);
@@ -498,44 +511,66 @@ export function ChatPane() {
     const gen = ++statusGenRef.current;
     try {
       const res = await apiFetch("/api/cubepilot/agent/status");
-      if (!res.ok || statusGenRef.current !== gen) return;
+      if (!res.ok) return;
       const body = (await res.json()) as AgentStatus;
-      if (statusGenRef.current !== gen) return;
+      // Landing order decides, not issue order: this answer applies unless a
+      // newer one already landed (a slow poll must not put an older phase back
+      // on screen), and it applies even while a slower read is still out.
+      if (gen < statusAppliedRef.current) return;
+      statusAppliedRef.current = gen;
       setAgentStatus(body);
     } catch {
       /* the next tick asks again */
     }
   }
 
-  async function loadAgentMeta(): Promise<AgentMeta> {
+  /** The agent meta (instance status, config, skills). One read serves every
+   *  concurrent caller: the mount's own load and the auto-select are the same
+   *  read, not two rounds of the same three requests. */
+  function loadAgentMeta(): Promise<AgentMeta> {
+    if (metaInflightRef.current) return metaInflightRef.current;
+    const run = readAgentMeta();
+    metaInflightRef.current = run;
+    void run.finally(() => {
+      if (metaInflightRef.current === run) metaInflightRef.current = null;
+    });
+    return run;
+  }
+
+  async function readAgentMeta(): Promise<AgentMeta> {
     const gen = ++statusGenRef.current;
     try {
-      const [stRes, cfgRes, skRes] = await Promise.all([
-        apiFetch("/api/cubepilot/agent/status"),
-        apiFetch("/api/cubepilot/agent/config"),
-        apiFetch("/api/cubepilot/skills"),
+      // The status leg publishes on its own, as soon as it lands: the pane's
+      // phase must not wait for the other two reads. Same landing rule as
+      // refreshAgentStatus above.
+      const statusLeg = (async () => {
+        const res = await apiFetch("/api/cubepilot/agent/status");
+        const body = res.ok ? ((await res.json().catch(() => null)) as AgentStatus | null) : null;
+        if (body && gen >= statusAppliedRef.current) {
+          statusAppliedRef.current = gen;
+          setAgentStatus(body);
+        }
+        return { res, body };
+      })();
+      const [st, cfgRes, skRes] = await Promise.all([
+        statusLeg,
+        // A neighbor's failure must not discard the status this leg published:
+        // the caller would read the meta as "no instance" and start over for
+        // something the pane already knows.
+        apiFetch("/api/cubepilot/agent/config").catch(() => null),
+        apiFetch("/api/cubepilot/skills").catch(() => null),
       ]);
-      const [stBody, cfgBody, skBody] = await Promise.all([
-        stRes.json().catch(() => null),
-        cfgRes.json().catch(() => null),
-        skRes.json().catch(() => null),
-      ]);
-      if (!stRes.ok) throw new Error((stBody as { error?: string } | null)?.error ?? `HTTP ${stRes.status}`);
-      // The agent meta is global (the object list entry + the card header),
-      // not part of the conversation generation: apply it even when a model
-      // auto-selection bumped that generation while these requests were in
-      // flight (otherwise the object entry stays "loading" forever).
-      const status = stBody as AgentStatus;
-      // A full read races the poll the same way a poll races itself; only the
-      // newest of all of them may set the phase.
-      const newestStatus = statusGenRef.current === gen;
-      const config = cfgRes.ok ? ((cfgBody as { config?: AgentConfig } | null)?.config ?? null) : null;
-      const skills = skRes.ok ? ((skBody as { skills?: SkillInfo[] } | null)?.skills ?? []) : [];
-      if (newestStatus) setAgentStatus(status);
+      if (!st.res.ok) throw new Error((st.body as { error?: string } | null)?.error ?? `HTTP ${st.res.status}`);
+      const config = cfgRes?.ok
+        ? (((await cfgRes.json().catch(() => null)) as { config?: AgentConfig } | null)?.config ?? null)
+        : null;
+      const skills = skRes?.ok
+        ? (((await skRes.json().catch(() => null)) as { skills?: SkillInfo[] } | null)?.skills ?? [])
+        : [];
       // config and skills travel in the returned meta and are read from there;
       // they used to have state of their own, which only the agent branch of
       // clearChat read, and that branch is gone with the fixed session key.
-      return { status, config, skills };
+      return { status: st.body as AgentStatus, config, skills };
     } catch {
       return { status: null, config: null, skills: [] };
     }
@@ -704,6 +739,10 @@ export function ChatPane() {
     const gen = genRef.current;
     const key = SESSION_KEY;
     setAgentSessionKey(key);
+    // Read after the meta, not with it: starting this earlier meant a selection
+    // that lands while it is out overtakes it (the generation guard drops the
+    // render), and the read in flight is shared, so the newer selection gets the
+    // overtaken answer too — an empty thread. Ordering it here is worth the wait.
     const hadHistory = await loadAgentHistory(key);
     if (genRef.current !== gen) return;
     // Nothing under this key yet: a conversation has not started, so greet. An
@@ -774,8 +813,24 @@ export function ChatPane() {
 
   /** Load a session's history; answers whether there was any. An empty history
    *  is a conversation that has not started, which the caller greets rather than
-   *  drawing as a blank thread. */
-  async function loadAgentHistory(key: string): Promise<boolean> {
+   *  drawing as a blank thread.
+   *
+   *  One read per session is in flight at a time: two can land out of order and
+   *  jump the transcript backwards, and the mount's read and the auto-select's
+   *  are the same read. The follow loop schedules its next tick after the last
+   *  one finishes, so it joins this rather than overlapping with it. */
+  function loadAgentHistory(key: string): Promise<boolean> {
+    const inflight = historyInflightRef.current.get(key);
+    if (inflight) return inflight;
+    const run = readAgentHistory(key);
+    historyInflightRef.current.set(key, run);
+    void run.finally(() => {
+      if (historyInflightRef.current.get(key) === run) historyInflightRef.current.delete(key);
+    });
+    return run;
+  }
+
+  async function readAgentHistory(key: string): Promise<boolean> {
     const gen = genRef.current;
     try {
       const res = await apiFetch(`/api/cubepilot/pilot/api/v1/sessions/${enc(key)}/messages`);
@@ -785,10 +840,16 @@ export function ChatPane() {
       if (res.status === 404) return false;
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const body = (await res.json()) as { items?: HistoryMessage[] };
-      if (genRef.current !== gen) return true;
       const items = body.items ?? [];
-      lastHistoryRef.current = JSON.stringify(items);
       const restored = historyToMsgs(items, nextId);
+      // A read that has been overtaken still answers the one question its caller
+      // asks — "is there a conversation under this key?" — because that answer
+      // decides between greeting and restoring. What it must not do is render,
+      // or record itself as what is on screen: the view belongs to the newer
+      // read now. (Answering `true` here instead would skip the greeting and
+      // leave the thread empty for a first-time reader.)
+      if (genRef.current !== gen) return restored.length > 0;
+      lastHistoryRef.current = JSON.stringify(items);
       // An empty document never replaces what is on screen. Read on its own it
       // means "this conversation has not started", and the caller greets — but
       // this same read is what the follow loop takes when a turn it was watching

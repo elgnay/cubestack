@@ -5,16 +5,22 @@ const { listNamespacedService } = vi.hoisted(() => ({ listNamespacedService: vi.
 
 vi.mock("@/lib/kubernetes", () => ({
   getCoreClient: () => ({ listNamespacedService }),
-  getKubeConfig: () => ({ getCurrentCluster: () => ({ server: "https://k8s.test" }) }),
+  getKubeConfig: () => ({ getCurrentCluster: () => ({ server: "https://k8s.test" }), getCurrentUser: () => null }),
 }));
 
-import { GATEWAY_NAMESPACE, gatewayFetch, gatewayTokenHeader, resolveGatewayBase } from "./gateway";
+// The service-proxy path speaks raw TLS through node:https, which the unit
+// environment cannot reach.
+const { httpsRequest, httpsAgent } = vi.hoisted(() => ({ httpsRequest: vi.fn(), httpsAgent: vi.fn() }));
+vi.mock("node:https", () => ({ request: httpsRequest, Agent: httpsAgent }));
+
+import { GATEWAY_NAMESPACE, clearGatewayCaches, gatewayCatalog, gatewayFetch, gatewayTokenHeader, resolveGatewayBase } from "./gateway";
 
 describe("lib/cubepilot/gateway", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.clearAllMocks();
+    clearGatewayCaches();
   });
 
   it("resolveGatewayBase prefers CUBESTACK_GATEWAT_URL and strips trailing slashes", async () => {
@@ -146,6 +152,96 @@ describe("lib/cubepilot/gateway", () => {
     await fn("/v1/models");
     expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
+  });
+
+  it("discovers the gateway base once within the cache window", async () => {
+    // Discovery is a Service LIST on the cluster API, and every gateway call
+    // used to pay for one.
+    vi.stubEnv("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+    vi.stubEnv("KUBERNETES_SERVICE_PORT", "443");
+    listNamespacedService.mockResolvedValue({
+      items: [{ metadata: { name: "envoy-default-ai-gateway-27dc8f39" }, spec: { ports: [{ port: 8080 }] } }],
+    });
+    await resolveGatewayBase();
+    await resolveGatewayBase();
+    expect(listNamespacedService).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts the service-proxy request when the caller's signal fires", async () => {
+    // This path is hand-rolled (client certs rule out global fetch), so the
+    // caller's timeout has to be wired to it explicitly: an endpoint that never
+    // answers would otherwise hold the caller — and its stream — open.
+    listNamespacedService.mockResolvedValue({
+      items: [{ metadata: { name: "envoy-default-ai-gateway-27dc8f39" }, spec: { ports: [{ port: 8080 }] } }],
+    });
+    const destroy = vi.fn();
+    httpsRequest.mockReturnValue({ on: vi.fn().mockReturnThis(), write: vi.fn(), end: vi.fn(), destroy });
+
+    expect(await gatewayCatalog(30)).toBeNull();
+    expect(destroy).toHaveBeenCalled();
+  });
+
+  it("shares one Service lookup between concurrent base resolutions", async () => {
+    // A cold portal answers several requests at once, and each used to run its
+    // own discovery LIST.
+    vi.stubEnv("KUBERNETES_SERVICE_HOST", "10.0.0.1");
+    vi.stubEnv("KUBERNETES_SERVICE_PORT", "443");
+    listNamespacedService.mockResolvedValue({
+      items: [{ metadata: { name: "envoy-default-ai-gateway-27dc8f39" }, spec: { ports: [{ port: 8080 }] } }],
+    });
+    const [a, b] = await Promise.all([resolveGatewayBase(), resolveGatewayBase()]);
+    expect(a).toEqual(b);
+    expect(listNamespacedService).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers the model catalog from one gateway call within the cache window", async () => {
+    vi.stubEnv("CUBESTACK_GATEWAT_URL", "http://gw.test:8080");
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(
+          JSON.stringify({ object: "list", data: [{ id: "qwen38-27b-fp16", owned_by: "cubestack" }, { id: "dsv4" }] }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const first = await gatewayCatalog();
+    const second = await gatewayCatalog();
+    expect(first).toEqual([
+      { id: "qwen38-27b-fp16", ownedBy: "cubestack" },
+      { id: "dsv4", ownedBy: "" },
+    ]);
+    expect(second).toEqual(first);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("answers null for the catalog when the gateway cannot be reached", async () => {
+    vi.stubEnv("CUBESTACK_GATEWAT_URL", "http://gw.test:8080");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new TypeError("fetch failed");
+      }),
+    );
+    expect(await gatewayCatalog()).toBeNull();
+  });
+
+  it("shares one gateway call between concurrent catalog reads", async () => {
+    // A page reads the catalog from two places at once (the chat pane's meta and
+    // the config pane's card): a cache that only remembers finished answers let
+    // both wait the gateway out separately.
+    vi.stubEnv("CUBESTACK_GATEWAT_URL", "http://gw.test:8080");
+    const fetchMock = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ data: [{ id: "qwen38-27b" }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const [a, b] = await Promise.all([gatewayCatalog(), gatewayCatalog()]);
+    expect(a).toEqual([{ id: "qwen38-27b", ownedBy: "" }]);
+    expect(b).toEqual(a);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 });
 
