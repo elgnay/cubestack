@@ -65,10 +65,17 @@ off**. Neither is a start.
 already `true` there is nothing else for the controller to observe:
 
 ```
-# does NOT work — the value is already true, so nothing changes, no watch event
-# is emitted, and the controller is never woken
+# does NOT work — the value is already true, so this patch changes nothing at
+# all, and in particular it leaves ai.cubestack.io/auto-stopped standing
 kubectl patch devenv <name> --type merge -p '{"spec":{"running":true}}'
 ```
+
+That patch is a no-op *as a write*: no object change, no `resourceVersion` bump, no watch event.
+But the absent wake-up is not why the environment stays down, and saying so would mislead a client
+that goes looking for a retry. The controller reconciles an environment on changes to its
+StatefulSet, its pod and its Service as well, and any such pass that sees the object unchanged
+finds the mark still standing: it is kept, and zero replicas are derived from it again. **The mark
+is the obstacle, not the sleeping controller.**
 
 Two ways that do work:
 
