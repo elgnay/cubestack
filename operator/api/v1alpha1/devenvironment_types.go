@@ -564,6 +564,10 @@ type Endpoint struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=devenv
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase.name`
+// +kubebuilder:printcolumn:name="Reason",type=string,JSONPath=`.status.phase.reason`
+// +kubebuilder:printcolumn:name="Last activity",type=date,JSONPath=`.status.lastActivityTime`
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // DevEnvironment is the Schema for the devenvironments API.
 //
@@ -573,6 +577,21 @@ type Endpoint struct {
 // hosting it has to be at the Baseline Pod Security Standard: root and any
 // capability beyond NET_BIND_SERVICE are rejected at Restricted, and Pod
 // Security Admission has no per-container exemption.
+//
+// The platform never writes spec.running. An environment stopped by its idle
+// timeout (spec.lifecycle.idleTimeout) is marked with the
+// ai.cubestack.io/auto-stopped annotation instead, and both the workload's
+// replicas and the reported phase follow from that mark — so starting one is
+// clearing the annotation rather than setting a field. The phase's reason is
+// what tells that stop apart from one the user made, and it is a column of the
+// default kubectl output for that purpose.
+//
+// Its companion, ai.cubestack.io/auto-stopped-at, is the platform's own record
+// of when it stopped the environment, and it floors the idle clock that judged
+// it idle: clearing the mark while the just-ended session's pod is still
+// standing must not let that pod's stale activity stop the environment again.
+// The platform writes it alone, and clearing the mark does not require touching
+// it.
 type DevEnvironment struct {
 	metav1.TypeMeta `json:",inline"`
 
