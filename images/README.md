@@ -288,7 +288,8 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
   the served host key equal to the mounted Secret public key. Root mode adds the one thing this image
   does not leave to docker-stacks: a root run serves `/root` — the home the platform derives, and so
   where the claim is mounted — rather than the `/home/root` the stock `start.sh` relocates to, and a
-  declared `HOME` is served unchanged.
+  declared `HOME` is served unchanged. The server's working directory is asserted with it, because
+  that and not `root_dir` is what a new terminal inherits.
 - **jupyter-maca-pytorch** — the same jupyter and ssh assertions at the platform identity (uid/gid
   1000, `$HOME`/cwd `/home/ubuntu`, login account `ubuntu`), plus that the vendor stack under
   `/opt/maca` is **readable by uid 1000**. That last one is checkable without a GPU and is the risk
@@ -296,7 +297,8 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
   cannot read fails at runtime with no build-time signal. Whether the *driver* works on a Metax node
   is not covered here. Root mode adds one check that is this image's own work and not docker-stacks':
   a root run serves `/root` — the home the platform derives, and so where the claim is mounted —
-  rather than the `/home/ubuntu` the image bakes, and a declared `HOME` is served unchanged.
+  rather than the `/home/ubuntu` the image bakes, is entered so that a new terminal starts there
+  rather than on the image's own `WORKDIR`, and a declared `HOME` is served unchanged.
 - **ssh-maca-pytorch** — the same ssh assertions at the same identity and the same vendor-stack
   check, plus the two properties that make it a separate image rather than a copy: **no JupyterLab
   exists in it** (the guard against its sibling's pip step being copied across, which would silently
