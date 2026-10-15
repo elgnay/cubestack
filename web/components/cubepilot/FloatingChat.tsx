@@ -172,6 +172,8 @@ export function FloatingChat() {
    *  genRef, and a tick already in flight must still be able to schedule its
    *  successor for the conversation the send belongs to. */
   const followGenRef = useRef(0);
+  /** Bumped when a tick sees no active turn (see restorePendingHitl). */
+  const turnEpochRef = useRef(0);
   /** True from the moment this surface drives a turn until the server says
    *  that turn has stopped running. While it holds, this surface's own view
    *  of the turn is the truth (its stream wrote it), and the follow loop must
@@ -383,10 +385,14 @@ export function FloatingChat() {
     setTurnCheckFailed(false);
   }
 
-  /** Re-attach cards the turn is currently blocked on (required after a
-   *  restore): a reload or a reopen cannot see the stream that raised them. */
-  async function restorePendingHitl(key: string): Promise<void> {
+  /** Re-attach cards the turn is currently blocked on (required after a restore).
+   *
+   *  The follow loop reads them quietly on every tick: a re-attach — and a reopen —
+   *  cannot replay a card raised before it opened, and a failed poll is a lost tick. */
+  async function restorePendingHitl(key: string, opts: { quiet?: boolean } = {}): Promise<void> {
     const gen = genRef.current;
+    const epoch = turnEpochRef.current;
+    const stale = (): boolean => turnEpochRef.current !== epoch;
     /** A card with no turn in the thread to hang it on gets its own bubble.
      *  The phase is `done`, never the constructor's `thinking`: this turn is
      *  PARKED, not running. */
@@ -405,12 +411,15 @@ export function FloatingChat() {
       // session that is not parked, and a read that could not be made is not
       // that answer.
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      if (genRef.current === gen) {
+      // Parsed BEFORE the check: reading the body is a suspension point, so a
+      // turn that settles while it is read would otherwise slip past the
+      // generation and epoch checks and attach cards to a turn already done.
+      const { approvals } = (await res.json()) as { approvals?: PendingApproval[] };
+      if (genRef.current === gen && !stale()) {
         // A LIST, oldest first: a session can hold several pending approvals
         // at once, and the oldest is not the only one this surface offers. An
         // empty one draws nothing, which is why the read above reports its
         // failures rather than leaving this branch to say it silently.
-        const { approvals } = (await res.json()) as { approvals?: PendingApproval[] };
         for (const a of approvals ?? []) {
           if (a.approvalId) {
             // Through the fold's own add, so a stream event that already
@@ -426,7 +435,7 @@ export function FloatingChat() {
       // Staying silent would leave a parked turn looking idle, with no card
       // anywhere — and the card is the only place the decision can be made.
       // Same reason the question read below reports its failures.
-      if (genRef.current === gen) {
+      if (!opts.quiet && genRef.current === gen && !stale()) {
         setMsgs((m) => [
           ...m,
           { ...newAgentMsg(nextId()), phase: "done", error: t("cubepilot.chat.pendingApprovalUnavailable", { error: String(e) }) },
@@ -438,20 +447,24 @@ export function FloatingChat() {
       // An empty collection is "nothing is pending", and a read that FAILED is
       // thrown so that it is reported rather than folded into "idle".
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      if (genRef.current === gen) {
-        const { questions } = (await res.json()) as {
-          questions?: Array<{ id?: string; questions?: AgentQuestionItem[]; timeoutSeconds?: number }>;
-        };
+      // Same ordering as the approval read above, for the same reason.
+      const { questions } = (await res.json()) as {
+        questions?: Array<{ id?: string; questions?: AgentQuestionItem[]; timeoutSeconds?: number }>;
+      };
+      if (genRef.current === gen && !stale()) {
         for (const q of questions ?? []) {
           if (!q.id) continue;
           // The response carries what is LEFT of the gateway's deadline, so a
           // restored card gets the same countdown as a streamed one.
           const card = newQuestion(q.id, q.questions ?? [], q.timeoutSeconds, Date.now());
-          attachToNewest((x) => ({ ...x, questions: [...x.questions, card] }));
+          // The stream and this read both describe one question: the id says so.
+          attachToNewest((x) =>
+            x.questions.some((old) => old.callId === card.callId) ? x : { ...x, questions: [...x.questions, card] },
+          );
         }
       }
     } catch (e) {
-      if (genRef.current === gen) {
+      if (!opts.quiet && genRef.current === gen && !stale()) {
         setMsgs((m) => [
           ...m,
           { ...newAgentMsg(nextId()), phase: "done", error: t("cubepilot.chat.pendingQuestionUnavailable", { error: String(e) }) },
@@ -613,6 +626,8 @@ export function FloatingChat() {
       if (!res.ok || followGenRef.current !== gen) return;
       const { active } = (await res.json()) as { active?: boolean };
       if (followGenRef.current !== gen) return;
+      // No active turn: any pending read in flight is about a settled turn.
+      if (active !== true) turnEpochRef.current += 1;
       if (ownTurnRef.current) {
         // A turn this surface started. Its stream is the state, and the
         // history document is no substitute: it holds no cards, and it cannot
@@ -644,9 +659,11 @@ export function FloatingChat() {
         // the turn was started elsewhere.
         followingRef.current = true;
         await refreshHistoryIfChanged(key);
-        // A run parked on a human pushes its card to the session's own stream,
-        // which this surface no longer holds. Re-attach so it arrives here.
+        // A run parked on a human pushes its card to a stream this surface no
+        // longer holds: re-attach for the continuation, and read the pending set
+        // for the card itself (a re-attach does not replay one).
         void attachToRun(key);
+        void restorePendingHitl(key, { quiet: true });
         return;
       }
       if (followingRef.current) await adoptServerState(key);
