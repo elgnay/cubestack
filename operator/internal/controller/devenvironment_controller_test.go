@@ -1646,6 +1646,18 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
 			return env
 		}
+		// A GPU model the environment names, and a node label that contradicts it
+		// — the one case where the two sources of node selection disagree.
+		contradicting := func() *aiv1alpha1.DevEnvironment {
+			env := newJupyter()
+			env.Spec.Image = testMetaxImage
+			env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+				Vendor: aiv1alpha1.AcceleratorVendorMetax,
+				Model:  testGPUModelMXC550,
+			}
+			env.Spec.NodeSelector = map[string]string{testProductLabelMetax: testGPUModelMXC500}
+			return env
+		}
 
 		// Each entry states the disposition it expects, not just that something was
 		// reported: the whole point of the condition is which of the two a value
@@ -1727,6 +1739,14 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					"spec.resources.gpu.vendor: must be updated — ",
 					"spec.runtime.env[NB_UID]: ignored — ",
 				}),
+			// A node label and the model pin write the same kind of value to one
+			// key, so where they disagree the model is what the pod is given and
+			// the label goes unused (::nodeSelectorFindings). Unlike the exposure
+			// above this is resolved rather than refused: the environment runs,
+			// and the field that decides it is one the user can edit.
+			Entry("a node label the model pin overwrites is ignored",
+				contradicting(), 0,
+				[]string{"spec.nodeSelector[" + testProductLabelMetax + "]: ignored — "}),
 		)
 
 		// The fold that is not lossless, and so is not a resolved value: the ssh
@@ -2190,10 +2210,15 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
-		// The model is the pod spec's only node selection, and it is set outright
-		// rather than merged. It is also the reason the image is the vendor's own:
-		// a metax model on a cuda image is a pair the pre-apply gate refuses, and
-		// this spec renders the pod the platform would actually create.
+		// A label that is not about the accelerator, which is what a selector is
+		// usually for.
+		pool := map[string]string{testNodePoolLabel: testNodePoolValue}
+
+		// The model is one of the pod spec's two sources of node selection, and
+		// the one that outranks the other (::desiredNodeSelector). It is also the
+		// reason the image is the vendor's own: a metax model on a cuda image is a
+		// pair the pre-apply gate refuses, and this spec renders the pod the
+		// platform would actually create.
 		It("pins the pod to the named model's node", func() {
 			spec := render(func(env *aiv1alpha1.DevEnvironment) {
 				env.Spec.Image = testMetaxImage
@@ -2231,6 +2256,57 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				env.Spec.Image = testMetaxImage
 				env.Spec.Resources.GPU = metaxGPU()
 			}).NodeSelector).To(BeEmpty())
+		})
+
+		// A selector is the pod spec's other source of node selection, and the
+		// labels the user wrote are what reach the pod.
+		It("carries the node labels the environment asked for", func() {
+			Expect(render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = pool
+			}).NodeSelector).To(Equal(pool))
+		})
+
+		// Each source reaches the pod on its own keys: a selector is not a
+		// replacement for the model pin, and the model pin is not a replacement
+		// for a selector.
+		It("merges the labels the environment asked for with the model pin", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Image = testMetaxImage
+				env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+					Vendor: aiv1alpha1.AcceleratorVendorMetax,
+					Model:  testGPUModelMXC550,
+				}
+				env.Spec.NodeSelector = pool
+			})
+			Expect(spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelMetax: testGPUModelMXC550,
+				testNodePoolLabel:     testNodePoolValue,
+			}))
+		})
+
+		// nodeSelector is a flat map with no merge semantics, so where the two
+		// sources write one key only one of them can be honoured. The model is:
+		// it is derived from the field that also picks the accelerator the pod
+		// requests, so a label allowed to displace it would pin the pod to a card
+		// the spec rejected while the device request named the other one. The
+		// remainder of the user's labels are untouched, and the disagreement is
+		// reported rather than dropped in silence (::nodeSelectorFindings).
+		It("keeps the model pin when the labels the environment asked for contradict it", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Image = testMetaxImage
+				env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+					Vendor: aiv1alpha1.AcceleratorVendorMetax,
+					Model:  testGPUModelMXC550,
+				}
+				env.Spec.NodeSelector = map[string]string{
+					testProductLabelMetax: testGPUModelMXC500,
+					testNodePoolLabel:     testNodePoolValue,
+				}
+			})
+			Expect(spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelMetax: testGPUModelMXC550,
+				testNodePoolLabel:     testNodePoolValue,
+			}))
 		})
 
 		// The model narrows where the pod runs and nothing else: the extended
@@ -4028,6 +4104,43 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+		})
+
+		// The same disposition reached end to end, for the one disagreement that
+		// is between two spec fields rather than between a spec field and the
+		// controller's own value: the node label loses to the model pin, the
+		// environment provisions anyway, and the StatefulSet the controller
+		// writes is what proves which of the two the pod was given.
+		It("accepts an environment whose node label the model pin overwrites", func() {
+			env := validDevEnvironment("de-node-selector-overridden")
+			env.Spec.Resources.GPU.Model = testGPUModelH200
+			env.Spec.NodeSelector = map[string]string{
+				testProductLabelNvidia: testGPUModelMXC500,
+				testNodePoolLabel:      testNodePoolValue,
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(cond.Reason).To(Equal(reasonOverridden))
+				g.Expect(cond.Message).To(ContainSubstring(
+					"spec.nodeSelector[" + testProductLabelNvidia + "]: ignored — "))
+				g.Expect(got.Status.Phase.Name).NotTo(Equal(aiv1alpha1.PhaseFailed))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The model's value on the key the two fields share, and the label
+			// that was only ever the user's left exactly as written.
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelNvidia: testGPUModelH200,
+				testNodePoolLabel:      testNodePoolValue,
+			}))
 		})
 
 		It("withdraws compute and routes when a running environment becomes mismatched", func() {

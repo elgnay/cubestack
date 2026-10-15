@@ -53,6 +53,20 @@ type DevEnvironmentSpec struct {
 	// Resources is the compute / resource configuration.
 	Resources ResourcesSpec `json:"resources"`
 
+	// NodeSelector constrains scheduling to nodes carrying these labels, e.g. a
+	// node pool. Labels are matched exactly, and one that matches no node leaves
+	// the environment Pending rather than failing: which nodes a cluster has is
+	// not something the spec can be wrong about.
+	//
+	// It is one input to placement and not the whole of it. The accelerator the
+	// environment asks for already decides which nodes can run it, so a selector
+	// that contradicts spec.resources.gpu.model is resolved in the model's favour
+	// and the disagreement is reported on the Accepted condition. Set the model
+	// there rather than here: that field also names the accelerator the
+	// environment requests, and a selector cannot.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
 	// Storage is the workspace storage: a PVC created with the environment and
 	// mounted at the workspace path (spec.storage.mountPath, else derived from
 	// spec.runtime). Before the environment starts, the claim's root is made

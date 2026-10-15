@@ -53,6 +53,12 @@ const (
 	// files too, which is why they are named rather than repeated.
 	testProductLabelNvidia = "nvidia.com/gpu.product"
 	testProductLabelMetax  = "metax-tech.com/gpu.product"
+
+	// A node label that is not about the accelerator, which is what a selector
+	// is usually for. A model pin and a user's selector never write the same key
+	// unless the user aims one at the vendor's own label.
+	testNodePoolLabel = "node-pool"
+	testNodePoolValue = "gpu-2"
 )
 
 // testExecProbeCommand is the command line of the exec-probe specs: the

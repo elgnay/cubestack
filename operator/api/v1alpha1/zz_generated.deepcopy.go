@@ -197,6 +197,13 @@ func (in *DevEnvironmentList) DeepCopyObject() runtime.Object {
 func (in *DevEnvironmentSpec) DeepCopyInto(out *DevEnvironmentSpec) {
 	*out = *in
 	in.Resources.DeepCopyInto(&out.Resources)
+	if in.NodeSelector != nil {
+		in, out := &in.NodeSelector, &out.NodeSelector
+		*out = make(map[string]string, len(*in))
+		for key, val := range *in {
+			(*out)[key] = val
+		}
+	}
 	if in.Storage != nil {
 		in, out := &in.Storage, &out.Storage
 		*out = new(StorageSpec)

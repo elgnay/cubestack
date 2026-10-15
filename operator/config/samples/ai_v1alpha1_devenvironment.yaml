@@ -28,6 +28,23 @@ spec:
     cpu: "16"
     memory: "64Gi"
 
+  # Placement. A nodeSelector picks the nodes this environment may run on, by
+  # label — a node pool, a zone, a particular machine. Left out, the environment
+  # is placed wherever its resources allow.
+  #
+  # It is one input to placement and not the whole of it. The accelerator the
+  # environment asks for already decides which nodes can run it, so a label here
+  # that disagrees with the gpu.model above loses to that field: the model is
+  # what also names the accelerator the environment requests, and a label
+  # cannot. The disagreement is reported on the environment's Accepted condition
+  # rather than passed over in silence, so set the model there rather than here.
+  #
+  # A label no node carries is not an error either — the environment stays
+  # Pending, because which nodes a cluster has is not something the spec is
+  # wrong about.
+  nodeSelector:
+    node-pool: gpu-2             # any label the cluster puts on its nodes
+
   # Workspace storage
   # The workspace always uses the platform-predefined StorageClass
   # (cephfs-ephemeral, ReadWriteMany) so it can follow the pod on drift; it is

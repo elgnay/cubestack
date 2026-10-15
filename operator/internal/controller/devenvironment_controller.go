@@ -1221,6 +1221,29 @@ func gpuModelNodeSelector(env *aiv1alpha1.DevEnvironment) map[string]string {
 	return map[string]string{vendorProductLabel(vendor): env.Spec.Resources.GPU.Model}
 }
 
+// desiredNodeSelector is the pod's whole node selection: the labels the
+// environment asked for (spec.nodeSelector) with the GPU model pin written over
+// them. It is nil when the environment selects nothing, so a pod that selects
+// nothing carries no map rather than an empty one.
+//
+// nodeSelector is a flat map with no merge semantics, so the two sources cannot
+// both be honoured on one key and one of them has to give way. The model does:
+// it is derived from the field that also picks the extended resource the pod
+// requests, so a hand-written label allowed to displace it would pin the pod to
+// a card the spec rejected while the device request went on naming the other
+// one. The user loses nothing by that — spec.resources.gpu.model is where a
+// model is chosen — and the clash is reported rather than silent
+// (::nodeSelectorFindings).
+func desiredNodeSelector(env *aiv1alpha1.DevEnvironment) map[string]string {
+	selector := make(map[string]string, len(env.Spec.NodeSelector)+1)
+	maps.Copy(selector, env.Spec.NodeSelector)
+	maps.Copy(selector, gpuModelNodeSelector(env))
+	if len(selector) == 0 {
+		return nil
+	}
+	return selector
+}
+
 // desiredContainerPorts declares the ports the environment's container listens
 // on, in the order desiredService publishes them: the type's main port, ssh
 // when it is exposed and is not already the main port, then each spec.ports
@@ -1811,6 +1834,7 @@ func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 		})
 	}
 	findings = append(findings, portCollisionFindings(env)...)
+	findings = append(findings, nodeSelectorFindings(env)...)
 	if env.Spec.Runtime == nil {
 		return findings
 	}
@@ -2090,13 +2114,12 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{container},
-		// The GPU model the environment names, if any. This is the pod spec's
-		// only node selection — #206 removed the hard compute-pool selector and
-		// nothing replaced it — so it is set outright rather than merged. A
-		// second source of node selection would have to merge into this map
-		// instead: nodeSelector is a flat map with no merge semantics, and
-		// assigning over it would silently drop the model constraint.
-		NodeSelector: gpuModelNodeSelector(env),
+		// The labels the environment asks for (spec.nodeSelector) together with
+		// the GPU model it names, if any. #206 removed the hard compute-pool
+		// selector and this is what replaced it; the two sources are reconciled
+		// in ::desiredNodeSelector, because nodeSelector is a flat map with no
+		// merge semantics.
+		NodeSelector: desiredNodeSelector(env),
 		// Pod-level, so the profile reaches the init container below too. An unset
 		// profile is Unconfined, which the Restricted Pod Security Standard refuses
 		// outright: this is that level's seccomp requirement met, and no more —
@@ -2394,6 +2417,36 @@ func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 			field:      field,
 			detail: fmt.Sprintf("the Service already publishes %d/%s as %q, which forwards to container port %d rather than the %d this entry declares, so the exposure's route would reach whatever listens on %d. Declare a container port the Service does not already publish",
 				p.ContainerPort, protocol, owner.Name, owner.TargetPort.IntVal, p.ContainerPort, owner.TargetPort.IntVal),
+		})
+	}
+	return findings
+}
+
+// nodeSelectorFindings reports the node labels an environment asked for that the
+// GPU model pin writes over (::desiredNodeSelector). spec.resources.gpu.model
+// decides the label a node advertises the card under and the extended resource
+// the pod requests together, so where the two disagree it is the model that is
+// applied and the label the user wrote is the one that goes unused. An entry
+// that names the same value the model pins is not a disagreement, and is not
+// reported.
+//
+// This is a finding and not a refusal: the environment provisions, and editing
+// the spec is the way to change what was applied, so it is reported as resolved
+// rather than as something that has to be fixed first.
+func nodeSelectorFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
+	pinned := gpuModelNodeSelector(env)
+	var findings []specFinding
+	// The keys are sorted because the message these produce is compared against
+	// a fixed string: map iteration order would shuffle it run to run.
+	for _, key := range slices.Sorted(maps.Keys(env.Spec.NodeSelector)) {
+		model, pinnedHere := pinned[key]
+		if !pinnedHere || env.Spec.NodeSelector[key] == model {
+			continue
+		}
+		findings = append(findings, specFinding{
+			field: fmt.Sprintf("nodeSelector[%s]", key),
+			detail: fmt.Sprintf("spec.resources.gpu.model decides this node label and the accelerator the pod requests together, and it names %q, so the pod is pinned to that. Change the model there rather than in a node label",
+				model),
 		})
 	}
 	return findings
