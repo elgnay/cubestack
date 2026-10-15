@@ -45,6 +45,19 @@ spec:
   nodeSelector:
     node-pool: gpu-2             # any label the cluster puts on its nodes
 
+  # schedulerName names the scheduler that places this environment's pod, when
+  # something other than the cluster's default should. Omitted, the default
+  # scheduler places it. It decides who picks the node, not which nodes may be
+  # picked: the nodeSelector above and the accelerator the environment asks for
+  # travel on the pod either way, and a scheduler that ignores them places the
+  # environment where the spec did not ask for it to be.
+  #
+  # The name has to be one a scheduler answers to. A name nothing answers to is
+  # not an error the environment reports: no scheduler looks at the pod at all,
+  # so it stays Pending with nothing but the PodScheduled condition to say it
+  # was never placed.
+  schedulerName: gpu-scheduler   # any scheduler registered in the cluster
+
   # Workspace storage
   # The workspace always uses the platform-predefined StorageClass
   # (cephfs-ephemeral, ReadWriteMany) so it can follow the pod on drift; it is

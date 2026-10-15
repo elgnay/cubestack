@@ -67,6 +67,22 @@ type DevEnvironmentSpec struct {
 	// +optional
 	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
 
+	// SchedulerName names the scheduler that places this environment's pod, when
+	// something other than the cluster's default should. Omitted, the default
+	// scheduler places it.
+	//
+	// It decides who picks the node, not which nodes may be picked: the placement
+	// the environment states elsewhere — spec.nodeSelector, the accelerator it
+	// asks for — travels on the pod, and a scheduler that ignores it places the
+	// environment where the spec did not ask for it to be.
+	//
+	// The name has to be one a scheduler answers to. A name nothing answers to is
+	// not an error and leaves nothing to read: no scheduler looks at the pod at
+	// all, so there is no scheduling failure to report, the environment stays
+	// Pending, and only the PodScheduled condition says it was never placed.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+
 	// Storage is the workspace storage: a PVC created with the environment and
 	// mounted at the workspace path (spec.storage.mountPath, else derived from
 	// spec.runtime). Before the environment starts, the claim's root is made

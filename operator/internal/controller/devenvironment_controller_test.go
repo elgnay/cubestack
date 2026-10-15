@@ -1467,6 +1467,48 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		})
 	})
 
+	// applyStatefulSet reads a matching digest as "nothing to do", so what this
+	// input omits is as load-bearing as what it carries: a template field that
+	// serializes even when the environment did not set it rolls every workload in
+	// the cluster the first time the new manager reconciles one.
+	Describe("stsSpecHash", func() {
+		hash := func(mut func(*aiv1alpha1.DevEnvironment)) string {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-hash", Namespace: testNamespace},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeVSCode, Image: testDevImage,
+				},
+			}
+			if mut != nil {
+				mut(env)
+			}
+			return (&DevEnvironmentReconciler{}).stsSpecHash(env)
+		}
+
+		// An environment that names no placement is the case with the most
+		// environments behind it, and the empty map is the shape to pin: a user may
+		// write `nodeSelector: {}`, and a map without omitempty would serialize as
+		// null for every one of them.
+		It("digests a placement the environment did not name as absent", func() {
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = map[string]string{}
+				env.Spec.SchedulerName = ""
+			})).To(Equal(hash(nil)))
+		})
+
+		// The digest is what makes an edit reach a running workload at all, so the
+		// two fields have to move it in both directions.
+		It("digests a named selector, and a named scheduler, as changes", func() {
+			plain := hash(nil)
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = map[string]string{testNodePoolLabel: testNodePoolValue}
+			})).NotTo(Equal(plain))
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.SchedulerName = testSchedulerName
+			})).NotTo(Equal(plain))
+		})
+	})
+
 	Describe("rdmaResource", func() {
 		envWith := func(network *aiv1alpha1.NetworkSpec) *aiv1alpha1.DevEnvironment {
 			return &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Network: network}}
@@ -2307,6 +2349,25 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				testProductLabelMetax: testGPUModelMXC550,
 				testNodePoolLabel:     testNodePoolValue,
 			}))
+		})
+
+		// Naming a scheduler offers the pod to that one instead of whichever the
+		// cluster runs by default. It decides who picks the node, not which nodes
+		// may be picked: the selection above still travels on the pod.
+		It("offers the pod to the scheduler the environment names", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.SchedulerName = testSchedulerName
+				env.Spec.NodeSelector = pool
+			})
+			Expect(spec.SchedulerName).To(Equal(testSchedulerName))
+			Expect(spec.NodeSelector).To(Equal(pool))
+		})
+
+		// An environment that names none leaves the field unset rather than
+		// writing the default scheduler's own name, so the pod spec is exactly
+		// what it was before the field existed.
+		It("leaves the scheduler unset when the environment names none", func() {
+			Expect(render(nil).SchedulerName).To(BeEmpty())
 		})
 
 		// The model narrows where the pod runs and nothing else: the extended
@@ -3620,6 +3681,69 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{
 					testProductLabelNvidia: testGPUModelH200,
 				}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The labels the environment asked for are a template field the hash has
+		// to cover for the same reason the model pin is: the pin rides into the
+		// hash through spec.resources, and a selector written by hand rides into
+		// nothing else. Left out, applying one to a running environment would
+		// digest the same, applyStatefulSet would skip the update, and the pod
+		// would go on being placed by a template the spec no longer states.
+		It("rolls the StatefulSet when the environment's node labels change", func() {
+			env := validDevEnvironment("de-node-selector-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.NodeSelector = map[string]string{testNodePoolLabel: testNodePoolValue}
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(Equal(
+					map[string]string{testNodePoolLabel: testNodePoolValue}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The scheduler is the same story with one wrinkle of its own: the
+		// environment naming none renders no name, but the stored template reads
+		// "default-scheduler" because the API server defaults the field on the way
+		// in. The live object therefore cannot stand in for the hash entry, and a
+		// renamed scheduler left out of the hash would never reach the pod.
+		It("rolls the StatefulSet when the scheduler is renamed", func() {
+			env := validDevEnvironment("de-scheduler-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.SchedulerName = testSchedulerName
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.SchedulerName).To(Equal(testSchedulerName))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

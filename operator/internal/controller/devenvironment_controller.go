@@ -2120,6 +2120,16 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		// in ::desiredNodeSelector, because nodeSelector is a flat map with no
 		// merge semantics.
 		NodeSelector: desiredNodeSelector(env),
+		// The scheduler the environment names, if any (spec.schedulerName). Empty
+		// is unset: the field is omitempty on the pod spec, so an environment that
+		// names none renders exactly as it did before the field existed, and the
+		// cluster's default scheduler places it.
+		//
+		// A name no scheduler answers to is not refused here and cannot be: what
+		// schedulers a cluster runs is not something the spec can be wrong about.
+		// The pod is simply never picked up, which is why the API says so plainly
+		// rather than leaving the failure to be discovered.
+		SchedulerName: env.Spec.SchedulerName,
 		// Pod-level, so the profile reaches the init container below too. An unset
 		// profile is Unconfined, which the Restricted Pod Security Standard refuses
 		// outright: this is that level's seccomp requirement met, and no more —
@@ -3022,6 +3032,25 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		Storage    *aiv1alpha1.StorageSpec
 		Volumes    []aiv1alpha1.VolumeMount
 		SSHExposed bool
+		// NodeSelector is the placement the environment asked for
+		// (spec.nodeSelector). The GPU model pin is not repeated here: it follows
+		// from Resources, which is above. A user's labels follow from nothing else,
+		// so without this a selector added to an existing environment would digest
+		// the same, applyStatefulSet would skip the update, and the workload would
+		// go on being placed by a template the spec no longer states. The map is
+		// omitted while it is empty, as rdma is, so the environments that select
+		// nothing — every one that predates the field — digest exactly as they did
+		// before it existed and are not rolled on upgrade.
+		NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+		// SchedulerName is spec.schedulerName, and is empty for every environment
+		// that names no scheduler. Nothing else in this input implies it, and the
+		// live object cannot stand in for it: the API server defaults the field on
+		// the stored template, so the StatefulSet reads "default-scheduler" whether
+		// or not the environment asked for anything. Without this entry a renamed
+		// scheduler would digest the same and never reach the pod. The empty string
+		// is omitted rather than hashed, so the environments that name none digest
+		// exactly as they did before the field existed.
+		SchedulerName string `json:"schedulerName,omitempty"`
 		// JupyterTokenRevision is the digest carried on the pod template for a
 		// jupyter environment ("" otherwise): introducing the JUPYTER_TOKEN env
 		// var plus its revision rolls existing StatefulSets once on upgrade, and
@@ -3134,6 +3163,8 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		Storage:               env.Spec.Storage,
 		Volumes:               env.Spec.Volumes,
 		SSHExposed:            sshExposed(env),
+		NodeSelector:          env.Spec.NodeSelector,
+		SchedulerName:         env.Spec.SchedulerName,
 		JupyterTokenRevision:  env.Annotations[jupyterTokenRevisionAnnotationKey],
 		SSHKeysRevision:       env.Annotations[sshKeysRevisionAnnotationKey],
 		SSHMount:              sshMountKey(env),

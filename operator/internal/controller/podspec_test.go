@@ -59,6 +59,9 @@ const (
 	// unless the user aims one at the vendor's own label.
 	testNodePoolLabel = "node-pool"
 	testNodePoolValue = "gpu-2"
+
+	// A scheduler a cluster might run instead of its default.
+	testSchedulerName = "gpu-scheduler"
 )
 
 // testExecProbeCommand is the command line of the exec-probe specs: the
