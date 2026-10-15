@@ -1961,6 +1961,15 @@ func activityAgentEnabled(env *aiv1alpha1.DevEnvironment) bool {
 	return env.Spec.Lifecycle != nil && env.Spec.Lifecycle.IdleTimeout > 0
 }
 
+// egressUnrestricted reports whether this environment asked to reach outside the
+// cluster (spec.network.egress). It is the whole of the condition — the field is
+// absent on every environment that did not ask, and absent is what the default
+// reads as — so it is read where the outbound allowance is rendered and nowhere
+// else.
+func egressUnrestricted(env *aiv1alpha1.DevEnvironment) bool {
+	return env.Spec.Network != nil && env.Spec.Network.Egress != nil && env.Spec.Network.Egress.Unrestricted
+}
+
 // activityAgentServiceAccountName is the account an environment that carries the
 // sidecar runs under, and names the Role and RoleBinding that go with it. It is
 // the name of an object that exists only while the environment asks for one, so
@@ -2439,10 +2448,12 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 }
 
 // desiredNetworkPolicy enforces default-deny ingress — widened by exactly one
-// rule when the platform Gateway's dataplane is configured — with DNS egress
-// whitelisted (design §9.1). agentEgress is the activity agent's allowance,
+// rule when the platform Gateway's dataplane is configured — and admits DNS
+// egress (design §9.1), or every egress at all for an environment that asked for
+// one (spec.network.egress). agentEgress is the activity agent's allowance,
 // resolved by applyNetworkPolicy, and is empty for an environment that carries
-// no agent.
+// no agent; the unrestricted case subsumes it, so it is dropped where the
+// environment has already removed the restriction it would have widened.
 func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvironment, agentEgress []networkingv1.NetworkPolicyEgressRule) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
@@ -2484,39 +2495,63 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 			}},
 		})
 	}
+	// Egress is default-deny with a single DNS allowance, and an environment may
+	// lift it entirely (spec.network.egress.unrestricted). The lifted form is one
+	// rule naming no destination and no port, which is the shape "nothing is
+	// refused" has to take: a policy that selects for egress and carries no rule
+	// at all refuses everything, so the absence of a restriction is a rule that
+	// restricts nothing.
+	//
+	// That rule subsumes the DNS allowance and the agent's apiserver one alike,
+	// so neither is appended when it is in force. The only difference between an
+	// unrestricted environment's policy and a restricted one's is this list —
+	// PolicyTypes names Egress either way, so the policy cannot be read as
+	// silently dropping out of egress enforcement.
+	//
+	// The decision belongs to one environment rather than to a namespace, which
+	// is why it is a field on the spec and not a setting on the installation: the
+	// environment that installs a package needs the network and the one beside it
+	// does not, and a namespace opened wholesale says nothing in either
+	// environment's spec about why it is open.
+	var egress []networkingv1.NetworkPolicyEgressRule
+	if egressUnrestricted(env) {
+		egress = []networkingv1.NetworkPolicyEgressRule{{}}
+	} else {
+		egress = append([]networkingv1.NetworkPolicyEgressRule{
+			{
+				// Port 53 with no peer, because the resolver's address is
+				// the cluster's to choose and no object reports it: the
+				// kubelet's --cluster-dns is what reaches a pod's
+				// resolv.conf, and it names the DNS Service's ClusterIP on
+				// one cluster, a node-local cache's address on the next
+				// (Kubernetes' nodelocaldns answers on 169.254.25.10,
+				// Cilium's on 169.254.20.10, and --localip moves it
+				// anywhere), and nothing stops an operator from setting it
+				// to something else again. A rule peering on the kube-dns
+				// pods — which is what this one used to do — admits no
+				// lookup at all wherever the pod dials a node-local cache
+				// instead, and the environment then starts, serves, and
+				// cannot resolve a single name.
+				//
+				// So the port is the scope here, not the destination. The
+				// cost is small: this platform's other egress rules all
+				// name a peer, and a tenant who could tunnel DNS out
+				// through the cluster resolver could already tunnel it
+				// through the kube-dns pods this rule would otherwise name.
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &udp, Port: &dnsPort},
+					{Protocol: &tcp, Port: &dnsPort},
+				},
+			},
+		}, agentEgress...)
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     ingress,
-			Egress: append([]networkingv1.NetworkPolicyEgressRule{
-				{
-					// Port 53 with no peer, because the resolver's address is
-					// the cluster's to choose and no object reports it: the
-					// kubelet's --cluster-dns is what reaches a pod's
-					// resolv.conf, and it names the DNS Service's ClusterIP on
-					// one cluster, a node-local cache's address on the next
-					// (Kubernetes' nodelocaldns answers on 169.254.25.10,
-					// Cilium's on 169.254.20.10, and --localip moves it
-					// anywhere), and nothing stops an operator from setting it
-					// to something else again. A rule peering on the kube-dns
-					// pods — which is what this one used to do — admits no
-					// lookup at all wherever the pod dials a node-local cache
-					// instead, and the environment then starts, serves, and
-					// cannot resolve a single name.
-					//
-					// So the port is the scope here, not the destination. The
-					// cost is small: this platform's other egress rules all
-					// name a peer, and a tenant who could tunnel DNS out
-					// through the cluster resolver could already tunnel it
-					// through the kube-dns pods this rule would otherwise name.
-					Ports: []networkingv1.NetworkPolicyPort{
-						{Protocol: &udp, Port: &dnsPort},
-						{Protocol: &tcp, Port: &dnsPort},
-					},
-				},
-			}, agentEgress...),
+			Egress:      egress,
 		},
 	}
 }

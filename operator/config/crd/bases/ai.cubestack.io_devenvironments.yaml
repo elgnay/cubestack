@@ -106,8 +106,34 @@ spec:
                     type: integer
                 type: object
               network:
-                description: Network configures the network.
+                description: |-
+                  Network configures the network: RDMA access, and what the environment may
+                  reach on its own behalf. Outbound access is restricted unless the
+                  environment asks otherwise (spec.network.egress).
                 properties:
+                  egress:
+                    description: Egress configures the environment's outbound access.
+                    properties:
+                      unrestricted:
+                        default: false
+                        description: |-
+                          Unrestricted lifts the restriction on what the environment may reach: it
+                          may open a connection to any destination, rather than being able to
+                          resolve names and reach nothing.
+
+                          An environment is restricted by default, and one that serves a notebook
+                          off its own image never notices. One that installs a package or downloads
+                          a dataset does — and the failure does not land where the request was made.
+                          An install that cannot reach its index does not raise, so the environment
+                          goes on to fail later on a missing import instead, and the network is the
+                          last thing suspected. This field is how an environment that expects to
+                          reach outside the cluster says so.
+
+                          It is a property of one environment and not of a namespace: setting it
+                          says nothing about the environments that did not, and an environment that
+                          carries it is no more reachable from outside than one that does not.
+                        type: boolean
+                    type: object
                   rdmaEnabled:
                     default: false
                     description: |-

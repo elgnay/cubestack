@@ -982,6 +982,17 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 		env := &aiv1alpha1.DevEnvironment{
 			ObjectMeta: metav1.ObjectMeta{Name: "de-netpol", Namespace: "ns"},
 		}
+		// The same environment with the outbound restriction lifted. It is the
+		// only spec field this renderer reads, so it is the whole of the
+		// difference between the two.
+		asking := &aiv1alpha1.DevEnvironment{
+			ObjectMeta: metav1.ObjectMeta{Name: "de-netpol-open", Namespace: "ns"},
+			Spec: aiv1alpha1.DevEnvironmentSpec{
+				Network: &aiv1alpha1.NetworkSpec{
+					Egress: &aiv1alpha1.EgressSpec{Unrestricted: true},
+				},
+			},
+		}
 
 		It("admits nothing while no dataplane namespace is configured", func() {
 			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env, nil)
@@ -1014,6 +1025,61 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(np.Spec.Egress[0].To).To(BeEmpty())
 			Expect(np.Spec.Egress[0].Ports).To(HaveLen(2))
 			Expect(np.Spec.Egress[1]).To(Equal(agentEgress[0]))
+		})
+
+		It("refuses nothing for an environment that asked to reach out", func() {
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(asking, nil)
+
+			// One rule naming no destination and no port. That is the only shape
+			// "nothing is refused" has: a policy selecting for egress and
+			// carrying no rule at all refuses everything, so an empty rule is not
+			// an omission here but the whole of the allowance.
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0]).To(Equal(networkingv1.NetworkPolicyEgressRule{}))
+			// And the ingress half is untouched: an environment that may reach
+			// out is no more reachable from outside than one that may not, so
+			// neither the empty ingress list nor the policy types move.
+			Expect(np.Spec.Ingress).To(BeEmpty())
+			Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress,
+			}))
+		})
+
+		It("drops the agent's allowance once there is no restriction to widen", func() {
+			agentEgress := []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "10.96.0.2/32"},
+				}},
+			}}
+
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(asking, agentEgress)
+
+			// Subsumed, not appended: the rule above admits the apiserver already,
+			// and a second rule saying so again would read as the allowance still
+			// being load-bearing.
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0]).To(Equal(networkingv1.NetworkPolicyEgressRule{}))
+		})
+
+		It("leaves an environment that did not ask at the default", func() {
+			// spec.network is set, and says nothing about egress. The opt-out is
+			// the field and not the presence of the section, so RDMA settings
+			// must not be read as reaching for the network.
+			silent := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-netpol-rdma", Namespace: "ns"},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Network: &aiv1alpha1.NetworkSpec{
+						RDMAEnabled: true,
+						RDMAType:    aiv1alpha1.RDMATypeRoCE,
+					},
+				},
+			}
+
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(silent, nil)
+
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0].To).To(BeEmpty())
+			Expect(np.Spec.Egress[0].Ports).To(HaveLen(2))
 		})
 
 		It("admits the configured Gateway's dataplane", func() {
@@ -3643,6 +3709,33 @@ var _ = Describe("DevEnvironment controller", func() {
 					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &servicePort}))
 				g.Expect(rule.Ports).To(ContainElement(
 					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &apiserverPort}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The other half of the pair above: an environment that says it reaches
+		// outside the cluster has to come up with an egress list that refuses
+		// nothing, because the field is worth having only if the policy that
+		// reaches the API server is the one a tenant's install needs. This is the
+		// reconcile path, not the renderer, so it is also what proves the field
+		// survives the CRD, the defaulting and the stored object.
+		It("refuses nothing outbound for an environment that asked to reach out", func() {
+			env := validDevEnvironment("de-open-netpol")
+			env.Spec.Network = &aiv1alpha1.NetworkSpec{
+				Egress: &aiv1alpha1.EgressSpec{Unrestricted: true},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				np := &networkingv1.NetworkPolicy{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), np)).To(Succeed())
+				// One rule naming no destination and no port, which is everything:
+				// a policy selecting for egress with no rule at all refuses all of
+				// it, so the empty rule is the allowance and not its absence.
+				g.Expect(np.Spec.Egress).To(Equal([]networkingv1.NetworkPolicyEgressRule{{}}))
+				// The ingress half is the one the environment did not ask about,
+				// and it is unchanged: default-deny plus the Gateway's dataplane.
+				g.Expect(np.Spec.Ingress).To(HaveLen(1))
 			}, "15s", "200ms").Should(Succeed())
 		})
 

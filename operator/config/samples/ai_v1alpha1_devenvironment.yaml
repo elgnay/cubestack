@@ -101,6 +101,18 @@ spec:
     # derives their addresses from the host's own networking. An environment is
     # reachable only on the fabric it names.
     rdmaType: roce               # infiniband / roce
+    # Outbound access is restricted by default: an environment resolves names and
+    # reaches nothing, which serves a notebook off its own image and stops an
+    # install or a dataset download at the network. An environment that is meant
+    # to reach outside the cluster says so here. The failure is easy to misread —
+    # an install that cannot reach its index does not raise, and the environment
+    # goes on to fail later on a missing import instead.
+    #
+    # It is a property of this environment, not of its namespace, and it says
+    # nothing about inbound traffic: an environment carrying it is no more
+    # reachable from outside than one that leaves it out.
+    egress:
+      unrestricted: false        # true lets the environment reach any destination
 
   # Container runtime customization
   runtime:

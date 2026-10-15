@@ -79,7 +79,9 @@ type DevEnvironmentSpec struct {
 	// +optional
 	SSH *SSHSpec `json:"ssh,omitempty"`
 
-	// Network configures the network.
+	// Network configures the network: RDMA access, and what the environment may
+	// reach on its own behalf. Outbound access is restricted unless the
+	// environment asks otherwise (spec.network.egress).
 	// +optional
 	Network *NetworkSpec `json:"network,omitempty"`
 
@@ -257,6 +259,10 @@ type SSHSpec struct {
 // the environment, and what else it takes, is the platform's to arrange — it
 // is deliberately not part of this API, so the arrangement can change without
 // the environment changing with it.
+//
+// Egress is what the environment may reach on its own behalf, and is
+// restricted to the cluster's own plumbing until the environment says
+// otherwise (spec.network.egress).
 type NetworkSpec struct {
 	// RDMAEnabled gives the environment access to an RDMA device on the node it
 	// runs on.
@@ -283,6 +289,10 @@ type NetworkSpec struct {
 	// +kubebuilder:default=roce
 	// +optional
 	RDMAType RDMAType `json:"rdmaType,omitempty"`
+
+	// Egress configures the environment's outbound access.
+	// +optional
+	Egress *EgressSpec `json:"egress,omitempty"`
 }
 
 // RDMAType is the RDMA network type.
@@ -292,6 +302,28 @@ const (
 	RDMATypeInfiniBand RDMAType = "infiniband"
 	RDMATypeRoCE       RDMAType = "roce"
 )
+
+// EgressSpec configures the environment's outbound access.
+type EgressSpec struct {
+	// Unrestricted lifts the restriction on what the environment may reach: it
+	// may open a connection to any destination, rather than being able to
+	// resolve names and reach nothing.
+	//
+	// An environment is restricted by default, and one that serves a notebook
+	// off its own image never notices. One that installs a package or downloads
+	// a dataset does — and the failure does not land where the request was made.
+	// An install that cannot reach its index does not raise, so the environment
+	// goes on to fail later on a missing import instead, and the network is the
+	// last thing suspected. This field is how an environment that expects to
+	// reach outside the cluster says so.
+	//
+	// It is a property of one environment and not of a namespace: setting it
+	// says nothing about the environments that did not, and an environment that
+	// carries it is no more reachable from outside than one that does not.
+	// +kubebuilder:default=false
+	// +optional
+	Unrestricted bool `json:"unrestricted,omitempty"`
+}
 
 // RuntimeSpec customizes the container runtime.
 type RuntimeSpec struct {
