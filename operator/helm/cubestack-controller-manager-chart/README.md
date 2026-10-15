@@ -220,6 +220,36 @@ helm install cubestack ./helm/cubestack-controller-manager-chart -n cubestack-sy
   --create-namespace --set image.pullPolicy=Always
 ```
 
+### Upgrading an existing release
+
+Helm installs the CRDs in this chart's `crds/` directory once, on `helm install`,
+and never manages them again: `helm upgrade` neither updates nor deletes them,
+and `helm uninstall` leaves them behind (see Uninstall). A release upgraded to a
+chart whose CRDs carry new fields therefore keeps the schema it was installed
+with, and the API server **prunes** a field the stored schema does not know — the
+write succeeds, the field is gone, and the manager reads it as unset. Nothing
+reports a difference between what the release believes it installed and what the
+cluster holds.
+
+That is true of every field added since the release was installed, not only of
+the ones a given version adds. Apply the CRDs before upgrading:
+
+```bash
+make -C operator helm-crds-sync
+kubectl apply --server-side -f helm/cubestack-controller-manager-chart/crds/
+helm upgrade cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system
+```
+
+Without a checkout, `helm show crds` reads the same files out of a published
+chart:
+
+```bash
+helm show crds oci://harbor.isuanova.com/suanova/cubestack-controller-manager-chart \
+  --version 1.0.0 | kubectl apply --server-side -f -
+helm upgrade cubestack oci://harbor.isuanova.com/suanova/cubestack-controller-manager-chart \
+  --version 1.0.0 -n cubestack-system
+```
+
 ### Upgrading from a chart that created the Gateway
 
 **Upgrading a release installed from a chart that still shipped the Gateway
