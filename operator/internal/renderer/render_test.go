@@ -1,6 +1,9 @@
 package renderer
 
 import (
+	"maps"
+	"strconv"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -12,8 +15,14 @@ import (
 )
 
 const (
-	overridePrefillReplicas = "prefillReplicas"
-	bootstrapAsset          = "bootstrap"
+	overridePrefillReplicas  = "prefillReplicas"
+	overrideReplicaPlacement = "replicaPlacement"
+	overrideNodeSelector     = "nodeSelector"
+	bootstrapAsset           = "bootstrap"
+	// nodePoolLabel and nodePoolValue are the node-pool label pair the
+	// nodeSelector table entries pin a service to.
+	nodePoolLabel = "node-pool"
+	nodePoolValue = "inference"
 	// assetDataKey is the single asset data key of the render specs.
 	assetDataKey = "key"
 	// assetDataValue is the single asset data value of the render specs.
@@ -46,7 +55,15 @@ func renderProfile() *aiv1alpha1.InferenceRuntimeProfile {
 			Overrides: []aiv1alpha1.Override{
 				{Name: overridePrefillReplicas, Type: aiv1alpha1.OverrideTypeInteger, Default: &apiextensionsv1.JSON{Raw: []byte("1")}},
 				{Name: overrideMode, Type: aiv1alpha1.OverrideTypeString, Default: &apiextensionsv1.JSON{Raw: []byte(`"pd"`)}},
+				{Name: overrideReplicaPlacement, Type: aiv1alpha1.OverrideTypeString, Default: &apiextensionsv1.JSON{Raw: []byte(`"preferred"`)}},
+				{Name: overrideNodeSelector, Type: aiv1alpha1.OverrideTypeString, Default: &apiextensionsv1.JSON{Raw: []byte(`""`)}},
 			},
+			// The templated declaration the shipped bundles use, so the fixture
+			// exercises a policy that comes from an override rather than a literal.
+			PodAntiAffinity: &aiv1alpha1.PodAntiAffinity{Policy: "{{ overrides.replicaPlacement }}", TopologyKey: "kubernetes.io/hostname"},
+			// Likewise the shipped nodeSelector declaration, whose empty default
+			// adds no selector to any role.
+			NodeSelector: "{{ overrides.nodeSelector }}",
 			Roles: []aiv1alpha1.Role{
 				{
 					Name:     "router",
@@ -100,7 +117,8 @@ var _ = Describe("Render", func() {
 	It("renders all variable namespaces and resolves workload structure", func() {
 		res := Render(renderISVC(), renderProfile(), renderModel(), map[string]map[string]string{bootstrapAsset: {assetDataKey: assetDataValue}})
 		Expect(res.Errors).To(BeEmpty())
-		Expect(res.Overrides).To(Equal(map[string]string{overridePrefillReplicas: "3", overrideMode: "pd"}))
+		Expect(res.Overrides).To(Equal(map[string]string{overridePrefillReplicas: "3", overrideMode: "pd", overrideReplicaPlacement: "preferred", overrideNodeSelector: ""}))
+		Expect(res.PodAntiAffinityPolicy).To(Equal("preferred"), "the profile default resolves through the templated declaration")
 
 		Expect(res.Roles).To(HaveLen(2))
 		router := res.Roles[0]
@@ -287,6 +305,136 @@ var _ = Describe("Render", func() {
 		res := Render(renderISVC(), p, renderModel(), nil)
 		Expect(res.Errors).To(BeEmpty())
 		Expect(res.Roles[0].Replicas).To(Equal(int64(1)))
+	})
+
+	// userPlacement sets the user's value for the replicaPlacement override.
+	userPlacement := func(v string) func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService) {
+		return func(_ *aiv1alpha1.InferenceRuntimeProfile, isvc *aiv1alpha1.InferenceService) {
+			isvc.Spec.Overrides[overrideReplicaPlacement] = apiextensionsv1.JSON{Raw: []byte(strconv.Quote(v))}
+		}
+	}
+	// dropUserPlacement unsets it, so the profile's default applies.
+	dropUserPlacement := func(_ *aiv1alpha1.InferenceRuntimeProfile, isvc *aiv1alpha1.InferenceService) {
+		delete(isvc.Spec.Overrides, overrideReplicaPlacement)
+	}
+	// policyTemplate writes a raw policy template in place of the fixture's.
+	policyTemplate := func(tmpl string) func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService) {
+		return func(p *aiv1alpha1.InferenceRuntimeProfile, _ *aiv1alpha1.InferenceService) {
+			p.Spec.PodAntiAffinity.Policy = aiv1alpha1.PodAntiAffinityPolicy(tmpl)
+		}
+	}
+
+	// noError is the wantReason of the entries that render without an error.
+	noError := ErrorReason("")
+
+	DescribeTable("resolves the podAntiAffinity policy",
+		func(mutate func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService), wantPolicy string, wantReason ErrorReason) {
+			p := renderProfile()
+			isvc := renderISVC()
+			mutate(p, isvc)
+			res := Render(isvc, p, renderModel(), nil)
+			if wantReason == noError {
+				Expect(res.Errors).To(BeEmpty())
+				Expect(res.PodAntiAffinityPolicy).To(Equal(wantPolicy))
+				return
+			}
+			Expect(res.Errors).To(HaveLen(1))
+			Expect(res.Errors[0].Reason).To(Equal(wantReason))
+			Expect(res.PodAntiAffinityPolicy).To(BeEmpty(), "a policy that does not resolve is no policy, never a half-resolved one")
+		},
+		Entry("the user's value wins over the default", userPlacement("preferred"), "preferred", noError),
+		Entry("required", userPlacement("required"), "required", noError),
+		Entry("none", userPlacement("none"), "none", noError),
+		Entry("the profile default applies when the user sets nothing", dropUserPlacement, "preferred", noError),
+		Entry("an undeclared policy is required, as it was before the field existed", policyTemplate(""), "required", noError),
+		Entry("a literal policy needs no override", policyTemplate("preferred"), "preferred", noError),
+		Entry("surrounding whitespace is tolerated", policyTemplate("required\n"), "required", noError),
+		Entry("a token outside the three policies is rejected", policyTemplate("{{ overrides.mode }}"), "", ReasonInvalidOverride),
+		Entry("an undeclared override is rejected", policyTemplate("{{ overrides.undeclared }}"), "", ReasonUnknownPlaceholder),
+		Entry("a namespace outside overrides is rejected", policyTemplate("{{ service.name }}"), "", ReasonPhaseViolation),
+	)
+
+	It("reports no policy when the profile declares no podAntiAffinity", func() {
+		p := renderProfile()
+		p.Spec.PodAntiAffinity = nil
+		res := Render(renderISVC(), p, renderModel(), nil)
+		Expect(res.Errors).To(BeEmpty())
+		Expect(res.PodAntiAffinityPolicy).To(BeEmpty(), "the controller injects only what the profile declares")
+	})
+
+	// userNodeSelector sets the user's value for the nodeSelector override.
+	userNodeSelector := func(v string) func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService) {
+		return func(_ *aiv1alpha1.InferenceRuntimeProfile, isvc *aiv1alpha1.InferenceService) {
+			isvc.Spec.Overrides[overrideNodeSelector] = apiextensionsv1.JSON{Raw: []byte(strconv.Quote(v))}
+		}
+	}
+	// dropUserNodeSelector unsets it, so the profile's empty default applies.
+	dropUserNodeSelector := func(_ *aiv1alpha1.InferenceRuntimeProfile, isvc *aiv1alpha1.InferenceService) {
+		delete(isvc.Spec.Overrides, overrideNodeSelector)
+	}
+	// nodeSelectorTemplate writes a raw template in place of the fixture's.
+	nodeSelectorTemplate := func(tmpl string) func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService) {
+		return func(p *aiv1alpha1.InferenceRuntimeProfile, _ *aiv1alpha1.InferenceService) {
+			p.Spec.NodeSelector = tmpl
+		}
+	}
+
+	// The GPU role carries the model pin as well, so each entry states the two
+	// selectors apart: what the pair adds, and what the accelerator declaration
+	// adds on top of it.
+	DescribeTable("merges the service-level node selector",
+		func(mutate func(*aiv1alpha1.InferenceRuntimeProfile, *aiv1alpha1.InferenceService), want map[string]string, wantReason ErrorReason) {
+			p := renderProfile()
+			isvc := renderISVC()
+			gpuPrefill(p)
+			p.Spec.Accelerator = aiv1alpha1.Accelerator{Vendor: aiv1alpha1.AcceleratorVendorMetax, Models: []string{metaxModelC500}}
+			mutate(p, isvc)
+			res := Render(isvc, p, renderModel(), nil)
+			if wantReason != noError {
+				Expect(res.Errors).To(HaveLen(1))
+				Expect(res.Errors[0].Reason).To(Equal(wantReason))
+				return
+			}
+			Expect(res.Errors).To(BeEmpty())
+			router := map[string]string{}
+			maps.Copy(router, want)
+			gpu := map[string]string{metaxProductLabel: metaxModelC500}
+			maps.Copy(gpu, want)
+			// One selector covers the service: the CPU-only router is pinned to
+			// the same nodes as the GPU roles.
+			Expect(res.Roles[0].PodTemplate.NodeSelector).To(Equal(router))
+			Expect(res.Roles[1].PodTemplate.NodeSelector).To(Equal(gpu))
+		},
+		Entry("the user's pair reaches every role", userNodeSelector("node-pool=inference"), map[string]string{nodePoolLabel: nodePoolValue}, noError),
+		Entry("the empty default adds no selector", dropUserNodeSelector, nil, noError),
+		Entry("an empty user value adds no selector", userNodeSelector(""), nil, noError),
+		Entry("surrounding whitespace is tolerated", userNodeSelector(" node-pool=inference "), map[string]string{nodePoolLabel: nodePoolValue}, noError),
+		Entry("a literal pair needs no override", nodeSelectorTemplate("node-pool=inference"), map[string]string{nodePoolLabel: nodePoolValue}, noError),
+		Entry("a pair repeating the model pin is consistent", userNodeSelector(metaxProductLabel+"="+metaxModelC500), map[string]string{metaxProductLabel: metaxModelC500}, noError),
+		Entry("an empty literal adds no selector", nodeSelectorTemplate(""), nil, noError),
+		Entry("a key without a value is rejected", userNodeSelector("node-pool"), nil, ReasonInvalidOverride),
+		Entry("a missing value is rejected", userNodeSelector("node-pool="), nil, ReasonInvalidOverride),
+		Entry("a missing key is rejected", userNodeSelector("=inference"), nil, ReasonInvalidOverride),
+		Entry("a value that is not a label value is rejected", userNodeSelector("node-pool=in ference"), nil, ReasonInvalidOverride),
+		Entry("a key that is not a label key is rejected", userNodeSelector("node pool=inference"), nil, ReasonInvalidOverride),
+		Entry("two pairs are one label value that no node carries", userNodeSelector("node-pool=inference,gpu"), nil, ReasonInvalidOverride),
+		Entry("a template resolving to a bare key is rejected", nodeSelectorTemplate("{{ overrides.mode }}"), nil, ReasonInvalidOverride),
+		Entry("a namespace outside overrides is rejected", nodeSelectorTemplate("{{ service.name }}"), nil, ReasonPhaseViolation),
+		Entry("an undeclared override is rejected", nodeSelectorTemplate("{{ overrides.undeclared }}"), nil, ReasonUnknownPlaceholder),
+		Entry("a pair contradicting the declared model is reported", userNodeSelector(metaxProductLabel+"="+metaxModelC550), nil, ReasonModelSchedulingConflict),
+	)
+
+	It("merges no selector when the profile declares no nodeSelector", func() {
+		p := renderProfile()
+		gpuPrefill(p)
+		p.Spec.Accelerator = aiv1alpha1.Accelerator{Vendor: aiv1alpha1.AcceleratorVendorMetax, Models: []string{metaxModelC500}}
+		p.Spec.NodeSelector = ""
+		isvc := renderISVC()
+		isvc.Spec.Overrides[overrideNodeSelector] = apiextensionsv1.JSON{Raw: []byte(`"node-pool=inference"`)}
+		res := Render(isvc, p, renderModel(), nil)
+		Expect(res.Errors).To(BeEmpty())
+		Expect(res.Roles[0].PodTemplate.NodeSelector).To(BeEmpty(), "a profile that declares no nodeSelector merges nothing, whatever the user sets")
+		Expect(res.Roles[1].PodTemplate.NodeSelector).To(Equal(map[string]string{metaxProductLabel: metaxModelC500}))
 	})
 
 	It("fails with UnknownPlaceholder for unknown variables", func() {
