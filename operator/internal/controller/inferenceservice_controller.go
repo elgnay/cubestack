@@ -25,7 +25,9 @@ limitations under the License.
 // +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=aigateway.envoyproxy.io,resources=aigatewayroutes;aiservicebackends,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=aigateway.envoyproxy.io,resources=aigatewayroutes,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=aigateway.envoyproxy.io,resources=aiservicebackends,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=referencegrants,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=gateway.envoyproxy.io,resources=backends,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;list;watch;create;update;patch;delete
 
@@ -57,6 +59,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	gatewayv1 "sigs.k8s.io/gateway-api/apis/v1"
 	leaderworkersetv1 "sigs.k8s.io/lws/api/leaderworkerset/v1"
 
 	aiv1alpha1 "github.com/suanova/cubestack/api/v1alpha1"
@@ -76,8 +79,14 @@ type InferenceServiceReconciler struct {
 	// catalog entry of a published service attaches to (spec.parentRefs).
 	GatewayName      string
 	GatewayNamespace string
-	// CatalogHostname is the shared model-catalog entry hostname every
-	// published service attaches to (design §3.3).
+	// CatalogRoute is the name of the platform's pre-installed shared
+	// AIGatewayRoute (in GatewayNamespace) that published services attach a
+	// rule to. The operator never creates it; a missing one degrades to
+	// CatalogRouteNotFound (design §3.3).
+	CatalogRoute string
+	// CatalogHostname, when set, is surfaced in status.endpoint.public so the
+	// Agent Router can advertise the shared catalog's host. It is a display
+	// value only — it no longer gates publishing.
 	CatalogHostname string
 	// AgentRouterAvailable reports whether the cluster serves the Agent
 	// Router CRDs. Probed once at startup (AgentRouterAvailable below).
@@ -142,6 +151,18 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 		return ctrl.Result{}, err
 	}
 
+	// A service being deleted sheds its rule from the platform's shared catalog
+	// route (and the finalizer that guards that removal) before it goes; a
+	// published service that is not being deleted makes sure it carries that
+	// finalizer. The rule lives in another namespace and is not owned by the
+	// service, so the finalizer is what lets the service wait for its removal.
+	if isvc.DeletionTimestamp != nil {
+		return ctrl.Result{}, r.finalizeCatalogRule(ctx, req, &isvc)
+	}
+	if err := r.ensureCatalogFinalizer(ctx, &isvc); err != nil {
+		return ctrl.Result{}, err
+	}
+
 	resolved, err := r.resolve(ctx, &isvc)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -157,25 +178,8 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	desired.Status.Roles = nil
 	desired.Status.Endpoint = nil
 	setResolvedCondition(&desired.Status.Conditions, resolved)
-	if resolved.profile != nil {
-		desired.Status.Profile = &aiv1alpha1.ProfileStatus{Name: resolved.profile.Name}
-		// Keep the last adopted revision of the same profile: ProfileDrifted
-		// compares the current hash against it while changed profile content is
-		// not yet adopted. A different profile has no baseline revision.
-		if isvc.Status.Profile != nil && isvc.Status.Profile.Name == resolved.profile.Name {
-			desired.Status.Profile.Revision = isvc.Status.Profile.Revision
-		}
-	} else if isvc.Status.Profile != nil && isvc.Status.Profile.Name != isvc.Spec.ProfileRef {
-		// A switched reference must not linger, but a same-name reference
-		// keeps its echo — including the adopted revision, the drift baseline
-		// that must survive the profile's deletion and recreation.
-		desired.Status.Profile = nil
-	}
-	if resolved.model != nil {
-		desired.Status.Model = &aiv1alpha1.ModelStatus{Name: resolved.model.Spec.Model, Version: resolved.model.Spec.Version}
-	} else {
-		desired.Status.Model = nil
-	}
+	setProfileEcho(desired, &isvc, resolved.profile)
+	setModelEcho(desired, resolved.model)
 
 	if !resolved.resolved() {
 		// A stale Rendered from a previous spec must not persist, and the
@@ -315,6 +319,84 @@ func (r *InferenceServiceReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{}, r.updateStatusIfChanged(ctx, &isvc, desired)
 }
 
+// finalizeCatalogRule removes the catalog finalizer from a service that is
+// being deleted, after shedding its rule from the platform's shared catalog
+// route. The rule lives in another namespace and is not owned by the service,
+// so it is removed explicitly here; the other catalog objects cascade through
+// their ownerRef. The guard is on the finalizer's presence, not on spec.route —
+// a service that was published and later had publish flipped off still carries
+// a rule to remove, and the finalizer is only ever added while the service is
+// being reconciled as published. A service without the finalizer has nothing to
+// shed, so deletion proceeds immediately.
+func (r *InferenceServiceReconciler) finalizeCatalogRule(ctx context.Context, req ctrl.Request, isvc *aiv1alpha1.InferenceService) error {
+	if !slices.Contains(isvc.Finalizers, inferenceServiceCatalogFinalizer) {
+		return nil
+	}
+	if err := r.removeCatalogRule(ctx, isvc); err != nil {
+		return err
+	}
+	// Re-fetch for a fresh resourceVersion before mutating finalizers: any
+	// status write during the delete reconcile bumped it, so a stale Update
+	// would 409-conflict and force a retry reconcile.
+	fresh := &aiv1alpha1.InferenceService{}
+	if err := r.Get(ctx, req.NamespacedName, fresh); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	fresh.Finalizers = slices.DeleteFunc(fresh.Finalizers, func(f string) bool {
+		return f == inferenceServiceCatalogFinalizer
+	})
+	return r.Update(ctx, fresh)
+}
+
+// ensureCatalogFinalizer adds the catalog finalizer to a published service that
+// does not already carry it, so its rule survives the service's deletion until
+// it is shed. A service that is not published — or already carries the
+// finalizer — is left untouched: the finalizer is added only for the
+// publish=true state, and a missing one means nothing needs guarding.
+func (r *InferenceServiceReconciler) ensureCatalogFinalizer(ctx context.Context, isvc *aiv1alpha1.InferenceService) error {
+	if slices.Contains(isvc.Finalizers, inferenceServiceCatalogFinalizer) || isvc.Spec.Route == nil || !isvc.Spec.Route.Publish {
+		return nil
+	}
+	// Patch, not Update: the finalizer is the only field this call means to
+	// change. The patch carries the resourceVersion we read (optimistic lock)
+	// because a merge patch spells out the whole finalizers list as we saw it:
+	// without the lock, a finalizer another controller adds after our read
+	// would be silently dropped by this write. With it, such a write 409s and
+	// this reconcile retries against a fresh read.
+	patch := client.MergeFromWithOptions(isvc.DeepCopy(), client.MergeFromWithOptimisticLock{})
+	isvc.Finalizers = append(isvc.Finalizers, inferenceServiceCatalogFinalizer)
+	return r.Patch(ctx, isvc, patch)
+}
+
+// setProfileEcho fills the profile status echo from the resolved profile. A
+// resolved profile sets the echo, keeping the last adopted revision of the
+// same profile: ProfileDrifted compares the current hash against it while
+// changed profile content is not yet adopted, and a different profile has no
+// baseline revision. With no resolved profile a switched reference is cleared,
+// while a same-name reference keeps its echo — including the adopted revision,
+// the drift baseline that must survive the profile's deletion and recreation.
+func setProfileEcho(desired, isvc *aiv1alpha1.InferenceService, profile *aiv1alpha1.InferenceRuntimeProfile) {
+	if profile != nil {
+		desired.Status.Profile = &aiv1alpha1.ProfileStatus{Name: profile.Name}
+		if isvc.Status.Profile != nil && isvc.Status.Profile.Name == profile.Name {
+			desired.Status.Profile.Revision = isvc.Status.Profile.Revision
+		}
+		return
+	}
+	if isvc.Status.Profile != nil && isvc.Status.Profile.Name != isvc.Spec.ProfileRef {
+		desired.Status.Profile = nil
+	}
+}
+
+// setModelEcho fills the model status echo from the resolved model version.
+func setModelEcho(desired *aiv1alpha1.InferenceService, model *aiv1alpha1.ModelVersion) {
+	if model != nil {
+		desired.Status.Model = &aiv1alpha1.ModelStatus{Name: model.Spec.Model, Version: model.Spec.Version}
+		return
+	}
+	desired.Status.Model = nil
+}
+
 // updateStatusIfChanged writes the desired status only when it differs from
 // the observed one.
 func (r *InferenceServiceReconciler) updateStatusIfChanged(ctx context.Context, isvc *aiv1alpha1.InferenceService, desired *aiv1alpha1.InferenceService) error {
@@ -348,11 +430,11 @@ func (r *InferenceServiceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// Same rule as above for the Agent Router catalog objects: with the
 		// CRDs served, their status writes (and external edits or deletions)
 		// must re-run the acceptance check of the owning service.
-		b = b.Owns(&aigwv1beta1.AIGatewayRoute{}).
+		b = b.Owns(&gatewayv1.ReferenceGrant{}).
 			Owns(&aigwv1beta1.AIServiceBackend{}).
 			Owns(&egv1alpha1.Backend{}).
 			Watches(&aigwv1beta1.AIGatewayRoute{},
-				handler.EnqueueRequestsFromMapFunc(r.enqueueForOwnedCatalogObject)).
+				handler.EnqueueRequestsFromMapFunc(r.enqueueForSharedCatalogRoute)).
 			Watches(&aigwv1beta1.AIServiceBackend{},
 				handler.EnqueueRequestsFromMapFunc(r.enqueueForOwnedCatalogObject)).
 			Watches(&egv1alpha1.Backend{},
@@ -395,6 +477,29 @@ func (r *InferenceServiceReconciler) enqueueForOwnedCatalogObject(_ context.Cont
 		return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: obj.GetNamespace(), Name: owner.Name}}}
 	}
 	return nil
+}
+
+// enqueueForSharedCatalogRoute maps a change to the platform's shared catalog
+// route to every published service, whose rule lives in that route and must be
+// re-reconciled when the route is edited or its acceptance changes. Only the
+// single route named by CatalogRoute in GatewayNamespace is meaningful; any
+// other AIGatewayRoute is left to the owning controller (the per-service
+// routes the previous design created are gone, but the CRD still allows
+// arbitrary routes in the cluster).
+func (r *InferenceServiceReconciler) enqueueForSharedCatalogRoute(ctx context.Context, obj client.Object) []reconcile.Request {
+	route := obj.(*aigwv1beta1.AIGatewayRoute)
+	if route.Name != r.CatalogRoute || route.Namespace != r.GatewayNamespace {
+		return nil
+	}
+	var reqs []reconcile.Request
+	var list aiv1alpha1.InferenceServiceList
+	if err := r.List(ctx, &list, client.MatchingFields{publishIndexKey: publishIndexValue}); err != nil {
+		return nil
+	}
+	for i := range list.Items {
+		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{Namespace: list.Items[i].Namespace, Name: list.Items[i].Name}})
+	}
+	return reqs
 }
 
 // enqueueForSourceConfigMap maps a ConfigMap in cubestack-system to the
