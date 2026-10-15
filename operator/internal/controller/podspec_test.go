@@ -76,7 +76,7 @@ var _ = Describe("buildPodSpec", func() {
 			Resources: &aiv1alpha1.PodResources{
 				CPU:       ptrTo(resource.MustParse("8")),
 				Memory:    ptrTo(resource.MustParse("64Gi")),
-				GPUPerPod: ptrTo[int64](2),
+				GPUPerPod: ptrTo(intstr.FromInt32(2)),
 			},
 		}
 		spec := buildPodSpec(pt, "svc", modelHostPath(), aiv1alpha1.AcceleratorVendorMetax)
@@ -90,7 +90,7 @@ var _ = Describe("buildPodSpec", func() {
 	It("maps nvidia vendor to nvidia.com/gpu", func() {
 		pt := aiv1alpha1.PodTemplate{
 			Image:     testEngineImage,
-			Resources: &aiv1alpha1.PodResources{GPUPerPod: ptrTo[int64](1)},
+			Resources: &aiv1alpha1.PodResources{GPUPerPod: ptrTo(intstr.FromInt32(1))},
 		}
 		spec := buildPodSpec(pt, "svc", modelHostPath(), aiv1alpha1.AcceleratorVendorNvidia)
 		c := spec.Containers[0]
@@ -162,7 +162,7 @@ var _ = Describe("buildPodSpec", func() {
 			},
 		}}
 		isvc := &aiv1alpha1.InferenceService{ObjectMeta: metav1.ObjectMeta{Name: testISVCName, Namespace: testNamespace}}
-		gpu := int64(2)
+		gpu := intstr.FromInt32(2)
 		rrFor := func(name string) *renderer.RenderedRole {
 			return &renderer.RenderedRole{Name: name, Replicas: 1, PodTemplate: aiv1alpha1.PodTemplate{
 				Image:     testEngineImage,
@@ -230,7 +230,7 @@ var _ = Describe("buildPodSpec", func() {
 		pt := aiv1alpha1.PodTemplate{
 			Image: testEngineImage,
 			Resources: &aiv1alpha1.PodResources{
-				GPUPerPod:         ptrTo[int64](2),
+				GPUPerPod:         ptrTo(intstr.FromInt32(2)),
 				ExtendedResources: map[string]int64{"rdma/ib_shared_devices": 2},
 			},
 		}
