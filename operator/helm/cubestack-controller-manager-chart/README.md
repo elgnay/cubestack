@@ -236,8 +236,8 @@ the ones a given version adds. Apply the CRDs before upgrading:
 
 ```bash
 make -C operator helm-crds-sync
-kubectl apply --server-side -f helm/cubestack-controller-manager-chart/crds/
-helm upgrade cubestack ./helm/cubestack-controller-manager-chart -n cubestack-system
+kubectl apply --server-side -f operator/helm/cubestack-controller-manager-chart/crds/
+helm upgrade cubestack ./operator/helm/cubestack-controller-manager-chart -n cubestack-system
 ```
 
 Without a checkout, `helm show crds` reads the same files out of a published
