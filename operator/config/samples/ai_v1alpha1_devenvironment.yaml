@@ -28,6 +28,36 @@ spec:
     cpu: "16"
     memory: "64Gi"
 
+  # Placement. A nodeSelector picks the nodes this environment may run on, by
+  # label — a node pool, a zone, a particular machine. Left out, the environment
+  # is placed wherever its resources allow.
+  #
+  # It is one input to placement and not the whole of it. The accelerator the
+  # environment asks for already decides which nodes can run it, so a label here
+  # that disagrees with the gpu.model above loses to that field: the model is
+  # what also names the accelerator the environment requests, and a label
+  # cannot. The disagreement is reported on the environment's Accepted condition
+  # rather than passed over in silence, so set the model there rather than here.
+  #
+  # A label no node carries is not an error either — the environment stays
+  # Pending, because which nodes a cluster has is not something the spec is
+  # wrong about.
+  nodeSelector:
+    node-pool: gpu-2             # any label the cluster puts on its nodes
+
+  # schedulerName names the scheduler that places this environment's pod, when
+  # something other than the cluster's default should. Omitted, the default
+  # scheduler places it. It decides who picks the node, not which nodes may be
+  # picked: the nodeSelector above and the accelerator the environment asks for
+  # travel on the pod either way, and a scheduler that ignores them places the
+  # environment where the spec did not ask for it to be.
+  #
+  # The name has to be one a scheduler answers to. A name nothing answers to is
+  # not an error the environment reports: no scheduler looks at the pod at all,
+  # so it stays Pending with nothing but the PodScheduled condition to say it
+  # was never placed.
+  schedulerName: gpu-scheduler   # any scheduler registered in the cluster
+
   # Workspace storage
   # The workspace always uses the platform-predefined StorageClass
   # (cephfs-ephemeral, ReadWriteMany) so it can follow the pod on drift; it is
@@ -101,6 +131,18 @@ spec:
     # derives their addresses from the host's own networking. An environment is
     # reachable only on the fabric it names.
     rdmaType: roce               # infiniband / roce
+    # Outbound access is restricted by default: an environment resolves names and
+    # reaches nothing, which serves a notebook off its own image and stops an
+    # install or a dataset download at the network. An environment that is meant
+    # to reach outside the cluster says so here. The failure is easy to misread —
+    # an install that cannot reach its index does not raise, and the environment
+    # goes on to fail later on a missing import instead.
+    #
+    # It is a property of this environment, not of its namespace, and it says
+    # nothing about inbound traffic: an environment carrying it is no more
+    # reachable from outside than one that leaves it out.
+    egress:
+      unrestricted: false        # true lets the environment reach any destination
 
   # Container runtime customization
   runtime:

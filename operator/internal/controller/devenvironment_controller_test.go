@@ -982,6 +982,17 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 		env := &aiv1alpha1.DevEnvironment{
 			ObjectMeta: metav1.ObjectMeta{Name: "de-netpol", Namespace: "ns"},
 		}
+		// The same environment with the outbound restriction lifted. It is the
+		// only spec field this renderer reads, so it is the whole of the
+		// difference between the two.
+		asking := &aiv1alpha1.DevEnvironment{
+			ObjectMeta: metav1.ObjectMeta{Name: "de-netpol-open", Namespace: "ns"},
+			Spec: aiv1alpha1.DevEnvironmentSpec{
+				Network: &aiv1alpha1.NetworkSpec{
+					Egress: &aiv1alpha1.EgressSpec{Unrestricted: true},
+				},
+			},
+		}
 
 		It("admits nothing while no dataplane namespace is configured", func() {
 			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(env, nil)
@@ -1014,6 +1025,61 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 			Expect(np.Spec.Egress[0].To).To(BeEmpty())
 			Expect(np.Spec.Egress[0].Ports).To(HaveLen(2))
 			Expect(np.Spec.Egress[1]).To(Equal(agentEgress[0]))
+		})
+
+		It("refuses nothing for an environment that asked to reach out", func() {
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(asking, nil)
+
+			// One rule naming no destination and no port. That is the only shape
+			// "nothing is refused" has: a policy selecting for egress and
+			// carrying no rule at all refuses everything, so an empty rule is not
+			// an omission here but the whole of the allowance.
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0]).To(Equal(networkingv1.NetworkPolicyEgressRule{}))
+			// And the ingress half is untouched: an environment that may reach
+			// out is no more reachable from outside than one that may not, so
+			// neither the empty ingress list nor the policy types move.
+			Expect(np.Spec.Ingress).To(BeEmpty())
+			Expect(np.Spec.PolicyTypes).To(Equal([]networkingv1.PolicyType{
+				networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress,
+			}))
+		})
+
+		It("drops the agent's allowance once there is no restriction to widen", func() {
+			agentEgress := []networkingv1.NetworkPolicyEgressRule{{
+				To: []networkingv1.NetworkPolicyPeer{{
+					IPBlock: &networkingv1.IPBlock{CIDR: "10.96.0.2/32"},
+				}},
+			}}
+
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(asking, agentEgress)
+
+			// Subsumed, not appended: the rule above admits the apiserver already,
+			// and a second rule saying so again would read as the allowance still
+			// being load-bearing.
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0]).To(Equal(networkingv1.NetworkPolicyEgressRule{}))
+		})
+
+		It("leaves an environment that did not ask at the default", func() {
+			// spec.network is set, and says nothing about egress. The opt-out is
+			// the field and not the presence of the section, so RDMA settings
+			// must not be read as reaching for the network.
+			silent := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-netpol-rdma", Namespace: "ns"},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Network: &aiv1alpha1.NetworkSpec{
+						RDMAEnabled: true,
+						RDMAType:    aiv1alpha1.RDMATypeRoCE,
+					},
+				},
+			}
+
+			np := (&DevEnvironmentReconciler{}).desiredNetworkPolicy(silent, nil)
+
+			Expect(np.Spec.Egress).To(HaveLen(1))
+			Expect(np.Spec.Egress[0].To).To(BeEmpty())
+			Expect(np.Spec.Egress[0].Ports).To(HaveLen(2))
 		})
 
 		It("admits the configured Gateway's dataplane", func() {
@@ -1401,6 +1467,48 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 		})
 	})
 
+	// applyStatefulSet reads a matching digest as "nothing to do", so what this
+	// input omits is as load-bearing as what it carries: a template field that
+	// serializes even when the environment did not set it rolls every workload in
+	// the cluster the first time the new manager reconciles one.
+	Describe("stsSpecHash", func() {
+		hash := func(mut func(*aiv1alpha1.DevEnvironment)) string {
+			env := &aiv1alpha1.DevEnvironment{
+				ObjectMeta: metav1.ObjectMeta{Name: "de-hash", Namespace: testNamespace},
+				Spec: aiv1alpha1.DevEnvironmentSpec{
+					Type: aiv1alpha1.DevEnvironmentTypeVSCode, Image: testDevImage,
+				},
+			}
+			if mut != nil {
+				mut(env)
+			}
+			return (&DevEnvironmentReconciler{}).stsSpecHash(env)
+		}
+
+		// An environment that names no placement is the case with the most
+		// environments behind it, and the empty map is the shape to pin: a user may
+		// write `nodeSelector: {}`, and a map without omitempty would serialize as
+		// null for every one of them.
+		It("digests a placement the environment did not name as absent", func() {
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = map[string]string{}
+				env.Spec.SchedulerName = ""
+			})).To(Equal(hash(nil)))
+		})
+
+		// The digest is what makes an edit reach a running workload at all, so the
+		// two fields have to move it in both directions.
+		It("digests a named selector, and a named scheduler, as changes", func() {
+			plain := hash(nil)
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = map[string]string{testNodePoolLabel: testNodePoolValue}
+			})).NotTo(Equal(plain))
+			Expect(hash(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.SchedulerName = testSchedulerName
+			})).NotTo(Equal(plain))
+		})
+	})
+
 	Describe("rdmaResource", func() {
 		envWith := func(network *aiv1alpha1.NetworkSpec) *aiv1alpha1.DevEnvironment {
 			return &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{Network: network}}
@@ -1580,6 +1688,18 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
 			return env
 		}
+		// A GPU model the environment names, and a node label that contradicts it
+		// — the one case where the two sources of node selection disagree.
+		contradicting := func() *aiv1alpha1.DevEnvironment {
+			env := newJupyter()
+			env.Spec.Image = testMetaxImage
+			env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+				Vendor: aiv1alpha1.AcceleratorVendorMetax,
+				Model:  testGPUModelMXC550,
+			}
+			env.Spec.NodeSelector = map[string]string{testProductLabelMetax: testGPUModelMXC500}
+			return env
+		}
 
 		// Each entry states the disposition it expects, not just that something was
 		// reported: the whole point of the condition is which of the two a value
@@ -1661,6 +1781,14 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					"spec.resources.gpu.vendor: must be updated — ",
 					"spec.runtime.env[NB_UID]: ignored — ",
 				}),
+			// A node label and the model pin write the same kind of value to one
+			// key, so where they disagree the model is what the pod is given and
+			// the label goes unused (::nodeSelectorFindings). Unlike the exposure
+			// above this is resolved rather than refused: the environment runs,
+			// and the field that decides it is one the user can edit.
+			Entry("a node label the model pin overwrites is ignored",
+				contradicting(), 0,
+				[]string{"spec.nodeSelector[" + testProductLabelMetax + "]: ignored — "}),
 		)
 
 		// The fold that is not lossless, and so is not a resolved value: the ssh
@@ -2124,10 +2252,15 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			}))
 		})
 
-		// The model is the pod spec's only node selection, and it is set outright
-		// rather than merged. It is also the reason the image is the vendor's own:
-		// a metax model on a cuda image is a pair the pre-apply gate refuses, and
-		// this spec renders the pod the platform would actually create.
+		// A label that is not about the accelerator, which is what a selector is
+		// usually for.
+		pool := map[string]string{testNodePoolLabel: testNodePoolValue}
+
+		// The model is one of the pod spec's two sources of node selection, and
+		// the one that outranks the other (::desiredNodeSelector). It is also the
+		// reason the image is the vendor's own: a metax model on a cuda image is a
+		// pair the pre-apply gate refuses, and this spec renders the pod the
+		// platform would actually create.
 		It("pins the pod to the named model's node", func() {
 			spec := render(func(env *aiv1alpha1.DevEnvironment) {
 				env.Spec.Image = testMetaxImage
@@ -2165,6 +2298,76 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				env.Spec.Image = testMetaxImage
 				env.Spec.Resources.GPU = metaxGPU()
 			}).NodeSelector).To(BeEmpty())
+		})
+
+		// A selector is the pod spec's other source of node selection, and the
+		// labels the user wrote are what reach the pod.
+		It("carries the node labels the environment asked for", func() {
+			Expect(render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.NodeSelector = pool
+			}).NodeSelector).To(Equal(pool))
+		})
+
+		// Each source reaches the pod on its own keys: a selector is not a
+		// replacement for the model pin, and the model pin is not a replacement
+		// for a selector.
+		It("merges the labels the environment asked for with the model pin", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Image = testMetaxImage
+				env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+					Vendor: aiv1alpha1.AcceleratorVendorMetax,
+					Model:  testGPUModelMXC550,
+				}
+				env.Spec.NodeSelector = pool
+			})
+			Expect(spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelMetax: testGPUModelMXC550,
+				testNodePoolLabel:     testNodePoolValue,
+			}))
+		})
+
+		// nodeSelector is a flat map with no merge semantics, so where the two
+		// sources write one key only one of them can be honoured. The model is:
+		// it is derived from the field that also picks the accelerator the pod
+		// requests, so a label allowed to displace it would pin the pod to a card
+		// the spec rejected while the device request named the other one. The
+		// remainder of the user's labels are untouched, and the disagreement is
+		// reported rather than dropped in silence (::nodeSelectorFindings).
+		It("keeps the model pin when the labels the environment asked for contradict it", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Image = testMetaxImage
+				env.Spec.Resources.GPU = &aiv1alpha1.GPUSpec{
+					Vendor: aiv1alpha1.AcceleratorVendorMetax,
+					Model:  testGPUModelMXC550,
+				}
+				env.Spec.NodeSelector = map[string]string{
+					testProductLabelMetax: testGPUModelMXC500,
+					testNodePoolLabel:     testNodePoolValue,
+				}
+			})
+			Expect(spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelMetax: testGPUModelMXC550,
+				testNodePoolLabel:     testNodePoolValue,
+			}))
+		})
+
+		// Naming a scheduler offers the pod to that one instead of whichever the
+		// cluster runs by default. It decides who picks the node, not which nodes
+		// may be picked: the selection above still travels on the pod.
+		It("offers the pod to the scheduler the environment names", func() {
+			spec := render(func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.SchedulerName = testSchedulerName
+				env.Spec.NodeSelector = pool
+			})
+			Expect(spec.SchedulerName).To(Equal(testSchedulerName))
+			Expect(spec.NodeSelector).To(Equal(pool))
+		})
+
+		// An environment that names none leaves the field unset rather than
+		// writing the default scheduler's own name, so the pod spec is exactly
+		// what it was before the field existed.
+		It("leaves the scheduler unset when the environment names none", func() {
+			Expect(render(nil).SchedulerName).To(BeEmpty())
 		})
 
 		// The model narrows where the pod runs and nothing else: the extended
@@ -3481,6 +3684,69 @@ var _ = Describe("DevEnvironment controller", func() {
 			}, "15s", "200ms").Should(Succeed())
 		})
 
+		// The labels the environment asked for are a template field the hash has
+		// to cover for the same reason the model pin is: the pin rides into the
+		// hash through spec.resources, and a selector written by hand rides into
+		// nothing else. Left out, applying one to a running environment would
+		// digest the same, applyStatefulSet would skip the update, and the pod
+		// would go on being placed by a template the spec no longer states.
+		It("rolls the StatefulSet when the environment's node labels change", func() {
+			env := validDevEnvironment("de-node-selector-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.NodeSelector = map[string]string{testNodePoolLabel: testNodePoolValue}
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.NodeSelector).To(Equal(
+					map[string]string{testNodePoolLabel: testNodePoolValue}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The scheduler is the same story with one wrinkle of its own: the
+		// environment naming none renders no name, but the stored template reads
+		// "default-scheduler" because the API server defaults the field on the way
+		// in. The live object therefore cannot stand in for the hash entry, and a
+		// renamed scheduler left out of the hash would never reach the pod.
+		It("rolls the StatefulSet when the scheduler is renamed", func() {
+			env := validDevEnvironment("de-scheduler-roll")
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			var before string
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				before = sts.Annotations[stsSpecHashAnnotationKey]
+				g.Expect(before).NotTo(BeEmpty())
+			}, "15s", "200ms").Should(Succeed())
+
+			updateEnvSpec(env.Name, func(e *aiv1alpha1.DevEnvironment) {
+				e.Spec.SchedulerName = testSchedulerName
+			})
+
+			Eventually(func(g Gomega) {
+				sts := &appsv1.StatefulSet{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+				g.Expect(sts.Annotations[stsSpecHashAnnotationKey]).NotTo(Equal(before))
+				g.Expect(sts.Spec.Template.Spec.SchedulerName).To(Equal(testSchedulerName))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
 		// A host-network environment's ports are host ports, so spec.ports
 		// reaches the pod template rather than only the Service. The Service and
 		// the routes are reconciled on their own, which is what makes a stale
@@ -3643,6 +3909,33 @@ var _ = Describe("DevEnvironment controller", func() {
 					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &servicePort}))
 				g.Expect(rule.Ports).To(ContainElement(
 					networkingv1.NetworkPolicyPort{Protocol: &tcp, Port: &apiserverPort}))
+			}, "15s", "200ms").Should(Succeed())
+		})
+
+		// The other half of the pair above: an environment that says it reaches
+		// outside the cluster has to come up with an egress list that refuses
+		// nothing, because the field is worth having only if the policy that
+		// reaches the API server is the one a tenant's install needs. This is the
+		// reconcile path, not the renderer, so it is also what proves the field
+		// survives the CRD, the defaulting and the stored object.
+		It("refuses nothing outbound for an environment that asked to reach out", func() {
+			env := validDevEnvironment("de-open-netpol")
+			env.Spec.Network = &aiv1alpha1.NetworkSpec{
+				Egress: &aiv1alpha1.EgressSpec{Unrestricted: true},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				np := &networkingv1.NetworkPolicy{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), np)).To(Succeed())
+				// One rule naming no destination and no port, which is everything:
+				// a policy selecting for egress with no rule at all refuses all of
+				// it, so the empty rule is the allowance and not its absence.
+				g.Expect(np.Spec.Egress).To(Equal([]networkingv1.NetworkPolicyEgressRule{{}}))
+				// The ingress half is the one the environment did not ask about,
+				// and it is unchanged: default-deny plus the Gateway's dataplane.
+				g.Expect(np.Spec.Ingress).To(HaveLen(1))
 			}, "15s", "200ms").Should(Succeed())
 		})
 
@@ -3935,6 +4228,43 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			sts := &appsv1.StatefulSet{}
 			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+		})
+
+		// The same disposition reached end to end, for the one disagreement that
+		// is between two spec fields rather than between a spec field and the
+		// controller's own value: the node label loses to the model pin, the
+		// environment provisions anyway, and the StatefulSet the controller
+		// writes is what proves which of the two the pod was given.
+		It("accepts an environment whose node label the model pin overwrites", func() {
+			env := validDevEnvironment("de-node-selector-overridden")
+			env.Spec.Resources.GPU.Model = testGPUModelH200
+			env.Spec.NodeSelector = map[string]string{
+				testProductLabelNvidia: testGPUModelMXC500,
+				testNodePoolLabel:      testNodePoolValue,
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				cond := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(cond).NotTo(BeNil())
+				g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+				g.Expect(cond.Reason).To(Equal(reasonOverridden))
+				g.Expect(cond.Message).To(ContainSubstring(
+					"spec.nodeSelector[" + testProductLabelNvidia + "]: ignored — "))
+				g.Expect(got.Status.Phase.Name).NotTo(Equal(aiv1alpha1.PhaseFailed))
+			}, "15s", "200ms").Should(Succeed())
+
+			// The model's value on the key the two fields share, and the label
+			// that was only ever the user's left exactly as written.
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, envKey(env.Name), sts)).To(Succeed())
+			Expect(sts.Spec.Template.Spec.NodeSelector).To(Equal(map[string]string{
+				testProductLabelNvidia: testGPUModelH200,
+				testNodePoolLabel:      testNodePoolValue,
+			}))
 		})
 
 		It("withdraws compute and routes when a running environment becomes mismatched", func() {

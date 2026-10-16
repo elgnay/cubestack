@@ -1221,6 +1221,29 @@ func gpuModelNodeSelector(env *aiv1alpha1.DevEnvironment) map[string]string {
 	return map[string]string{vendorProductLabel(vendor): env.Spec.Resources.GPU.Model}
 }
 
+// desiredNodeSelector is the pod's whole node selection: the labels the
+// environment asked for (spec.nodeSelector) with the GPU model pin written over
+// them. It is nil when the environment selects nothing, so a pod that selects
+// nothing carries no map rather than an empty one.
+//
+// nodeSelector is a flat map with no merge semantics, so the two sources cannot
+// both be honoured on one key and one of them has to give way. The model does:
+// it is derived from the field that also picks the extended resource the pod
+// requests, so a hand-written label allowed to displace it would pin the pod to
+// a card the spec rejected while the device request went on naming the other
+// one. The user loses nothing by that — spec.resources.gpu.model is where a
+// model is chosen — and the clash is reported rather than silent
+// (::nodeSelectorFindings).
+func desiredNodeSelector(env *aiv1alpha1.DevEnvironment) map[string]string {
+	selector := make(map[string]string, len(env.Spec.NodeSelector)+1)
+	maps.Copy(selector, env.Spec.NodeSelector)
+	maps.Copy(selector, gpuModelNodeSelector(env))
+	if len(selector) == 0 {
+		return nil
+	}
+	return selector
+}
+
 // desiredContainerPorts declares the ports the environment's container listens
 // on, in the order desiredService publishes them: the type's main port, ssh
 // when it is exposed and is not already the main port, then each spec.ports
@@ -1811,6 +1834,7 @@ func specFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 		})
 	}
 	findings = append(findings, portCollisionFindings(env)...)
+	findings = append(findings, nodeSelectorFindings(env)...)
 	if env.Spec.Runtime == nil {
 		return findings
 	}
@@ -1961,6 +1985,15 @@ func activityAgentEnabled(env *aiv1alpha1.DevEnvironment) bool {
 	return env.Spec.Lifecycle != nil && env.Spec.Lifecycle.IdleTimeout > 0
 }
 
+// egressUnrestricted reports whether this environment asked to reach outside the
+// cluster (spec.network.egress). It is the whole of the condition — the field is
+// absent on every environment that did not ask, and absent is what the default
+// reads as — so it is read where the outbound allowance is rendered and nowhere
+// else.
+func egressUnrestricted(env *aiv1alpha1.DevEnvironment) bool {
+	return env.Spec.Network != nil && env.Spec.Network.Egress != nil && env.Spec.Network.Egress.Unrestricted
+}
+
 // activityAgentServiceAccountName is the account an environment that carries the
 // sidecar runs under, and names the Role and RoleBinding that go with it. It is
 // the name of an object that exists only while the environment asks for one, so
@@ -2081,13 +2114,22 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 
 	podSpec := corev1.PodSpec{
 		Containers: []corev1.Container{container},
-		// The GPU model the environment names, if any. This is the pod spec's
-		// only node selection — #206 removed the hard compute-pool selector and
-		// nothing replaced it — so it is set outright rather than merged. A
-		// second source of node selection would have to merge into this map
-		// instead: nodeSelector is a flat map with no merge semantics, and
-		// assigning over it would silently drop the model constraint.
-		NodeSelector: gpuModelNodeSelector(env),
+		// The labels the environment asks for (spec.nodeSelector) together with
+		// the GPU model it names, if any. #206 removed the hard compute-pool
+		// selector and this is what replaced it; the two sources are reconciled
+		// in ::desiredNodeSelector, because nodeSelector is a flat map with no
+		// merge semantics.
+		NodeSelector: desiredNodeSelector(env),
+		// The scheduler the environment names, if any (spec.schedulerName). Empty
+		// is unset: the field is omitempty on the pod spec, so an environment that
+		// names none renders exactly as it did before the field existed, and the
+		// cluster's default scheduler places it.
+		//
+		// A name no scheduler answers to is not refused here and cannot be: what
+		// schedulers a cluster runs is not something the spec can be wrong about.
+		// The pod is simply never picked up, which is why the API says so plainly
+		// rather than leaving the failure to be discovered.
+		SchedulerName: env.Spec.SchedulerName,
 		// Pod-level, so the profile reaches the init container below too. An unset
 		// profile is Unconfined, which the Restricted Pod Security Standard refuses
 		// outright: this is that level's seccomp requirement met, and no more —
@@ -2390,6 +2432,36 @@ func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	return findings
 }
 
+// nodeSelectorFindings reports the node labels an environment asked for that the
+// GPU model pin writes over (::desiredNodeSelector). spec.resources.gpu.model
+// decides the label a node advertises the card under and the extended resource
+// the pod requests together, so where the two disagree it is the model that is
+// applied and the label the user wrote is the one that goes unused. An entry
+// that names the same value the model pins is not a disagreement, and is not
+// reported.
+//
+// This is a finding and not a refusal: the environment provisions, and editing
+// the spec is the way to change what was applied, so it is reported as resolved
+// rather than as something that has to be fixed first.
+func nodeSelectorFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
+	pinned := gpuModelNodeSelector(env)
+	var findings []specFinding
+	// The keys are sorted because the message these produce is compared against
+	// a fixed string: map iteration order would shuffle it run to run.
+	for _, key := range slices.Sorted(maps.Keys(env.Spec.NodeSelector)) {
+		model, pinnedHere := pinned[key]
+		if !pinnedHere || env.Spec.NodeSelector[key] == model {
+			continue
+		}
+		findings = append(findings, specFinding{
+			field: fmt.Sprintf("nodeSelector[%s]", key),
+			detail: fmt.Sprintf("spec.resources.gpu.model decides this node label and the accelerator the pod requests together, and it names %q, so the pod is pinned to that. Change the model there rather than in a node label",
+				model),
+		})
+	}
+	return findings
+}
+
 // desiredService renders the ClusterIP Service with the main port, the SSH
 // port (when exposed and not the main port), and the extra application ports.
 //
@@ -2439,10 +2511,12 @@ func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment
 }
 
 // desiredNetworkPolicy enforces default-deny ingress — widened by exactly one
-// rule when the platform Gateway's dataplane is configured — with DNS egress
-// whitelisted (design §9.1). agentEgress is the activity agent's allowance,
+// rule when the platform Gateway's dataplane is configured — and admits DNS
+// egress (design §9.1), or every egress at all for an environment that asked for
+// one (spec.network.egress). agentEgress is the activity agent's allowance,
 // resolved by applyNetworkPolicy, and is empty for an environment that carries
-// no agent.
+// no agent; the unrestricted case subsumes it, so it is dropped where the
+// environment has already removed the restriction it would have widened.
 func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvironment, agentEgress []networkingv1.NetworkPolicyEgressRule) *networkingv1.NetworkPolicy {
 	tcp := corev1.ProtocolTCP
 	udp := corev1.ProtocolUDP
@@ -2484,39 +2558,63 @@ func (r *DevEnvironmentReconciler) desiredNetworkPolicy(env *aiv1alpha1.DevEnvir
 			}},
 		})
 	}
+	// Egress is default-deny with a single DNS allowance, and an environment may
+	// lift it entirely (spec.network.egress.unrestricted). The lifted form is one
+	// rule naming no destination and no port, which is the shape "nothing is
+	// refused" has to take: a policy that selects for egress and carries no rule
+	// at all refuses everything, so the absence of a restriction is a rule that
+	// restricts nothing.
+	//
+	// That rule subsumes the DNS allowance and the agent's apiserver one alike,
+	// so neither is appended when it is in force. The only difference between an
+	// unrestricted environment's policy and a restricted one's is this list —
+	// PolicyTypes names Egress either way, so the policy cannot be read as
+	// silently dropping out of egress enforcement.
+	//
+	// The decision belongs to one environment rather than to a namespace, which
+	// is why it is a field on the spec and not a setting on the installation: the
+	// environment that installs a package needs the network and the one beside it
+	// does not, and a namespace opened wholesale says nothing in either
+	// environment's spec about why it is open.
+	var egress []networkingv1.NetworkPolicyEgressRule
+	if egressUnrestricted(env) {
+		egress = []networkingv1.NetworkPolicyEgressRule{{}}
+	} else {
+		egress = append([]networkingv1.NetworkPolicyEgressRule{
+			{
+				// Port 53 with no peer, because the resolver's address is
+				// the cluster's to choose and no object reports it: the
+				// kubelet's --cluster-dns is what reaches a pod's
+				// resolv.conf, and it names the DNS Service's ClusterIP on
+				// one cluster, a node-local cache's address on the next
+				// (Kubernetes' nodelocaldns answers on 169.254.25.10,
+				// Cilium's on 169.254.20.10, and --localip moves it
+				// anywhere), and nothing stops an operator from setting it
+				// to something else again. A rule peering on the kube-dns
+				// pods — which is what this one used to do — admits no
+				// lookup at all wherever the pod dials a node-local cache
+				// instead, and the environment then starts, serves, and
+				// cannot resolve a single name.
+				//
+				// So the port is the scope here, not the destination. The
+				// cost is small: this platform's other egress rules all
+				// name a peer, and a tenant who could tunnel DNS out
+				// through the cluster resolver could already tunnel it
+				// through the kube-dns pods this rule would otherwise name.
+				Ports: []networkingv1.NetworkPolicyPort{
+					{Protocol: &udp, Port: &dnsPort},
+					{Protocol: &tcp, Port: &dnsPort},
+				},
+			},
+		}, agentEgress...)
+	}
 	return &networkingv1.NetworkPolicy{
 		ObjectMeta: metav1.ObjectMeta{Name: env.Name, Namespace: env.Namespace, Labels: r.envLabels(env.Name)},
 		Spec: networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{MatchLabels: map[string]string{devEnvironmentLabelKey: env.Name}},
 			PolicyTypes: []networkingv1.PolicyType{networkingv1.PolicyTypeIngress, networkingv1.PolicyTypeEgress},
 			Ingress:     ingress,
-			Egress: append([]networkingv1.NetworkPolicyEgressRule{
-				{
-					// Port 53 with no peer, because the resolver's address is
-					// the cluster's to choose and no object reports it: the
-					// kubelet's --cluster-dns is what reaches a pod's
-					// resolv.conf, and it names the DNS Service's ClusterIP on
-					// one cluster, a node-local cache's address on the next
-					// (Kubernetes' nodelocaldns answers on 169.254.25.10,
-					// Cilium's on 169.254.20.10, and --localip moves it
-					// anywhere), and nothing stops an operator from setting it
-					// to something else again. A rule peering on the kube-dns
-					// pods — which is what this one used to do — admits no
-					// lookup at all wherever the pod dials a node-local cache
-					// instead, and the environment then starts, serves, and
-					// cannot resolve a single name.
-					//
-					// So the port is the scope here, not the destination. The
-					// cost is small: this platform's other egress rules all
-					// name a peer, and a tenant who could tunnel DNS out
-					// through the cluster resolver could already tunnel it
-					// through the kube-dns pods this rule would otherwise name.
-					Ports: []networkingv1.NetworkPolicyPort{
-						{Protocol: &udp, Port: &dnsPort},
-						{Protocol: &tcp, Port: &dnsPort},
-					},
-				},
-			}, agentEgress...),
+			Egress:      egress,
 		},
 	}
 }
@@ -2934,6 +3032,25 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		Storage    *aiv1alpha1.StorageSpec
 		Volumes    []aiv1alpha1.VolumeMount
 		SSHExposed bool
+		// NodeSelector is the placement the environment asked for
+		// (spec.nodeSelector). The GPU model pin is not repeated here: it follows
+		// from Resources, which is above. A user's labels follow from nothing else,
+		// so without this a selector added to an existing environment would digest
+		// the same, applyStatefulSet would skip the update, and the workload would
+		// go on being placed by a template the spec no longer states. The map is
+		// omitted while it is empty, as rdma is, so the environments that select
+		// nothing — every one that predates the field — digest exactly as they did
+		// before it existed and are not rolled on upgrade.
+		NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+		// SchedulerName is spec.schedulerName, and is empty for every environment
+		// that names no scheduler. Nothing else in this input implies it, and the
+		// live object cannot stand in for it: the API server defaults the field on
+		// the stored template, so the StatefulSet reads "default-scheduler" whether
+		// or not the environment asked for anything. Without this entry a renamed
+		// scheduler would digest the same and never reach the pod. The empty string
+		// is omitted rather than hashed, so the environments that name none digest
+		// exactly as they did before the field existed.
+		SchedulerName string `json:"schedulerName,omitempty"`
 		// JupyterTokenRevision is the digest carried on the pod template for a
 		// jupyter environment ("" otherwise): introducing the JUPYTER_TOKEN env
 		// var plus its revision rolls existing StatefulSets once on upgrade, and
@@ -3046,6 +3163,8 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		Storage:               env.Spec.Storage,
 		Volumes:               env.Spec.Volumes,
 		SSHExposed:            sshExposed(env),
+		NodeSelector:          env.Spec.NodeSelector,
+		SchedulerName:         env.Spec.SchedulerName,
 		JupyterTokenRevision:  env.Annotations[jupyterTokenRevisionAnnotationKey],
 		SSHKeysRevision:       env.Annotations[sshKeysRevisionAnnotationKey],
 		SSHMount:              sshMountKey(env),

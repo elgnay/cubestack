@@ -53,6 +53,36 @@ type DevEnvironmentSpec struct {
 	// Resources is the compute / resource configuration.
 	Resources ResourcesSpec `json:"resources"`
 
+	// NodeSelector constrains scheduling to nodes carrying these labels, e.g. a
+	// node pool. Labels are matched exactly, and one that matches no node leaves
+	// the environment Pending rather than failing: which nodes a cluster has is
+	// not something the spec can be wrong about.
+	//
+	// It is one input to placement and not the whole of it. The accelerator the
+	// environment asks for already decides which nodes can run it, so a selector
+	// that contradicts spec.resources.gpu.model is resolved in the model's favour
+	// and the disagreement is reported on the Accepted condition. Set the model
+	// there rather than here: that field also names the accelerator the
+	// environment requests, and a selector cannot.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// SchedulerName names the scheduler that places this environment's pod, when
+	// something other than the cluster's default should. Omitted, the default
+	// scheduler places it.
+	//
+	// It decides who picks the node, not which nodes may be picked: the placement
+	// the environment states elsewhere — spec.nodeSelector, the accelerator it
+	// asks for — travels on the pod, and a scheduler that ignores it places the
+	// environment where the spec did not ask for it to be.
+	//
+	// The name has to be one a scheduler answers to. A name nothing answers to is
+	// not an error and leaves nothing to read: no scheduler looks at the pod at
+	// all, so there is no scheduling failure to report, the environment stays
+	// Pending, and only the PodScheduled condition says it was never placed.
+	// +optional
+	SchedulerName string `json:"schedulerName,omitempty"`
+
 	// Storage is the workspace storage: a PVC created with the environment and
 	// mounted at the workspace path (spec.storage.mountPath, else derived from
 	// spec.runtime). Before the environment starts, the claim's root is made
@@ -79,7 +109,9 @@ type DevEnvironmentSpec struct {
 	// +optional
 	SSH *SSHSpec `json:"ssh,omitempty"`
 
-	// Network configures the network.
+	// Network configures the network: RDMA access, and what the environment may
+	// reach on its own behalf. Outbound access is restricted unless the
+	// environment asks otherwise (spec.network.egress).
 	// +optional
 	Network *NetworkSpec `json:"network,omitempty"`
 
@@ -258,6 +290,10 @@ type SSHSpec struct {
 // the environment, and what else it takes, is the platform's to arrange — it
 // is deliberately not part of this API, so the arrangement can change without
 // the environment changing with it.
+//
+// Egress is what the environment may reach on its own behalf, and is
+// restricted to the cluster's own plumbing until the environment says
+// otherwise (spec.network.egress).
 type NetworkSpec struct {
 	// RDMAEnabled gives the environment access to an RDMA device on the node it
 	// runs on.
@@ -284,6 +320,10 @@ type NetworkSpec struct {
 	// +kubebuilder:default=roce
 	// +optional
 	RDMAType RDMAType `json:"rdmaType,omitempty"`
+
+	// Egress configures the environment's outbound access.
+	// +optional
+	Egress *EgressSpec `json:"egress,omitempty"`
 }
 
 // RDMAType is the RDMA network type.
@@ -293,6 +333,28 @@ const (
 	RDMATypeInfiniBand RDMAType = "infiniband"
 	RDMATypeRoCE       RDMAType = "roce"
 )
+
+// EgressSpec configures the environment's outbound access.
+type EgressSpec struct {
+	// Unrestricted lifts the restriction on what the environment may reach: it
+	// may open a connection to any destination, rather than being able to
+	// resolve names and reach nothing.
+	//
+	// An environment is restricted by default, and one that serves a notebook
+	// off its own image never notices. One that installs a package or downloads
+	// a dataset does — and the failure does not land where the request was made.
+	// An install that cannot reach its index does not raise, so the environment
+	// goes on to fail later on a missing import instead, and the network is the
+	// last thing suspected. This field is how an environment that expects to
+	// reach outside the cluster says so.
+	//
+	// It is a property of one environment and not of a namespace: setting it
+	// says nothing about the environments that did not, and an environment that
+	// carries it is no more reachable from outside than one that does not.
+	// +kubebuilder:default=false
+	// +optional
+	Unrestricted bool `json:"unrestricted,omitempty"`
+}
 
 // RuntimeSpec customizes the container runtime.
 type RuntimeSpec struct {
