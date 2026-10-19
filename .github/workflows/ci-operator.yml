@@ -207,10 +207,10 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    # The conformance step below is bounded by go test's own -timeout of 60m, which
-    # panics with a useful message; this is the job's release past that plus the
-    # ~7m of work before it, not a deadline the step should approach.
-    timeout-minutes: 90
+    # The happy path is the operator install plus three verifications, ~5m; this
+    # is a release for something stuck, not a deadline a step should approach.
+    # The conformance suite, which used to run here, is devenv-conformance below.
+    timeout-minutes: 30
     env:
       # The install target runs codegen locally so an edited tree is reflected
       # in the cluster. That is redundant here: generate-drift runs the same
@@ -255,14 +255,67 @@ jobs:
       - name: Run the DevEnvironment happy-path verification
         run: make helm-e2e-devenv-verify
         working-directory: operator
-      - name: Run the DevEnvironment conformance suite (CPU images)
-        # The suite the happy-path step above samples: every CPU-image case, against
-        # the same cluster. It runs the image helm-e2e-install loaded rather than a
-        # published one, and the step passes the suite the two opt-ins that say so —
-        # see helm-e2e-devenv-conformance in operator/Makefile. Not allowed to fail:
-        # the required `result` check aggregates this job.
+      - name: Clean up the kind cluster
+        if: always()
+        run: make helm-e2e-cleanup
+        working-directory: operator
+
+  devenv-conformance:
+    needs: changes
+    if: needs.changes.outputs.operator == 'true'
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    # One shard is the operator install plus half of the suite. go test's own
+    # -timeout of 60m is the real stop, panicking with a useful message; this is
+    # the job's release past that plus the ~5m of work before it.
+    timeout-minutes: 90
+    env:
+      # As in test-e2e: generate-drift runs the same targets under the same
+      # `changes` filter, so the install needs no codegen of its own.
+      HELM_E2E_CODEGEN: "0"
+    strategy:
+      # One shard failing must not cancel the other's diagnosis.
+      fail-fast: false
+      matrix:
+        # The suite's two priority labels, which partition the CPU selection
+        # (96 and 84 specs today). A spec carrying neither belongs to no leg,
+        # so the split is a partition — see DEVENV_E2E_PRIORITY in
+        # operator/Makefile. Two clusters rather than one: the suite's
+        # namespace is per run, but the environments would share a node, and
+        # each leg already needs the whole operator install.
+        priority: [p0, p1]
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Setup Go
+        uses: ./.github/actions/setup-go
+        with:
+          go-version-file: operator/go.mod
+      - name: Install the latest version of kind
+        run: |
+          KIND_VERSION=0.32.0
+          KIND_SHA256="50030de23cf40a18505f20426f6a8506bedf13c6e509244bd1fa9463721b0f54"
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v${KIND_VERSION}/kind-linux-$(go env GOARCH)
+          echo "${KIND_SHA256}  ./kind" | sha256sum --check --strict
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+      - name: Install the operator via helm into a kind cluster
+        # The same install test-e2e runs, for the same -j2 reason: the cluster
+        # bootstrap overlaps the docker builds and the init image pull, and the
+        # environment's own image is built from this commit rather than pulled.
+        run: make helm-e2e-install -j2
+        working-directory: operator
+      - name: Run the DevEnvironment conformance suite (CPU images, ${{ matrix.priority }})
+        # The suite the happy-path verification samples. It runs the image the
+        # install loaded rather than a published one; the target passes the two
+        # opt-ins that say so — see helm-e2e-devenv-conformance in
+        # operator/Makefile. Not allowed to fail: the required `result` check
+        # aggregates this job.
         timeout-minutes: 70
-        run: make helm-e2e-devenv-conformance
+        run: make helm-e2e-devenv-conformance DEVENV_E2E_PRIORITY=${{ matrix.priority }}
         working-directory: operator
       - name: Clean up the kind cluster
         if: always()
@@ -308,7 +361,7 @@ jobs:
         working-directory: operator
 
   result:
-    needs: [lint, test, images-smoke, images-check, test-e2e, helm-drift, generate-drift]
+    needs: [lint, test, images-smoke, images-check, test-e2e, devenv-conformance, helm-drift, generate-drift]
     if: always()
     runs-on: ubuntu-latest
     steps:
