@@ -216,6 +216,12 @@ type Suite struct {
 	// pointing this suite at the kind specs' cluster.
 	AllowKind bool
 
+	// PreloadedImages says the images are on the nodes rather than in a registry,
+	// which is what leaves PullSecret empty. A node that was loaded rather than
+	// pulled resolves only tagged references — a digest-pinned reference is
+	// handed to the registry — so a case that pins a digest has to skip here.
+	PreloadedImages bool
+
 	// Cluster is what the preflight established about the cluster this run is
 	// against: the Gateway, the L4 pool, the dataplane Service. Assigned by the
 	// suite's setup, and only read by the cases that ask a question about the
@@ -279,6 +285,7 @@ func NewSuite() (*Suite, error) {
 	}
 	if os.Getenv(envPreloadedImages) == "1" {
 		s.PullSecret = ""
+		s.PreloadedImages = true
 	}
 	s.Namespace = os.Getenv(envNamespace)
 	if s.Namespace == "" {
