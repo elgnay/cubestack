@@ -9,8 +9,8 @@
 # Re-include the shared runtime logic and the image directories.
 !common
 !common/**
-!minimal
-!minimal/**
+!cpu-base
+!cpu-base/**
 !maca-base
 !maca-base/**
 !cube-base

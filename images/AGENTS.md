@@ -12,7 +12,7 @@ Container images that back the DevEnvironment `type` contract served by the
 `docs/design/devenv-images/decision.md`). There is **one image per accelerator family**, and every
 image serves **both** runtime modes:
 
-- **`minimal`** — CPU, on `ubuntu:22.04`: the platform layer plus `python3`/pip, JupyterLab on the
+- **`cpu-base`** — CPU, on `ubuntu:22.04`: the platform layer plus `python3`/pip, JupyterLab on the
   system interpreter, and the shared launcher.
 - **`maca-base`** — GPU, on a vendor Metax MACA base.
 - **`cube-base`** — GPU, on the vendor's NVIDIA NGC PyTorch base.
@@ -135,7 +135,7 @@ make -C images push TAG=<tag>   # builds each image for every $(PLATFORMS) (defa
                                 # linux/amd64 linux/arm64) and pushes it as one multi-arch
                                 # index carrying :TAG and :latest
 make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt-in)
-make -C images smoke-maca-base # one image: --minimal / --maca-base / --cube-base select one
+make -C images smoke-maca-base # one image: --cpu-base / --maca-base / --cube-base select one
 ```
 
 `PLATFORM` takes a single value; a list fails in `check-platform` with that reason. On a host of a
@@ -208,7 +208,7 @@ copy of its base, tens of GB, to keep. Nothing pays that cost unless it can chan
 per image is what keeps it that way: a merge that reaches only a CPU image, only the smoke harness or
 only markdown schedules no vendor build at all, and each vendor image gets a whole runner's disk
 rather than sharing one. The reclaim and the long timeout are the vendor legs' alone too — the CPU
-image is a fraction of that base (`minimal` is well under a gigabyte). The other side of that split is
+image is a fraction of that base (`cpu-base` is well under a gigabyte). The other side of that split is
 that the vendor images no longer share a runner's layer store, so a merge reaching two of them runs
 their base's pull on two runners in parallel where one lane ran it twice on one; the exchange is the
 disk, the CPU legs' 1m41s and the fact that a merge reaching one of them pays for one. Every image is

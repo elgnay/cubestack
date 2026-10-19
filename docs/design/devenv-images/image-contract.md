@@ -85,7 +85,7 @@ controller probes only the one `spec.type` selects.
 
 | Image | Base | Platforms |
 |---|---|---|
-| `minimal` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
+| `cpu-base` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
 | `cube-base` | NVIDIA NGC PyTorch (`nvcr.io/nvidia/pytorch:<release>-py3`, mirrored) | `linux/amd64` |
 | `maca-base` | Metax MACA (`public-library/maca-pytorch:…`, mirrored) | `linux/amd64` |
 

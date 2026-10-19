@@ -236,10 +236,10 @@ var environments = []struct {
 	image    devenv.Image
 	identity devenv.Identity
 }{
-	{devenv.MustImage("minimal-ssh"), devenv.NonRoot},     // S1
-	{devenv.MustImage("minimal-ssh"), devenv.Root},        // S2
-	{devenv.MustImage("minimal-jupyter"), devenv.NonRoot}, // J1, S3
-	{devenv.MustImage("minimal-jupyter"), devenv.Root},    // J2, S4
+	{devenv.MustImage("cpu-base-ssh"), devenv.NonRoot},     // S1
+	{devenv.MustImage("cpu-base-ssh"), devenv.Root},        // S2
+	{devenv.MustImage("cpu-base-jupyter"), devenv.NonRoot}, // J1, S3
+	{devenv.MustImage("cpu-base-jupyter"), devenv.Root},    // J2, S4
 	{devenv.MustImage("maca-base-ssh"), devenv.NonRoot},
 	{devenv.MustImage("maca-base-ssh"), devenv.Root},
 	{devenv.MustImage("maca-base-jupyter"), devenv.NonRoot},

@@ -9,7 +9,7 @@
 CONTAINER_TOOL ?= docker
 
 # The architecture every published image must run on: the cluster's nodes are amd64, and the
-# machine building them may not be. The minimal family's Dockerfile starts from a multi-arch base,
+# machine building them may not be. The cpu-base family's Dockerfile starts from a multi-arch base,
 # and without --platform `docker build` resolves that base to the *host* architecture — so a build
 # on an arm64 host publishes an arm64-only image and every amd64 node then fails to pull it ("no
 # match for platform in manifest"). Naming the platform makes the build independent of the host;
@@ -77,7 +77,7 @@ BASE_ARGS ?= \
 	--build-arg MACA_BASE=$(MACA_BASE) \
 	--build-arg CUDA_BASE=$(CUDA_BASE)
 
-# Base release of the minimal family image — the CPU image, built on plain ubuntu:<version>.
+# Base release of the cpu-base family image — the CPU image, built on plain ubuntu:<version>.
 # It selects the build base and nothing else; it is looked up in UBUNTU_BASE_DIGESTS below, so
 # a release and its digest can never be chosen apart.
 UBUNTU_VERSION ?= 22.04
@@ -85,7 +85,7 @@ UBUNTU_VERSION ?= 22.04
 # The pinned base, one entry per supported Ubuntu release, as <version>=<digest of the
 # platform registry's copy>. A release with no entry has no base to build from: its tag would
 # carry another release's digest, which the build resolves — so it would either fail the pull
-# or build a release the image does not claim. `make build-minimal UBUNTU_VERSION=24.04`
+# or build a release the image does not claim. `make build-cpu-base UBUNTU_VERSION=24.04`
 # stops in check-ubuntu-base instead, until 24.04 is mirrored and pinned here.
 UBUNTU_BASE_DIGESTS = 22.04=sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
 
@@ -153,9 +153,12 @@ TAG      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
 # One repository per accelerator family: the image carries the stack, and the mode (jupyter or
 # ssh) is chosen at run time by CUBSTACK_TYPE, so there is no image-per-mode axis any more.
 #
-# The CPU family is `minimal`; its base is plain ubuntu:<UBUNTU_VERSION> (above), which is a
-# build detail the repository name no longer repeats.
-MINIMAL_REPO = $(REGISTRY)/$(PROJECT)/minimal
+# The CPU family is `cpu-base`: the name states the accelerator axis the vendor families name,
+# and says there is no vendor stack. It was `minimal` while the CPU image was described by its
+# size; the repository is named for what a user selects on, not for how small the image is. Its
+# base is plain ubuntu:<UBUNTU_VERSION> (above), which is a build detail the repository name does
+# not repeat.
+CPU_BASE_REPO = $(REGISTRY)/$(PROJECT)/cpu-base
 # The vendor families are named `maca-base` and `cube-base`: they carry the vendor's stack on
 # top of the vendor base, and a base package bump (MACA_PACKAGE / CUDA_PACKAGE below) moves
 # the layers without moving the name.
@@ -189,13 +192,13 @@ MACA_TAG        ?= $(MACA_TAG_AXES)-$(TAG)
 CUDA_PKG_VERSION = $(firstword $(subst -, ,$(lastword $(subst :, ,$(CUDA_PACKAGE)))))
 CUBE_TAG        ?= $(CUDA_PKG_VERSION)-$(TAG)
 
-IMG_MINIMAL ?= $(MINIMAL_REPO):$(TAG)
+IMG_CPU_BASE ?= $(CPU_BASE_REPO):$(TAG)
 IMG_MACA    ?= $(MACA_REPO):$(MACA_TAG)
 IMG_CUBE    ?= $(CUBE_REPO):$(CUBE_TAG)
 
 # The moving publish tag: added by `make push`, never produced by `make build`, so a
 # local :latest means it came from a publish.
-LATEST_MINIMAL = $(MINIMAL_REPO):latest
+LATEST_CPU_BASE = $(CPU_BASE_REPO):latest
 LATEST_MACA    = $(MACA_REPO):latest
 LATEST_CUBE    = $(CUBE_REPO):latest
 
@@ -206,17 +209,17 @@ LATEST_CUBE    = $(CUBE_REPO):latest
 # whole index a second time. See .github/workflows/ci-images.yml.
 PUSH_LATEST ?= 1
 
-LATEST_ARG_MINIMAL = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MINIMAL))
+LATEST_ARG_CPU_BASE = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_CPU_BASE))
 LATEST_ARG_MACA    = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MACA))
 LATEST_ARG_CUBE    = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_CUBE))
 
-.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base check-cuda-base check-deps check-select build build-minimal build-maca-base build-cube-base \
-	smoke smoke-minimal smoke-maca-base smoke-cube-base push push-minimal push-maca-base push-cube-base retag-latest \
-	retag-latest-minimal retag-latest-maca-base retag-latest-cube-base
+.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base check-cuda-base check-deps check-select build build-cpu-base build-maca-base build-cube-base \
+	smoke smoke-cpu-base smoke-maca-base smoke-cube-base push push-cpu-base push-maca-base push-cube-base retag-latest \
+	retag-latest-cpu-base retag-latest-maca-base retag-latest-cube-base
 
 .DEFAULT_GOAL := help
 
-# Every build/smoke/push target funnels through build-minimal, build-maca-base or build-cube-base, so this
+# Every build/smoke/push target funnels through build-cpu-base, build-maca-base or build-cube-base, so this
 # is the one place a missing TAG has to be caught.
 check-tag:
 	@test -n "$(TAG)" || { \
@@ -259,7 +262,7 @@ check-push-latest:
 		   exit 1;; \
 	esac
 
-# UBUNTU_VERSION selects the base the minimal image is built from, so a release misspelled or not
+# UBUNTU_VERSION selects the base the cpu-base image is built from, so a release misspelled or not
 # yet pinned would build against a tag carrying another release's digest — a base the image does
 # not claim. Only the defaulted BASE_ARGS is guarded — that one is this file's own pin, and the
 # lookup is what has to answer. A caller-supplied BASE_ARGS is the caller's own base, pinned or
@@ -330,14 +333,14 @@ check-deps: ## Assert no Dockerfile reads from outside common/ and its own direc
 check-select: ## Run the image-selection rule's fixtures
 	hack/changed-images.test.sh
 
-build: build-minimal build-maca-base build-cube-base ## Build every image
+build: build-cpu-base build-maca-base build-cube-base ## Build every image
 
-build-minimal: check-tag check-platform check-ubuntu-base ## Build the CPU (minimal) image
+build-cpu-base: check-tag check-platform check-ubuntu-base ## Build the CPU (cpu-base) image
 	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
-		-f minimal/Dockerfile -t $(IMG_MINIMAL) .
+		-f cpu-base/Dockerfile -t $(IMG_CPU_BASE) .
 
 # MACA_PLATFORM, not PLATFORM: the maca-base image has no arm64 base to build from, so it stays
-# amd64 on every host rather than following the platform the minimal image builds for.
+# amd64 on every host rather than following the platform the cpu-base image builds for.
 build-maca-base: check-tag check-maca-base ## Build the Metax (maca-base) image (linux/amd64 only)
 	$(CONTAINER_TOOL) build --platform "$(MACA_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		-f maca-base/Dockerfile -t $(IMG_MACA) .
@@ -351,23 +354,23 @@ build-cube-base: check-tag check-cuda-base ## Build the NVIDIA (cube-base) image
 		-f cube-base/Dockerfile -t $(IMG_CUBE) .
 
 smoke: build ## Build and run the full local Docker smoke
-	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh
+	IMG_CPU_BASE=$(IMG_CPU_BASE) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh
 
-smoke-minimal: build-minimal ## Build and smoke only the minimal image
-	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --minimal
+smoke-cpu-base: build-cpu-base ## Build and smoke only the cpu-base image
+	IMG_CPU_BASE=$(IMG_CPU_BASE) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --cpu-base
 
 smoke-maca-base: build-maca-base ## Build and smoke only the Metax (maca-base) image
-	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --maca-base
+	IMG_CPU_BASE=$(IMG_CPU_BASE) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --maca-base
 
 smoke-cube-base: build-cube-base ## Build and smoke only the NVIDIA (cube-base) image
-	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --cube-base
+	IMG_CPU_BASE=$(IMG_CPU_BASE) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --cube-base
 
-push: push-minimal push-maca-base push-cube-base ## Publish every image (TAG + :latest)
+push: push-cpu-base push-maca-base push-cube-base ## Publish every image (TAG + :latest)
 
-push-minimal: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the minimal image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
+push-cpu-base: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the cpu-base image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
-		-f minimal/Dockerfile -t $(IMG_MINIMAL) $(LATEST_ARG_MINIMAL) --push .
+		-f cpu-base/Dockerfile -t $(IMG_CPU_BASE) $(LATEST_ARG_CPU_BASE) --push .
 
 # check-platforms would be checking PLATFORMS, which this target deliberately does not read;
 # MACA_PLATFORM is the whole of what it publishes, and PLATFORMS_ARG is what would break it.
@@ -388,11 +391,11 @@ push-cube-base: check-tag check-cuda-base check-push-latest ## Publish the NVIDI
 # the rest: the ref a skipped image would name is one this run never pushed, so its retag
 # would fail on a missing manifest, and a tag that another run published is that run's to
 # move. Defaults to every image, which is what a human means.
-RETAG ?= minimal maca-base cube-base
+RETAG ?= cpu-base maca-base cube-base
 
 retag-latest: $(addprefix retag-latest-,$(RETAG)) ## Repoint :latest at an already-published TAG (no rebuild; RETAG names the images)
-retag-latest-minimal: check-tag
-	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MINIMAL) $(IMG_MINIMAL)
+retag-latest-cpu-base: check-tag
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_CPU_BASE) $(IMG_CPU_BASE)
 retag-latest-maca-base: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MACA) $(IMG_MACA)
 retag-latest-cube-base: check-tag

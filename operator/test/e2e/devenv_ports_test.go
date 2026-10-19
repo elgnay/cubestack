@@ -101,7 +101,7 @@ func extraPorts(want *aiv1alpha1.DevEnvironment) {
 func describeExtraPorts() {
 	draftCase{
 		Name:     "ports-extra",
-		Image:    devenv.MustImage("minimal-jupyter"),
+		Image:    devenv.MustImage("cpu-base-jupyter"),
 		Identity: devenv.NonRoot,
 		Shape:    extraPorts,
 		Cases: func(open func() *devenv.Environment) {
@@ -458,7 +458,7 @@ func describeExtraPorts() {
 	// tell the two apart.
 	draftCase{
 		Name:     "ports-repeat",
-		Image:    devenv.MustImage("minimal-jupyter"),
+		Image:    devenv.MustImage("cpu-base-jupyter"),
 		Identity: devenv.NonRoot,
 		Shape: func(want *aiv1alpha1.DevEnvironment) {
 			want.Spec.Ports = []aiv1alpha1.PortSpec{
@@ -541,7 +541,7 @@ func describePoolIsShared() {
 
 	draftCase{
 		Name:     envName,
-		Image:    devenv.MustImage("minimal-jupyter"),
+		Image:    devenv.MustImage("cpu-base-jupyter"),
 		Identity: devenv.NonRoot,
 		Shape:    extraPorts,
 		Cases: func(open func() *devenv.Environment) {
@@ -555,7 +555,7 @@ func describePoolIsShared() {
 					// only thing it contributes is a second environment holding a
 					// pool port somewhere else in the cluster.
 					peer := conformance.DraftIn(secondNS(), peerEnv,
-						devenv.MustImage("minimal-jupyter"), devenv.NonRoot)
+						devenv.MustImage("cpu-base-jupyter"), devenv.NonRoot)
 					Expect(conformance.PrepareNamespace(ctx, secondNS())).To(Succeed())
 					DeferCleanup(func() {
 						cleanup, cancel := context.WithTimeout(context.Background(), 2*time.Minute)

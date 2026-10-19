@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cubestack jupyter launch chain, shared by all three family images: minimal, cube-base and
+# Cubestack jupyter launch chain, shared by all three family images: cpu-base, cube-base and
 # maca-base.
 #
 # This is the image CMD. common/entrypoint.sh has already started sshd when the operator mounted

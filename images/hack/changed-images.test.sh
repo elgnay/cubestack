@@ -20,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.." # repository root: the paths below are the ones CI passes
 SUT=images/hack/changed-images.sh
-ALL="minimal maca-base cube-base"
+ALL="cpu-base maca-base cube-base"
 
 cases=0
 failures=0
@@ -75,9 +75,9 @@ check_groups() { # check_groups <name> <expected-json> <image>...
 check "an empty diff" "" ""
 check "another project" "" "" operator/internal/controller/devenv.go web/src/app.ts
 check "markdown at images/ root" "" "" images/README.md
-check "markdown inside an image directory" "" "" images/minimal/README.md
+check "markdown inside an image directory" "" "" images/cpu-base/README.md
 
-check "the minimal image's own file" minimal minimal images/minimal/Dockerfile
+check "the cpu-base image's own file" cpu-base cpu-base images/cpu-base/Dockerfile
 check "the maca-base image's own file" maca-base maca-base images/maca-base/Dockerfile
 check "the cube-base image's own file" cube-base cube-base images/cube-base/Dockerfile
 
@@ -103,8 +103,8 @@ check "a stray file at images/ root" "$ALL" "$ALL" images/notes.txt
 
 # A selection is a union over the whole diff, not the last path to match, and these two
 # share no input and are not each other's.
-check "two images' own files" "minimal maca-base" "minimal maca-base" \
-  images/minimal/Dockerfile images/maca-base/Dockerfile
+check "two images' own files" "cpu-base maca-base" "cpu-base maca-base" \
+  images/cpu-base/Dockerfile images/maca-base/Dockerfile
 
 # The same union across the two vendor legs.
 check "images on different bases" "maca-base cube-base" "maca-base cube-base" \
@@ -135,24 +135,24 @@ esac
 check_groups "a selection with no images has no leg" '[]'
 check_groups "the cube-base image is one leg" \
   '[{"base":"cube-base","images":"cube-base","vendor":true}]' cube-base
-check_groups "the minimal image is one leg, and is not a vendor leg" \
-  '[{"base":"minimal","images":"minimal","vendor":false}]' minimal
+check_groups "the cpu-base image is one leg, and is not a vendor leg" \
+  '[{"base":"cpu-base","images":"cpu-base","vendor":false}]' cpu-base
 check_groups "a maca-base-only selection schedules no other base's leg" \
   '[{"base":"maca-base","images":"maca-base","vendor":true}]' maca-base
 check_groups "one leg per selected base, in the table's order" \
-  '[{"base":"minimal","images":"minimal","vendor":false},{"base":"maca-base","images":"maca-base","vendor":true},{"base":"cube-base","images":"cube-base","vendor":true}]' \
-  minimal maca-base cube-base
+  '[{"base":"cpu-base","images":"cpu-base","vendor":false},{"base":"maca-base","images":"maca-base","vendor":true},{"base":"cube-base","images":"cube-base","vendor":true}]' \
+  cpu-base maca-base cube-base
 check_groups "a repeated name does not repeat a leg" \
   '[{"base":"cube-base","images":"cube-base","vendor":true}]' cube-base cube-base
 
 # The primitive the action's publish matrix is sized from, asserted apart from the grouping
 # so that a `vendor` gone wrong cannot hide behind a grouping fixture that agrees with it.
 cases=$((cases + 1))
-if [ "$("$SUT" vendor cube-base)" = true ] && [ "$("$SUT" vendor minimal)" = false ]; then
+if [ "$("$SUT" vendor cube-base)" = true ] && [ "$("$SUT" vendor cpu-base)" = false ]; then
   printf 'ok    vendor follows the base, not a name list\n'
 else
   failures=$((failures + 1))
-  printf 'FAIL  vendor must read true for cube-base and false for minimal\n'
+  printf 'FAIL  vendor must read true for cube-base and false for cpu-base\n'
 fi
 
 # A name the rule does not know must fail loudly: a group silently dropped here is an image
@@ -243,7 +243,7 @@ done
 # --- the gate needs the pathspec, not a list of image names ----------------------
 
 cases=$((cases + 1))
-if [ "$("$SUT" paths minimal | wc -l)" -lt 2 ]; then
+if [ "$("$SUT" paths cpu-base | wc -l)" -lt 2 ]; then
   failures=$((failures + 1))
   printf 'FAIL  `paths` must emit a pathspec for git, not a name\n'
 else
