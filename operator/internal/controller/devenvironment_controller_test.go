@@ -2866,9 +2866,50 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Key:                  jupyterTokenKey,
 				}}},
 				{Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env)},
+				{Name: cubstackTypeEnv, Value: "jupyter"},
 			}))
 			// A jupyter environment without ssh.enabled mounts no ssh volume.
 			Expect(c.VolumeMounts).To(BeEmpty())
+		})
+
+		// One image serves both a notebook and an ssh environment because the
+		// controller states which one this is; the mode the image bakes at build
+		// time is only a fallback (images/common/entrypoint.sh). The value has to
+		// follow spec.type or the container would contradict the probe, Service and
+		// routes the controller derived from the same field.
+		DescribeTable("states the environment type to the image",
+			func(typ aiv1alpha1.DevEnvironmentType, want string) {
+				env := newEnv()
+				env.Spec.Type = typ
+				Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).
+					To(ContainElement(corev1.EnvVar{Name: cubstackTypeEnv, Value: want}))
+			},
+			Entry("jupyter", aiv1alpha1.DevEnvironmentTypeJupyter, "jupyter"),
+			Entry("ssh", aiv1alpha1.DevEnvironmentTypeSSH, "ssh"),
+		)
+
+		// The value is the controller's, like JUPYTER_TOKEN: a declared one could
+		// disagree with what the probe, Service and routes were built from.
+		It("drops a container type the environment declares", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+				{Name: cubstackTypeEnv, Value: "jupyter"},
+			}}
+			rendered := []corev1.EnvVar{}
+			for _, v := range (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env {
+				if v.Name == cubstackTypeEnv {
+					rendered = append(rendered, v)
+				}
+			}
+			Expect(rendered).To(Equal([]corev1.EnvVar{{Name: cubstackTypeEnv, Value: "ssh"}}))
+		})
+
+		// vscode is not a mode the platform's images implement — the shared
+		// entrypoint exits on an unknown one — so its image keeps deciding what to
+		// run.
+		It("states no container type to a vscode environment", func() {
+			Expect(render(nil).Containers[0].Env).NotTo(ContainElement(HaveField("Name", cubstackTypeEnv)))
 		})
 
 		// The prefix Jupyter is told to serve under has to be the prefix its route
@@ -3025,7 +3066,8 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
 				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 			}
-			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).To(BeEmpty())
+			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).
+				To(Equal([]corev1.EnvVar{{Name: cubstackTypeEnv, Value: "ssh"}}))
 		})
 
 		// The whole rollout story of this feature is that an environment which

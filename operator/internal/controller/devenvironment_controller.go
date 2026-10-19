@@ -297,6 +297,15 @@ const (
 	// and contributes nothing (::stsSpecHash), so only the others are rolled.
 	workspaceHomeVersion = "workspace-home-1"
 
+	// cubstackTypeEnvVersion names the mode the controller states to the image
+	// (see desiredPodSpec). stsSpecHash cannot see the injection by itself:
+	// spec.type is already an input, so an environment whose spec has not changed
+	// would digest exactly as it did before the variable existed and keep a
+	// template that never learns its mode. Only the environment types that state
+	// a mode contribute (::containerTypeEnv), so a vscode environment is not
+	// rolled for a variable it is never given.
+	cubstackTypeEnvVersion = "cubstack-type-env-1"
+
 	// defaultRuntimeUser is the account an environment logs in as when
 	// spec.runtime.user names none; it is also the account the platform's base
 	// images conventionally use.
@@ -323,6 +332,14 @@ const (
 	// the owner (via the Secret) and the pod know it.
 	jupyterTokenKey = "token"
 	jupyterTokenEnv = "JUPYTER_TOKEN"
+
+	// cubstackTypeEnv is the variable the images read first to decide what to
+	// run, ahead of the mode baked into them at build time
+	// (images/common/entrypoint.sh). The controller states spec.type through it
+	// so one image can serve either type; a user-supplied value is dropped for
+	// the same reason JUPYTER_TOKEN is — the container has to agree with the
+	// probe, Service and routes the controller derived from spec.type.
+	cubstackTypeEnv = "CUBSTACK_TYPE"
 
 	// notebookArgsEnv is the variable the stock Jupyter launcher appends to the
 	// notebook command line, and notebookBaseURLFlag the launcher flag that makes
@@ -2004,6 +2021,19 @@ func activityAgentServiceAccountName(env *aiv1alpha1.DevEnvironment) string {
 	return env.Name + activityAgentNameSuffix
 }
 
+// containerTypeEnv is the CUBSTACK_TYPE value the controller states on the
+// container, and false when it states none. Only jupyter and ssh are modes the
+// platform's images implement — the shared entrypoint exits on an unknown mode
+// (images/common/entrypoint.sh) — so a vscode environment keeps whatever mode
+// its own image bakes, which is what it did before the injection existed.
+func containerTypeEnv(env *aiv1alpha1.DevEnvironment) (string, bool) {
+	switch env.Spec.Type {
+	case aiv1alpha1.DevEnvironmentTypeJupyter, aiv1alpha1.DevEnvironmentTypeSSH:
+		return string(env.Spec.Type), true
+	}
+	return "", false
+}
+
 // desiredPodSpec renders the pod spec: the GPU-model nodeSelector when the
 // environment names one, the main container with the workspace and data volume
 // mounts, the SSH keys volume, and — when the environment has its own storage —
@@ -2059,6 +2089,16 @@ func (r *DevEnvironmentReconciler) desiredPodSpec(env *aiv1alpha1.DevEnvironment
 		if rootLauncherEnvNeeded(env) {
 			envVars = withRootLauncherEnv(envVars)
 		}
+	}
+	// The image decides what to run from this, ahead of the mode it baked at
+	// build time, so one image can serve both a notebook and an ssh environment
+	// (images/common/entrypoint.sh). It is controller-owned like JUPYTER_TOKEN —
+	// a user value could contradict the probe, Service and routes derived from
+	// spec.type — so a declared entry is dropped. A type the images do not
+	// implement is stated to no one: vscode keeps the mode its image bakes.
+	if mode, ok := containerTypeEnv(env); ok {
+		envVars = slices.DeleteFunc(envVars, func(v corev1.EnvVar) bool { return v.Name == cubstackTypeEnv })
+		envVars = append(envVars, corev1.EnvVar{Name: cubstackTypeEnv, Value: mode})
 	}
 	// The claim the platform mounts is the environment's home, so the container is
 	// told where it is: a launcher that reads HOME serves the workspace whatever
@@ -3097,6 +3137,14 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		// environments that state no home digest exactly as they did before it
 		// existed.
 		WorkspaceHome string `json:"workspaceHome,omitempty"`
+		// CUBSTACK_TYPE is the version of the mode the controller states on the
+		// container (::cubstackTypeEnvVersion), and is empty for every environment
+		// that states none. Like WorkspaceHome it stands for something this input
+		// cannot see: spec.type is already above, so nothing else here moves when
+		// the injection is added. The empty string is omitted rather than hashed,
+		// so the environments that state no mode — every vscode one — digest
+		// exactly as they did before it existed.
+		CubstackTypeEnv string `json:"cubstackTypeEnv,omitempty"`
 		// RDMA is the *resolved* RDMA request (::rdmaResource) — the resource the
 		// container claims and whether the pod runs on the host network — rather
 		// than spec.network as declared. Both follow from the spec and from the
@@ -3145,6 +3193,13 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	if _, ok := resolvedHome(env); ok {
 		workspaceHome = workspaceHomeVersion
 	}
+	// Empty unless the environment states a mode the images implement, so a
+	// vscode environment — which receives no CUBSTACK_TYPE — digests exactly as it
+	// did before the injection existed.
+	typeEnv := ""
+	if _, ok := containerTypeEnv(env); ok {
+		typeEnv = cubstackTypeEnvVersion
+	}
 	// Both empty unless the environment asks for an idle timeout, so the
 	// environments that ask for none — every one that predates the sidecar —
 	// digest exactly as they did before it existed.
@@ -3171,6 +3226,7 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		PodSecurityContext:    podSecurityContextVersion,
 		RootLauncherEnv:       rootLauncherEnv,
 		WorkspaceHome:         workspaceHome,
+		CubstackTypeEnv:       typeEnv,
 		RDMA:                  rdma,
 		ShareProcessNamespace: activityAgentEnabled(env),
 		ActivityAgent:         activityAgent,
