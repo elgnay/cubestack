@@ -2885,7 +2885,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					To(ContainElement(corev1.EnvVar{Name: cubstackTypeEnv, Value: want}))
 			},
 			Entry("jupyter", aiv1alpha1.DevEnvironmentTypeJupyter, "jupyter"),
-			Entry("ssh", aiv1alpha1.DevEnvironmentTypeSSH, "ssh"),
+			Entry("ssh", aiv1alpha1.DevEnvironmentTypeSSH, string(aiv1alpha1.DevEnvironmentTypeSSH)),
 		)
 
 		// The value is the controller's, like JUPYTER_TOKEN: a declared one could
@@ -2902,7 +2902,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					rendered = append(rendered, v)
 				}
 			}
-			Expect(rendered).To(Equal([]corev1.EnvVar{{Name: cubstackTypeEnv, Value: "ssh"}}))
+			Expect(rendered).To(Equal([]corev1.EnvVar{{
+				Name: cubstackTypeEnv, Value: string(aiv1alpha1.DevEnvironmentTypeSSH),
+			}}))
 		})
 
 		// vscode is not a mode the platform's images implement — the shared
@@ -3067,7 +3069,9 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 			}
 			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).
-				To(Equal([]corev1.EnvVar{{Name: cubstackTypeEnv, Value: "ssh"}}))
+				To(Equal([]corev1.EnvVar{{
+					Name: cubstackTypeEnv, Value: string(aiv1alpha1.DevEnvironmentTypeSSH),
+				}}))
 		})
 
 		// The whole rollout story of this feature is that an environment which
