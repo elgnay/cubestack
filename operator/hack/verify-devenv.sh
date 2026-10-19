@@ -54,7 +54,7 @@ check_contains() {
 }
 
 # url_port <url> — the port in the URL's authority: 80 from
-# http://1.2.3.4:80/dev/ns/env/, 20000 from ssh://jovyan@1.2.3.4:20000.
+# http://1.2.3.4:80/dev/ns/env/, 20000 from ssh://ubuntu@1.2.3.4:20000.
 url_port() {
   local a="${1#*://}" # scheme
   a="${a%%/*}"        # authority only
@@ -270,7 +270,7 @@ if [ -n "${key_secret}" ]; then
     sleep 5
   done
   check_contains "${out}" "uid=1000" "ssh key-auth login over the Gateway as uid 1000"
-  check_contains "${out}" "home=/home/jovyan" "ssh login HOME=/home/jovyan"
+  check_contains "${out}" "home=/home/ubuntu" "ssh login HOME=/home/ubuntu"
 else
   bad "status.sshClientKeySecret is empty — no login key to authenticate with"
 fi
