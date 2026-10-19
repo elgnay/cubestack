@@ -15,8 +15,8 @@ permissions: {}
 
 # One job per image, chosen by the rule both workflows ask
 # (images/hack/changed-images.sh), because the images are independent: no Dockerfile
-# reads across them, so a merge that changes only images/jupyter/** cannot change what is
-# in the MACA pair. Running one job for several images made every such merge pull the
+# reads across them, so a merge that changes only images/ubuntu/** cannot change what is
+# in the MACA image. Running one job for several images made every such merge pull the
 # 10.5 GiB vendor base on its way to publishing images it could not have altered.
 #
 # Which images those are is the selection, and the selection is the matrix below: an
@@ -95,8 +95,8 @@ jobs:
         uses: ./.github/actions/resolve-release-version
       - name: Reclaim disk space
         # The vendor images are why this step exists: each unpacks to tens of GB against
-        # the ~31 GB a standard runner has free on /. The CPU pair is a fraction of that
-        # (ssh-ubuntu22.04 measures 132 MB), so its legs skip the 1m41s.
+        # the ~31 GB a standard runner has free on /. The CPU image is a fraction of that
+        # (`ubuntu` measures well under a gigabyte), so its leg skips the 1m41s.
         if: ${{ matrix.vendor }}
         uses: ./.github/actions/reclaim-disk
       - name: Smoke the image before publishing it
@@ -126,7 +126,7 @@ jobs:
           docker builder prune -af
           df -h /
       - name: Set up QEMU
-        # PLATFORMS is linux/amd64 plus linux/arm64, so for the CPU pair one of the two is
+        # PLATFORMS is linux/amd64 plus linux/arm64, so for the CPU image one of the two is
         # not the runner's own architecture and has to be emulated for the build to
         # finish. The vendor images build MACA_PLATFORM alone — linux/amd64, the runner's
         # own — so they need it not at all.
@@ -134,7 +134,7 @@ jobs:
         uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - name: Set up Buildx
         # A runner's default driver is `docker`, which builds for a single platform, so
-        # the CPU pair needs the container driver this installs to build its amd64+arm64
+        # the CPU image needs the container driver this installs to build its amd64+arm64
         # index. A vendor leg keeps the default driver deliberately: MACA_PLATFORM is one
         # platform — the runner's own — so the container driver would buy nothing, and it
         # would cost a second copy of the base on the runner, since it builds in a store

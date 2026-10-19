@@ -120,13 +120,15 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       # One leg per base image, from the rule: `smoke-groups-json` is the selection `smoke`
-      # names, partitioned by the base each image is built on. The two images of one base
-      # resolve the same base layers, so one leg builds both and unpacks that base once,
-      # where a leg each would unpack it twice. Two *different* vendor bases never share a
-      # leg — MACA unpacks to ~33 GB and CUDA to ~38.6 GB, against the ~31 GB a standard
-      # runner has free on /, so one runner cannot hold both. A base the change did not
-      # reach has no entry and so no leg at all: a CUDA-only pull request schedules one job
-      # rather than three, and a shared path such as images/Makefile schedules all of them.
+      # names, partitioned by the base each image is built on. One image per base ships today,
+      # so that is one leg per image; the grouping is kept because the base is the axis a leg
+      # is *sized* on, and because two images of one base would resolve the same layers — one
+      # leg would build both and unpack that base once, where a leg each would unpack it
+      # twice. Two *different* vendor bases never share a leg — MACA unpacks to ~33 GB and
+      # CUDA to ~38.6 GB, against the ~31 GB a standard runner has free on /, so one runner
+      # cannot hold both. A base the change did not reach has no entry and so no leg at all: a
+      # CUDA-only pull request schedules one job rather than three, and a shared path such as
+      # images/Makefile schedules all of them.
       #
       # One base failing must not cancel the others, or an in-flight vendor leg — the same
       # reason ci-images.yml's publish matrix gives.
@@ -135,9 +137,10 @@ jobs:
         include: ${{ fromJSON(needs.changes.outputs.smoke-groups-json) }}
     # A smoke of the four images then shipping measured 17m02s on one runner, so this only ever
     # fires on something stuck. Each leg is now strictly smaller than the run that number came
-    # from, being at most the two images of one base, so the bound stays what it was: the job's
-    # release, not a deadline a leg should approach. A leg that did reach it is answered by
-    # sizing it off `vendor` here, not by a column in the rule.
+    # from, being one image today (and at most the images of one base if a base gains a second),
+    # so the bound stays what it was: the job's release, not a deadline a leg should approach. A
+    # leg that did reach it is answered by sizing it off `vendor` here, not by a column in the
+    # rule.
     timeout-minutes: 45
     steps:
       - name: Clone the code
@@ -146,9 +149,9 @@ jobs:
           persist-credentials: false
       - name: Reclaim disk space
         # The vendor bases are why this step exists, exactly as on a publishing leg. The CPU
-        # pair is a fraction of one (`ssh-ubuntu22.04` measures 132 MB), so its leg skips the
-        # 1m41s. `vendor` is the rule's, carried on the group it sized: one derivation, so a
-        # smoke leg and a publish leg cannot come out sized differently.
+        # image is a fraction of one (`ubuntu` measures well under a gigabyte), so its leg
+        # skips the 1m41s. `vendor` is the rule's, carried on the group it sized: one
+        # derivation, so a smoke leg and a publish leg cannot come out sized differently.
         if: ${{ matrix.vendor }}
         uses: ./.github/actions/reclaim-disk
       - name: Build and smoke the images this base group reaches
@@ -159,15 +162,15 @@ jobs:
         #
         # Only the images the change reaches are built, which is what keeps a CPU-only
         # pull request from paying for a vendor base at all; a change to images/common/**
-        # reaches all six, and does so across the three legs above rather than queued on
+        # reaches all three, and does so across the three legs above rather than queued on
         # one runner that could not hold two vendor bases at once.
         run: |
           set -euo pipefail
 
-          # One target per image rather than `smoke`, which builds all six: smoke.sh takes
+          # One target per image rather than `smoke`, which builds all three: smoke.sh takes
           # one image per invocation, so naming the targets is how a subset is asked for.
           # The names are the selector's vocabulary, which is the Makefile's
-          # (`make -C images smoke-ssh`), and `matrix.images` is that vocabulary for this
+          # (`make -C images smoke-ubuntu`), and `matrix.images` is that vocabulary for this
           # leg's base.
           targets=""
           for img in ${{ matrix.images }}; do

@@ -1,13 +1,18 @@
-# Cubestack 'jupyter-maca-pytorch' DevEnvironment image — Metax MACA GPU base.
+# Cubestack 'maca-pytorch' DevEnvironment image — the Metax family.
 #
-# Serves BOTH services from one container, like the CPU jupyter-minimal overlay: JupyterLab on
-# 8888 (the jupyter type's main port, which readiness probes) and sshd on the unprivileged 2222,
-# started only when the operator mounted the ssh host key (mode jupyter, common/entrypoint.sh).
+# Serves BOTH modes from one container, selected at run time by CUBSTACK_TYPE (which the
+# controller injects from spec.type, common/entrypoint.sh):
+#   jupyter  JupyterLab on 8888 (the jupyter type's main port, which readiness probes), plus
+#            sshd on the unprivileged 2222 when the operator mounted the ssh host key
+#   ssh      sshd alone on 2222, no notebook process
 #
-# Unlike that overlay this is not stock-native: the vendor base ships no launcher, no sshd, no
-# non-root account, and no ENTRYPOINT at all (config.User is unset, so it would run as root and
+# One image rather than two is what keeps the offline package small: the ssh sibling omitted the
+# JupyterLab pip step and baked a mode, which CUBSTACK_TYPE now states at run time.
+#
+# Unlike the CUDA family image this is not stock-native: the vendor base ships no launcher, no sshd,
+# no non-root account, and no ENTRYPOINT at all (config.User is unset, so it would run as root and
 # its CMD is a bare /bin/bash that exits immediately). So this Dockerfile adds the platform
-# layer the self-authored CPU image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
+# layer the ubuntu family image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
 # openssh-server, the shared entrypoint — on top of the vendor's own python/torch/MACA stack,
 # inherited as the base published it except for PATH, which the overlay corrects so that `python3`
 # is the interpreter that owns the vendor torch (see below). The account is not a preference: the
@@ -19,8 +24,8 @@
 #   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, directory mount)
 #
 # Build context MUST be images/ (not this directory) so common/ is COPYable.
-#   docker build --platform linux/amd64 -f jupyter-maca-pytorch/Dockerfile \
-#     -t harbor.isuanova.com/suanova/jupyter-maca-pytorch:<tag> images/
+#   docker build --platform linux/amd64 -f maca-pytorch/Dockerfile \
+#     -t harbor.isuanova.com/suanova/maca-pytorch:<tag> images/
 #   (or: make -C images build-maca)
 
 # The platform registry's mirrored copy of the vendor package, which is what a bare `docker build`
@@ -79,8 +84,8 @@ RUN set -eu; \
     if [ -n "$PIP_INDEX_URL" ]; then pip_args="--index-url $PIP_INDEX_URL"; fi; \
     python3 -m pip install --no-cache-dir $pip_args jupyterlab
 
-# Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the identity the
-# self-authored CPU image ships, so one account names both and a DevEnvironment states it once
+# Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the identity every family
+# image ships, so one account names them all and a DevEnvironment states it once
 # (spec.runtime.user: ubuntu). The workspace PVC mounts at the home, so nothing durable is baked
 # under it; ~/.ssh exists only so the account's own `ssh-copy-id` target exists when no PVC is
 # attached.
@@ -99,8 +104,8 @@ RUN rm -f /etc/ssh/ssh_host_* \
     && mkdir -p -m 0700 /run/sshd
 
 # The vendor base ships no launcher and no ENTRYPOINT, so the platform supplies both the
-# entrypoint and the jupyter launch chain it hands off to — the latter shared with the CUDA
-# jupyter image, common/jupyter/start-jupyter.sh.
+# entrypoint and the jupyter launch chain it hands off to — the latter shared with the other two
+# family images, common/jupyter/start-jupyter.sh.
 COPY common/entrypoint.sh /usr/local/bin/cubestack-entrypoint.sh
 COPY common/jupyter/start-jupyter.sh /usr/local/bin/start-jupyter.sh
 # Shared sshd config (common/), installed by the script that also owns its placeholders: this

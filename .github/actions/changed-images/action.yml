@@ -101,15 +101,15 @@ runs:
         # those jobs expand from: an image the change did not reach has no job at all
         # rather than a skipped one, and so claims no concurrency group and no runner. The
         # per-leg settings come along as keys, because a matrix keyed by image name alone
-        # could not say which legs are the vendor pair — and an `include` in the workflow
+        # could not say which legs are vendor legs — and an `include` in the workflow
         # cannot add it either: an entry merges into the combination whose keys it matches
         # and is appended as a new one otherwise, so a per-image entry duplicates its own
         # leg.
         #
         # `vendor` is what sizes a leg: the disk reclaim and the long timeout belong to the
         # images built on a vendor base, which unpack to tens of GB each against the ~31 GB
-        # a standard runner has free on /, where the CPU pair is a fraction of that
-        # (`ssh-ubuntu22.04` measures 132 MB).
+        # a standard runner has free on /, where the CPU image is a fraction of that
+        # (`ubuntu` measures well under a gigabyte).
         #
         # Asked of the rule rather than compiled in here. `vendor` is exactly "this image is
         # not built on the CPU base", which the rule already holds in the same row that names

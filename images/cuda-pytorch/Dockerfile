@@ -1,16 +1,21 @@
-# Cubestack 'jupyter-cuda-pytorch' DevEnvironment image — NVIDIA NGC PyTorch base.
+# Cubestack 'cuda-pytorch' DevEnvironment image — the NVIDIA family.
 #
-# Serves BOTH services from one container, like the CPU jupyter-minimal overlay: JupyterLab on
-# 8888 (the jupyter type's main port, which readiness probes) and sshd on the unprivileged 2222,
-# started only when the operator mounted the ssh host key (mode jupyter, common/entrypoint.sh).
+# Serves BOTH modes from one container, selected at run time by CUBSTACK_TYPE (which the
+# controller injects from spec.type, common/entrypoint.sh):
+#   jupyter  JupyterLab on 8888 (the jupyter type's main port, which readiness probes), plus
+#            sshd on the unprivileged 2222 when the operator mounted the ssh host key
+#   ssh      sshd alone on 2222, no notebook process
+#
+# One image rather than two is what keeps the offline package small: the ssh sibling added
+# nothing but a baked mode, which CUBSTACK_TYPE now states at run time.
 #
 # Unlike the MACA overlay, this one is thin: the base is not a bare vendor SDK but NVIDIA's own
 # PyTorch image, which already ships the interpreter, the framework, JupyterLab and the account
 # the platform's contract names. What it adds is the platform layer — openssh-server, the shared
-# entrypoint and sshd drop-in, the shared jupyter launcher, and the baked CUBESTACK_IMAGE:
+# entrypoint and sshd drop-in, the shared jupyter launcher, and the default mode:
 #
 #   the account       uid/gid 1000 'ubuntu', home /home/ubuntu. Inherited, not created: it is
-#                     exactly the self-authored family's identity, so the Dockerfile must NOT
+#                     exactly the identity every family image ships, so the Dockerfile must NOT
 #                     useradd over it (groupadd would fail on the GID it already holds).
 #   the interpreter   one python 3.12 at /usr/bin/python3, with torch in its dist-packages and
 #                     /usr/local/bin/jupyter shebanged to it. No second interpreter, so no PATH
@@ -32,8 +37,8 @@
 #   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, directory mount)
 #
 # Build context MUST be images/ (not this directory) so common/ is COPYable.
-#   docker build --platform linux/amd64 -f jupyter-cuda-pytorch/Dockerfile \
-#     -t harbor.isuanova.com/suanova/jupyter-cuda-pytorch:<tag> images/
+#   docker build --platform linux/amd64 -f cuda-pytorch/Dockerfile \
+#     -t harbor.isuanova.com/suanova/cuda-pytorch:<tag> images/
 #   (or: make -C images build-cuda)
 
 # The platform registry's mirrored copy of the vendor image, which is what a bare `docker build`
@@ -49,7 +54,7 @@ FROM ${CUDA_BASE}
 USER root
 
 # Optional apt mirror override for CN/offline builds; empty = upstream. No PIP_INDEX_URL, unlike
-# the CPU jupyter image: this overlay installs nothing from pip — JupyterLab here is the base's.
+# the ubuntu family: this overlay installs nothing from pip — JupyterLab here is the base's.
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i -E "s#https?://(archive|ports)\.ubuntu\.com/(ubuntu|ubuntu-ports)#${APT_MIRROR}#g" \
