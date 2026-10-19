@@ -32,7 +32,7 @@ import {
   TextField,
   Typography,
 } from "@mui/material";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 
 import type { DevEnvironmentSummary } from "@/app/api/devenvironments/route";
 import type { DevEnvImageOption, DevEnvOptionsResponse } from "@/app/api/devenvironments/options/route";
@@ -857,7 +857,7 @@ function Card({ title, meta, children }: { title: string; meta?: string; childre
   );
 }
 
-function Kvs({ rows }: { rows: Array<[string, string]> }) {
+function Kvs({ rows }: { rows: Array<[string, ReactNode]> }) {
   return (
     // Two columns of rows, filled left to right: with the card this wide a single
     // column would set every value the width of the table away from its label.
@@ -886,7 +886,7 @@ function Kvs({ rows }: { rows: Array<[string, string]> }) {
           }}
         >
           <Box component="span" sx={{ color: "text.secondary", flex: "none" }}>{k}</Box>
-          <Box component="span" sx={{ fontFamily: "var(--font-mono)", fontSize: 12, textAlign: "right", overflowWrap: "anywhere" }}>{v}</Box>
+          <Box component="span" sx={{ fontFamily: "var(--font-mono)", fontSize: 12, textAlign: "right", overflowWrap: "anywhere", whiteSpace: "pre-line" }}>{v}</Box>
         </Box>
       ))}
     </Box>
@@ -992,9 +992,9 @@ function EndpointRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-// Twelve bullets, whatever the token's length: the mask says "there is a secret
+// Twelve bullets, whatever the value's length: the mask says "there is a secret
 // here" and says nothing about how long it is.
-const TOKEN_MASK = "•".repeat(12);
+const SECRET_MASK = "•".repeat(12);
 
 function EyeIcon({ open }: { open: boolean }) {
   return (
@@ -1070,7 +1070,7 @@ function TokenRow({
       <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px" }}>{t("dev.conn.token")}</Typography>
       <Box sx={CONN_ROW_SX}>
         <Box component="span" data-od-id="token-value" sx={{ ...CONN_VALUE_SX, color: error ? STATUS_ERR : "text.secondary" }}>
-          {error ?? (revealed && token !== null ? token : TOKEN_MASK)}
+          {error ?? (revealed && token !== null ? token : SECRET_MASK)}
         </Box>
         <IconButton
           data-od-id="token-toggle"
@@ -1110,37 +1110,174 @@ function sshParts(address: string): { user: string; host: string; port: string }
   return { user: m[1], host: m[2].replace(/^\[|\]$/g, ""), port: m[3] };
 }
 
-// The private half of the keypair the operator minted for the environment:
-// the file the user runs `ssh -i id_ed25519 user@host -p port` with. A plain
-// download link — the session cookie authorizes the route, and the Secret the
-// key comes from is derived server-side from the environment's own status, so
-// the href cannot be turned into a read of an arbitrary Secret.
-function SshKeyRow({ name, namespace, address }: { name: string; namespace: string; address: string }) {
-  const { t } = useI18n();
-  const parts = sshParts(address);
+// A value as a POSIX shell single-quoted word. A minted key is base64 PEM and
+// never holds a quote, but a hand-edited Secret could, so a quote is closed,
+// escaped and reopened rather than trusted.
+const shQuote = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
+
+// One command the user can paste into a shell: it writes the key to a private
+// temporary file, logs in with it, and removes the file on the way out, so the
+// key never has to be saved first. `printf '%s\n'` rather than echo: the key is
+// carried verbatim, and echo's handling of backslashes varies between shells.
+// The whole sequence runs in a subshell: the pasted line lands in the user's
+// interactive shell, and a bare `exit` would close it — on a failed login too,
+// before the error could be read — and would leave `tmp`/`rc` set.
+function sshCommand(key: string, parts: { user: string; host: string; port: string }): string {
   return (
-    <Box>
-      <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px" }}>{t("dev.conn.sshKey")}</Typography>
-      <Box sx={CONN_ROW_SX}>
-        {/* A plain link, not a fetch: the session cookie authorizes the route
-            and the browser saves the file. The base path is the deployment's,
-            so the href goes through withBasePath as every hand-addressed URL does. */}
-        <Box
-          component="a"
-          data-od-id="ssh-key-download"
-          href={withBasePath(`/api/devenvironments/ssh-key?namespace=${encodeURIComponent(namespace)}&name=${encodeURIComponent(name)}`)}
-          sx={{ ...CONN_VALUE_SX, color: "var(--accent-strong)", textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
-        >
-          {t("dev.conn.sshKeyDownload")}
+    `(tmp=$(mktemp) && chmod 600 "$tmp" && printf '%s\\n' ${shQuote(key)} > "$tmp" && ` +
+    `ssh -i "$tmp" -p ${parts.port} ${shQuote(`${parts.user}@${parts.host}`)}; ` +
+    `rc=$?; rm -f "$tmp"; exit "$rc")`
+  );
+}
+
+// The SSH endpoint and the private half of the keypair the operator minted for
+// it, in one block: the address, then the two ways to reach it with the key. The
+// download is a plain link — the session cookie authorizes the route, and the
+// Secret the key comes from is derived server-side from the environment's own
+// status, so the href cannot be turned into a read of an arbitrary Secret.
+//
+// The second shape is one paste-ready command that embeds the key and cleans up
+// after itself, for the user who has nowhere to keep a file. It is fetched only
+// when asked for, and masked until then like the token: the line contains the
+// key, so the card treats it as part of the credential.
+function SshKeyRow({
+  name,
+  namespace,
+  address,
+  label,
+}: {
+  name: string;
+  namespace: string;
+  address: string;
+  label: string;
+}) {
+  const { t } = useI18n();
+  const [command, setCommand] = useState<string | null>(null);
+  const [revealed, setRevealed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const parts = sshParts(address);
+  // The command the downloaded key is used with: the file is the fixed target of
+  // the download above, so only user, host and port vary.
+  const login = parts
+    ? t("dev.conn.sshLoginCommand", { user: parts.user, host: parts.host, port: parts.port })
+    : address;
+
+  const load = async (): Promise<string | null> => {
+    if (command !== null) return command;
+    const target = sshParts(address);
+    if (!target) return null;
+    setBusy(true);
+    try {
+      const res = await apiFetch(
+        `/api/devenvironments/ssh-key?namespace=${encodeURIComponent(namespace)}&name=${encodeURIComponent(name)}`,
+      );
+      if (!res.ok) {
+        const body = (await res.json().catch(() => ({}))) as ValidationErrorBody;
+        setError(validationMessage(t, body, res.status, "dev"));
+        return null;
+      }
+      const built = sshCommand(await res.text(), target);
+      setCommand(built);
+      setError(null);
+      return built;
+    } catch {
+      // The route's own sentence for this: from the user's side a request that
+      // never arrived and a read that failed are the same thing to retry.
+      setError(t("dev.err.keyUnreadable"));
+      return null;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    // The card's own grid is two columns; this block spans both and lays its
+    // two halves out the same way, so the endpoint and the command that logs in
+    // with it sit side by side rather than stacked.
+    <Box sx={{ gridColumn: { lg: "1 / -1" } }}>
+      <Box
+        sx={{
+          display: "grid",
+          gridTemplateColumns: { xs: "1fr", lg: "repeat(2, minmax(0, 1fr))" },
+          columnGap: "28px",
+          rowGap: "14px",
+          alignItems: "start",
+        }}
+      >
+        <Box>
+          <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px", textTransform: "uppercase" }}>{label}</Typography>
+          <Box sx={CONN_ROW_SX}>
+            {/* The command and the key that opens it belong on one line: the user
+                arrived here to log in, and the link beside it is how they get the
+                key that command names. */}
+            <Box component="span" data-od-id="ssh-endpoint" sx={CONN_VALUE_SX}>{login}</Box>
+            {/* A plain link, not a fetch: the session cookie authorizes the route
+                and the browser saves the file. The base path is the deployment's,
+                so the href goes through withBasePath as every hand-addressed URL does. */}
+            <Box
+              component="a"
+              data-od-id="ssh-key-download"
+              href={withBasePath(`/api/devenvironments/ssh-key?namespace=${encodeURIComponent(namespace)}&name=${encodeURIComponent(name)}`)}
+              sx={{ flex: "none", color: "var(--accent-strong)", textDecoration: "none", "&:hover": { textDecoration: "underline" } }}
+            >
+              {t("dev.conn.sshKeyDownload")}
+            </Box>
+            <CopyButton value={login} />
+          </Box>
+          {/* Stated when the endpoint could be read: without user/host/port the
+              command is a guess, and a guess in a credential card is worse than
+              none. chmod first — ssh refuses a key any other local user can read. */}
+          {parts ? (
+            <Typography data-od-id="ssh-key-hint" sx={{ fontSize: 11, color: "text.secondary", mt: "6px" }}>
+              {t("dev.conn.sshKeyHint")}
+            </Typography>
+          ) : null}
         </Box>
+        {/* The same key without the download step. */}
+        {parts ? (
+          <Box>
+            <Typography sx={{ fontSize: 11, color: "text.secondary", mb: "8px" }}>{t("dev.conn.sshCommand")}</Typography>
+            <Box sx={CONN_ROW_SX}>
+              <Box
+                component="span"
+                data-od-id="ssh-command-value"
+                sx={{
+                  ...CONN_VALUE_SX,
+                  color: error ? STATUS_ERR : "text.secondary",
+                  // The key makes this several lines; they wrap inside the row
+                  // rather than stretching the card.
+                  whiteSpace: "pre-wrap",
+                  overflowWrap: "anywhere",
+                  maxHeight: 140,
+                  overflowY: "auto",
+                }}
+              >
+                {error ?? (revealed && command !== null ? command : SECRET_MASK)}
+              </Box>
+              <IconButton
+                data-od-id="ssh-command-toggle"
+                aria-label={revealed ? t("dev.conn.sshCommandHide") : t("dev.conn.sshCommandReveal")}
+                aria-pressed={revealed}
+                disabled={busy}
+                onClick={async () => {
+                  if (revealed) {
+                    setRevealed(false);
+                    return;
+                  }
+                  // The mask stays if the key could not be read: the row says why.
+                  if (command === null && (await load()) === null) return;
+                  setRevealed(true);
+                }}
+                sx={{ p: 0, width: 20, height: 20, color: "var(--accent-strong)", "&:hover": { background: "transparent" } }}
+              >
+                <EyeIcon open={revealed} />
+              </IconButton>
+              <CopyButton value={load} />
+            </Box>
+          </Box>
+        ) : null}
       </Box>
-      {/* Stated when the endpoint could be read: without it the command is a
-          guess, and a guess in a credential card is worse than none. */}
-      {parts ? (
-        <Typography data-od-id="ssh-key-hint" sx={{ fontSize: 11, color: "text.secondary", mt: "6px" }}>
-          {t("dev.conn.sshKeyHint", { user: parts.user, host: parts.host, port: parts.port })}
-        </Typography>
-      ) : null}
     </Box>
   );
 }
@@ -1165,9 +1302,14 @@ function ConnectionCard({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: Dev
             alignItems: "start",
           }}
         >
-          {e.endpoints.map((ep) => (
-            <EndpointRow key={ep.name} label={ep.name} value={ep.address} />
-          ))}
+          {/* The ssh endpoint and its key are one block, so the generic endpoint
+              row stands aside when the key row renders: two boxes would say the
+              same address twice. */}
+          {e.endpoints
+            .filter((ep) => !(e.sshClientKeySecret && sshEndpoint && ep.name === sshEndpoint.name))
+            .map((ep) => (
+              <EndpointRow key={ep.name} label={ep.name} value={ep.address} />
+            ))}
           {/* Reaching a jupyter environment needs its token, so the card carries
               the token itself — masked until asked for, read from the Secret the
               environment's own status names. */}
@@ -1182,7 +1324,13 @@ function ConnectionCard({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: Dev
               name, and only for environments the user did not key with their
               own — so its presence is what earns the download row. */}
           {e.sshClientKeySecret && sshEndpoint ? (
-            <SshKeyRow key={`${e.namespace}/${e.name}-ssh-key`} name={e.name} namespace={e.namespace} address={sshEndpoint.address} />
+            <SshKeyRow
+              key={`${e.namespace}/${e.name}-ssh-key`}
+              name={e.name}
+              namespace={e.namespace}
+              address={sshEndpoint.address}
+              label={sshEndpoint.name}
+            />
           ) : null}
         </Box>
         {/* Said only when it is true of this environment: the idle clause used to
@@ -1227,7 +1375,7 @@ function ConnectionCard({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: Dev
 function SpecCard({ e }: { e: DevEnvironmentSummary }) {
   const { t } = useI18n();
   const gpu = e.resources.gpu;
-  const rows: Array<[string, string]> = [
+  const rows: Array<[string, ReactNode]> = [
     [t("dev.spec.type"), e.type],
     [t("dev.spec.image"), e.image],
     [t("dev.spec.gpu"), gpu ? `${gpu.count} × ${gpu.vendor}${gpu.model ? ` · ${gpu.model}` : ""}` : t("dev.gpu.none")],
@@ -1272,7 +1420,12 @@ function SpecCard({ e }: { e: DevEnvironmentSummary }) {
         .join(" · "),
     ]);
   }
-  if (e.envNames.length) rows.push([t("dev.spec.env"), e.envNames.join(" · ")]);
+  if (e.env.length) {
+    // The variables themselves are one block per environment: the literal
+    // values are masked behind one reveal, because the list that produced this
+    // panel deliberately does not carry them.
+    rows.push([t("dev.spec.env"), <EnvValues key="env" e={e} />]);
+  }
   if (e.command.length) rows.push([t("dev.spec.command"), e.command.join(" ")]);
   if (e.args.length) rows.push([t("dev.spec.args"), e.args.join(" ")]);
   if (e.ports.length) rows.push([t("dev.spec.ports"), e.ports.map((p) => `${p.name}:${p.containerPort}/${p.type}`).join(" · ")]);
@@ -1284,6 +1437,89 @@ function SpecCard({ e }: { e: DevEnvironmentSummary }) {
     <Card title={t("dev.spec.title")} meta={t("dev.spec.meta")}>
       <Kvs rows={rows} />
     </Card>
+  );
+}
+
+/**
+ * spec.runtime.env, one variable per line, with literal values masked until the
+ * user asks for them.
+ *
+ * The environment list is cluster-wide and carries only names (and valueFrom
+ * sources): a literal value can be a credential, so it is fetched for this one
+ * environment on demand. A valueFrom is shown by its source — the value itself
+ * lives in a Secret or ConfigMap, not in the CR.
+ */
+function EnvValues({ e }: { e: DevEnvironmentSummary }) {
+  const { t } = useI18n();
+  const [values, setValues] = useState<Record<string, string> | null>(null);
+  const [revealed, setRevealed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  // Nothing to fetch when every entry is a reference: there are no literals.
+  const hasLiteral = e.env.some((v) => v.hasValue);
+
+  const load = async (): Promise<boolean> => {
+    if (values !== null) return true;
+    setBusy(true);
+    try {
+      const res = await apiFetch(
+        `/api/devenvironments/env-values?namespace=${encodeURIComponent(e.namespace)}&name=${encodeURIComponent(e.name)}`,
+      );
+      const body = (await res.json().catch(() => ({}))) as ValidationErrorBody & { values?: Record<string, string> };
+      if (!res.ok || !body.values) {
+        setError(validationMessage(t, body, res.status, "dev"));
+        return false;
+      }
+      setValues(body.values);
+      setError(null);
+      return true;
+    } catch {
+      setError(t("dev.err.envUnreadable"));
+      return false;
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Box sx={{ display: "flex", alignItems: "flex-start", justifyContent: "flex-end", gap: "8px", minWidth: 0 }}>
+      <Box sx={{ display: "grid", justifyItems: "end", gap: "2px", minWidth: 0 }}>
+        {error ? (
+          <Box component="span" data-od-id="env-values-error" sx={{ color: STATUS_ERR }}>{error}</Box>
+        ) : null}
+        <Box component="span" data-od-id="env-values" sx={{ whiteSpace: "pre-line", overflowWrap: "anywhere", textAlign: "right" }}>
+          {e.env
+            .map((v) => {
+              if (v.valueFrom) return `${v.name} → ${v.valueFrom}`;
+              // A literal is masked until asked for; an entry with no value and
+              // no source is an empty value, not a dangling arrow.
+              const value = revealed && values ? values[v.name] : undefined;
+              return `${v.name}=${value ?? (v.hasValue ? SECRET_MASK : "")}`;
+            })
+            .join("\n")}
+        </Box>
+      </Box>
+      {hasLiteral ? (
+        <IconButton
+          data-od-id="env-values-toggle"
+          aria-label={revealed ? t("dev.spec.envHide") : t("dev.spec.envReveal")}
+          aria-pressed={revealed}
+          disabled={busy}
+          onClick={async () => {
+            if (revealed) {
+              setRevealed(false);
+              return;
+            }
+            // The mask stays if the values could not be read: the row says why.
+            if (values === null && !(await load())) return;
+            setRevealed(true);
+          }}
+          sx={{ p: 0, width: 20, height: 20, color: "var(--accent-strong)", "&:hover": { background: "transparent" } }}
+        >
+          <EyeIcon open={revealed} />
+        </IconButton>
+      ) : null}
+    </Box>
   );
 }
 
@@ -1311,7 +1547,16 @@ function StatusCard({ e }: { e: DevEnvironmentSummary }) {
             // Green only for an observed True condition; False (a real failure
             // or an expected non-ready state like a stopped Ready) and Unknown
             // (pending) get distinct non-success styling.
-            const cls = c.status === "True" ? "ok" : c.status === "Unknown" ? "pending" : "err";
+            // Progressing is inverted: False means the controller has nothing
+            // in flight — the settled, healthy state — so it reads as success.
+            const cls =
+              c.type === "Progressing" && c.status === "False"
+                ? "ok"
+                : c.status === "True"
+                  ? "ok"
+                  : c.status === "Unknown"
+                    ? "pending"
+                    : "err";
             const [chip, dot] =
               cls === "ok"
                 ? [STATUS_OK, STATUS_OK]
