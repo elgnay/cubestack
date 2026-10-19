@@ -466,15 +466,7 @@ func describeAccepted() {
 							// room for, which is the difference between a user
 							// knowing to lower the request and being told to try
 							// again.
-							pod, err := env.Pod(ctx)
-							Expect(err).NotTo(HaveOccurred())
-							cond := podCondition(pod, corev1.PodScheduled)
-							Expect(cond).NotTo(BeNil(),
-								"the pod records no PodScheduled condition, so nothing anywhere says why it is stuck")
-							Expect(cond.Reason).To(Equal(corev1.PodReasonUnschedulable),
-								"the scheduler's reason for refusing the pod: %s", cond.Message)
-							Expect(cond.Message).To(ContainSubstring("Insufficient"),
-								"the scheduler's message has to name what it could not find: %q", cond.Message)
+							schedulerRefusal(ctx, env)
 						})
 				},
 			}.declare()
