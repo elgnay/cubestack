@@ -111,9 +111,16 @@ type Preflight struct {
 	Client client.Client
 	Dialer Dialer
 	// PullSecretNamespace and PullSecretName are checked for presence only; the
-	// copy into the run's namespace is Setup's job.
+	// copy into the run's namespace is Setup's job. PullSecretName is empty when
+	// the images are already on the nodes, and then there is no credential to
+	// check for.
 	PullSecretNamespace string
 	PullSecretName      string
+	// AllowKind admits a kind cluster. False is the default because the guard it
+	// disables exists to catch DEVENV_E2E left set on the kind path, where it
+	// would silently misdirect the run at a cluster that path is about to
+	// rebuild.
+	AllowKind bool
 	// NeededPorts is how many L4 ports this selection will hold at once, which is
 	// what the pool check measures against.
 	NeededPorts int
@@ -150,13 +157,17 @@ func (p Preflight) Run(ctx context.Context) (Cluster, []Result) {
 
 // --- each check ---------------------------------------------------------------
 
-// checkContext refuses a kind cluster.
+// checkContext refuses a kind cluster unless the run allowed one.
 //
 // This is the guard against the one way the conformance mode can be entered by
 // accident: `DEVENV_E2E=1` left set while running the existing kind path. That
 // would skip the cluster build and point the kind specs at whatever KUBECONFIG
 // holds — a silent misdirection, and an expensive one, because the existing
 // specs deploy a manager and expect to have made the cluster themselves.
+//
+// A run CI drives against the kind cluster it just built sets AllowKind, and the
+// detail says so: a reader of the report should be able to tell an admission
+// from the absence of a check.
 func (p Preflight) checkContext() Result {
 	const name = "cluster identity"
 	current, err := CurrentContext()
@@ -164,10 +175,15 @@ func (p Preflight) checkContext() Result {
 		return Result{Name: name, Err: err}
 	}
 	if strings.HasPrefix(current, "kind-") {
+		if p.AllowKind {
+			return Result{Name: name, Detail: "context " + current + " (kind, allowed by DEVENV_E2E_ALLOW_KIND)"}
+		}
 		return Result{
 			Name: name,
 			Err: fmt.Errorf("context %q is a kind cluster; this suite runs against an existing "+
-				"cluster and DEVENV_E2E=1 must not be set on the kind path", current),
+				"cluster and DEVENV_E2E=1 must not be set on the kind path (set "+
+				"DEVENV_E2E_ALLOW_KIND=1 only to admit the kind cluster a CI job built for this run)",
+				current),
 		}
 	}
 	return Result{Name: name, Detail: "context " + current}
@@ -461,8 +477,14 @@ func (p Preflight) checkStorage(ctx context.Context) Result {
 // job, and it either did them or said why not. This check exists so that a run
 // whose images will never pull says so once, in the preflight, rather than as
 // twelve ImagePullBackOff failures that read as image findings.
+//
+// A run whose images are already on the nodes has no credential and no secret to
+// read; it passes with a detail that says which of the two this was.
 func (p Preflight) checkPullCredential(ctx context.Context) Result {
 	const name = "pull credential"
+	if p.PullSecretName == "" {
+		return Result{Name: name, Detail: "none (the images are on the nodes)"}
+	}
 	var s corev1.Secret
 	key := client.ObjectKey{Namespace: p.PullSecretNamespace, Name: p.PullSecretName}
 	if err := p.Client.Get(ctx, key, &s); err != nil {

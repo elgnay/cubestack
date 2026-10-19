@@ -543,6 +543,57 @@ helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and S
 	KIND_CLUSTER_HELM="$(KIND_CLUSTER_HELM)" KUBECTL="$(KUBECTL)" DEV_ENV_IMAGE="$(DEV_ENV_IMAGE)" \
 		hack/verify-devenv.sh
 
+# The conformance suite's CPU selection by label. It is the whole matrix minus the
+# four vendor rows (test/e2e/devenv_conformance_test.go's `environments`), so every
+# environment it brings up runs the one image helm-e2e-images-load put on the node.
+# A new vendor row has to be added here too. A row that leaks fails loudly rather
+# than silently: its image is not on the node, so the pull fails and the
+# environment never starts.
+#
+# The two cases elsewhere that name a vendor image — E1 and N4 — are not excluded
+# by this: E1 is refused before a workload is rendered and N4's pod is
+# unschedulable, so neither pulls.
+#
+# One line, because Ginkgo's tokenizer skips spaces but not a newline: a
+# backslash continuation would put one inside the filter.
+DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-base-ssh && !image:maca-base-jupyter && !image:cube-base-ssh && !image:cube-base-jupyter
+# go test's hard stop for that selection, and how long one environment gets to
+# reach Running. The latter is well under the suite's 20m default because the
+# image is on the node: past a few seconds, a bring-up that is still going is
+# stuck rather than pulling.
+DEVENV_E2E_CPU_TIMEOUT      ?= 60m
+DEVENV_E2E_CPU_UP_TIMEOUT   ?= 6m
+# The registry the suite composes image references from, read out of DEV_ENV_IMAGE
+# so the suite and verify-devenv.sh cannot point at different registries. The
+# repository and tag are the suite's own catalogue: only the host is shared.
+DEV_ENV_IMAGE_REGISTRY ?= $(firstword $(subst /, ,$(DEV_ENV_IMAGE)))
+
+# Takes no prerequisites, like helm-e2e-devenv-verify and helm-e2e-crd-check: it
+# asserts against the cluster a previous target built. DEVENV_E2E_TAG is what
+# makes Image.Ref() name the loaded copy, and a non-latest tag is also what makes
+# Kubernetes default imagePullPolicy to IfNotPresent — so the node's copy is used
+# without a registry round trip. Together with DEVENV_E2E_PRELOADED_IMAGES there
+# is no credential to copy, which is why no Secret has to exist in the cluster.
+#
+# KUBECONFIG is the kind cluster's own, not the ambient one: every other helm-e2e
+# target names its cluster with --context, and the suite reads the current context
+# rather than taking one, so a kubeconfig is how it is pointed at the same place.
+# Without this the target would run against whichever cluster the caller happens
+# to be on.
+.PHONY: helm-e2e-devenv-conformance
+helm-e2e-devenv-conformance: ## Run the CPU-image conformance cases against the helm-e2e kind cluster
+	@config=$$(mktemp); trap 'rm -f "$$config"' EXIT; \
+	$(KIND) get kubeconfig --name $(KIND_CLUSTER_HELM) >"$$config"; \
+	KUBECONFIG="$$config" \
+	DEVENV_E2E=1 \
+	DEVENV_E2E_ALLOW_KIND=1 \
+	DEVENV_E2E_PRELOADED_IMAGES=1 \
+	DEVENV_E2E_REGISTRY=$(DEV_ENV_IMAGE_REGISTRY) \
+	DEVENV_E2E_TAG=$(DEV_ENV_IMAGE_TAG) \
+	DEVENV_E2E_UP_TIMEOUT=$(DEVENV_E2E_CPU_UP_TIMEOUT) \
+		go test -tags=e2e ./test/e2e/ -v -timeout $(DEVENV_E2E_CPU_TIMEOUT) \
+		-ginkgo.label-filter='$(DEVENV_E2E_CPU_LABELS)'
+
 .PHONY: helm-e2e-uninstall
 helm-e2e-uninstall: ## Uninstall the helm release; CRDs intentionally remain
 	$(HELM_E2E_HELM) uninstall $(HELM_RELEASE) --namespace $(HELM_NAMESPACE)
@@ -553,12 +604,17 @@ helm-e2e-cleanup: ## Delete the dedicated kind cluster
 
 # ---- DevEnvironment conformance suite (an existing cluster, never one we build) ----
 #
-# Not a CI target and not to become one. The helm-e2e family above builds the
-# cluster its subject runs on; this one runs against a cluster someone else owns —
-# their Gateway, their L4 port pool, their storage class, their pulls — and
-# creates and destroys real environments in a real namespace. CI invokes targets
-# by name with no wildcard, so a target nothing references is inert, and this is
-# deliberately referenced by nothing.
+# Not a CI target. The helm-e2e family above builds the cluster its subject runs
+# on; this one runs against a cluster someone else owns — their Gateway, their L4
+# port pool, their storage class, their pulls — and creates and destroys real
+# environments in a real namespace. CI invokes targets by name with no wildcard,
+# so a target nothing references is inert, and this is deliberately referenced by
+# nothing.
+#
+# The CI-owned counterpart is helm-e2e-devenv-conformance above: the same suite,
+# the same specs, against the kind cluster the job built. The two are separate
+# targets because the cluster is — this one's preflight refuses a kind context,
+# and that one hands the suite the opt-ins a preloaded, self-built cluster needs.
 #
 #   make -C operator devenv-e2e KUBECONFIG=~/.kube/kubeconfig.cs3
 #   make -C operator devenv-e2e-list

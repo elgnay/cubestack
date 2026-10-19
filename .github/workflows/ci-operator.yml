@@ -207,6 +207,10 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
+    # The conformance step below is bounded by go test's own -timeout of 60m, which
+    # panics with a useful message; this is the job's release past that plus the
+    # ~7m of work before it, not a deadline the step should approach.
+    timeout-minutes: 90
     env:
       # The install target runs codegen locally so an edited tree is reflected
       # in the cluster. That is redundant here: generate-drift runs the same
@@ -250,6 +254,15 @@ jobs:
         working-directory: operator
       - name: Run the DevEnvironment happy-path verification
         run: make helm-e2e-devenv-verify
+        working-directory: operator
+      - name: Run the DevEnvironment conformance suite (CPU images)
+        # The suite the happy-path step above samples: every CPU-image case, against
+        # the same cluster. It runs the image helm-e2e-install loaded rather than a
+        # published one, and the step passes the suite the two opt-ins that say so —
+        # see helm-e2e-devenv-conformance in operator/Makefile. Not allowed to fail:
+        # the required `result` check aggregates this job.
+        timeout-minutes: 70
+        run: make helm-e2e-devenv-conformance
         working-directory: operator
       - name: Clean up the kind cluster
         if: always()

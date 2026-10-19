@@ -85,6 +85,7 @@ func setupDevEnvConformance() {
 		Dialer:              conformance.Dialer,
 		PullSecretNamespace: conformance.PlatformNamespace,
 		PullSecretName:      conformance.PullSecret,
+		AllowKind:           conformance.AllowKind,
 		NeededPorts:         peakPorts,
 	}
 	var results []devenv.Result

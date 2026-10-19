@@ -7,11 +7,13 @@
 // preconditions usable from a plain TestXxx or a one-off program and keeps the
 // assertion framework out of code that is otherwise all plumbing.
 //
-// The suite is opt-in and must stay that way. It runs against a cluster someone
-// else owns — their Gateway, their L4 port pool, their storage class, their image
-// pulls — and pulls images measured in tens of gigabytes. TestE2E filters
-// LabelConformance out unless the caller names a filter explicitly, so a run
-// that forgets one lands on the safe side.
+// The suite is opt-in and must stay that way. It creates real environments in a
+// cluster someone else owns — their Gateway, their L4 port pool, their storage
+// class, their pulls — or, with DEVENV_E2E_ALLOW_KIND and preloaded images, in
+// the kind cluster a CI job built for it, where the images it would otherwise
+// pull are already on the node. TestE2E filters LabelConformance out unless the
+// caller names a filter explicitly, so a run that forgets one lands on the safe
+// side.
 package devenv
 
 // LabelConformance is on every spec this suite contributes, and on nothing else
