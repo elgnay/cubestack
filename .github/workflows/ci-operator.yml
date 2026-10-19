@@ -235,10 +235,11 @@ jobs:
         # builds and the init image pull). ~160s of this step needs no cluster at all,
         # and the two are joined by helm-e2e-images-load, which waits for both before
         # loading anything — so nothing loads into a cluster that is still being
-        # created. The environment's own image is not among them: its pod pulls
-        # minimal:latest from the platform registry at start. The codegen
-        # targets whose parallel execution would be unsafe are already off in this job
-        # (HELM_E2E_CODEGEN=0).
+        # created. The environment's own image is built from this commit by
+        # helm-e2e-images and loaded beside them: it is not pulled, because a rename or
+        # any other change in the commit under test has no published reference to pull
+        # until the merge that publishes it. The codegen targets whose parallel
+        # execution would be unsafe are already off in this job (HELM_E2E_CODEGEN=0).
         run: make helm-e2e-install -j2
         working-directory: operator
       - name: Verify CRDs, VAPs and RBAC

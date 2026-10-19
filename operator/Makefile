@@ -173,18 +173,25 @@ HELM_CHART_DIR ?= helm/cubestack-controller-manager-chart
 ECHO_IMG ?= example.com/cubestack-e2e-echo:v0.0.1
 HELM_RELEASE ?= cubestack
 # --- DevEnvironment image the e2e environment runs ---
-# The published image, which the pod pulls itself: nothing in this flow pulls,
-# re-tags or loads it. So the e2e exercises the artifact a deployment gets — the
-# same reference, over the same pull path, with no pre-staged copy standing in
-# for it and no build from this tree that could drift from what ships.
+# Built from this tree by helm-e2e-images and loaded into the kind node, rather
+# than pulled: an image renamed or changed in the commit under test has no
+# published reference to pull until the merge that publishes it, so pulling
+# would leave every pull request's e2e testing the previous release — or, after
+# a rename, nothing at all.
 #
-# The container carries no ImagePullPolicy and the CRD has no field for one, so
-# Kubernetes applies the default — Always for a :latest tag — and every container
-# start re-resolves the tag against the registry. That is what makes this work
-# without a pre-load, and it is why the kind node has to reach the platform
-# registry: it does so over the runner's docker network, the same route the
-# mirrored bases in helm-e2e-images are already pulled over.
-DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/minimal:latest
+# The tag is deliberately not `:latest`. The container carries no
+# ImagePullPolicy and the CRD has no field for one, so Kubernetes applies the
+# default — Always for `:latest`, IfNotPresent for any other tag — and only the
+# latter uses the loaded copy without a registry round trip.
+#
+# The published-artifact claim moves with it: that the reference a deployment
+# pulls exists is the images-smoke job's, which builds the same tree and asserts
+# its contract. This flow is about the operator serving an environment.
+DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/minimal:e2e
+# The tag images/Makefile builds the environment's image under. Kept apart from
+# DEV_ENV_IMAGE because that Makefile reads TAG for its own default reference,
+# which is overridden here by IMG_MINIMAL.
+DEV_ENV_IMAGE_TAG ?= e2e
 # The platform the kind node runs. A kind node matches the docker daemon's
 # architecture, which on an arm64 laptop is not the amd64 these images publish
 # as — and an image loaded for the wrong one fails at container start with an
@@ -358,7 +365,7 @@ helm-e2e-setup: ## Create the dedicated kind cluster for helm e2e if it does not
 # `helm-e2e-install -j2`. Serially the pair is still correct: this is an ordering that
 # permits overlap, not one that requires it.
 .PHONY: helm-e2e-images
-helm-e2e-images: ## Build the manager and echo images and pull the init container's image (needs a docker daemon, no cluster)
+helm-e2e-images: ## Build the manager, echo and environment images and pull the init container's image (needs a docker daemon, no cluster)
 	$(MAKE) docker-build IMG=$(HELM_E2E_IMG) \
 		BASE_ARGS="$(call base_arg,GOLANG_BASE) $(call base_arg,DISTROLESS_BASE)"
 	@if [ -f test/e2e/assets/echo/Dockerfile ]; then \
@@ -369,23 +376,20 @@ helm-e2e-images: ## Build the manager and echo images and pull the init containe
 	fi
 	# The init container's image is hardcoded in the controller, so the tag has to
 	# be the one it names; upstream busybox carries the same tag, so pulling the
-	# platform registry's copy needs no re-tagging. Unlike the environment's image
-	# this one is loaded, and that works because its tag is an immutable version
-	# rather than :latest: the default IfNotPresent policy then takes the local
-	# copy, so the init container starts with no registry round trip.
+	# platform registry's copy needs no re-tagging. Its tag is an immutable
+	# version rather than :latest, so the default IfNotPresent policy takes the
+	# local copy once it is loaded and the init container starts with no registry
+	# round trip.
 	@[ -n "$(PERMISSION_INIT_IMAGE)" ] || { echo "permissionInitImage not found in internal/controller/assets.go"; exit 1; } ; \
 	echo "Pulling $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
 	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)"
-	# What is deliberately absent above is the environment's image: the pod pulls
-	# it from the platform registry at start (see DEV_ENV_IMAGE). Only the minimal
-	# image is involved — the environment is a jupyter one, and the same image
-	# serves ssh from the controller's CUBSTACK_TYPE, since its entrypoint starts
-	# sshd when the operator mounts the ssh material; the vendor images are
-	# neither built nor pulled.
-	#
-	# A change under images/ is therefore not validated here; it is covered by
-	# `make -C images smoke` — the images-smoke job in ci-operator.yml — which builds
-	# all three families and asserts the same contract against them.
+	# The environment's own image, built from this tree (see DEV_ENV_IMAGE). Only
+	# the minimal image is involved — the environment is a jupyter one, and the
+	# same image serves ssh from the controller's CUBSTACK_TYPE, since its
+	# entrypoint starts sshd when the operator mounts the ssh material; the
+	# vendor images are neither built nor pulled.
+	$(MAKE) -C ../images build-minimal \
+		TAG=$(DEV_ENV_IMAGE_TAG) PLATFORM=$(DEV_ENV_PLATFORM) IMG_MINIMAL=$(DEV_ENV_IMAGE)
 
 .PHONY: helm-e2e-images-load
 helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulled images into the kind cluster
@@ -396,6 +400,7 @@ helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulle
 	fi
 	$(KIND) load docker-image $(HELM_E2E_IMG) --name $(KIND_CLUSTER_HELM)
 	$(KIND) load docker-image $(PERMISSION_INIT_IMAGE) --name $(KIND_CLUSTER_HELM)
+	$(KIND) load docker-image $(DEV_ENV_IMAGE) --name $(KIND_CLUSTER_HELM)
 
 # The codegen prerequisites below are for someone running this target against a
 # tree they just edited. CI already runs the same three targets — `generate-check`
