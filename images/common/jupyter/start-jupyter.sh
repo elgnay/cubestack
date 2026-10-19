@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Cubestack jupyter launch chain, shared by the two vendor (GPU) jupyter images: the Metax MACA
-# one and the NVIDIA CUDA one.
+# Cubestack jupyter launch chain, shared by all three family images: minimal, cube-base and
+# maca-base.
 #
 # This is the image CMD. common/entrypoint.sh has already started sshd when the operator mounted
-# the ssh host key, and hands off here (mode jupyter). Neither vendor base ships a launcher — the
-# MACA one has no jupyter at all, the CUDA one ships JupyterLab but no command that starts it — so
-# this is the platform's, and it stands in for docker-stacks' start.sh, which is what the CPU
-# jupyter image runs, because the controller injects the same two variables for both:
+# the ssh host key, and hands off here (mode jupyter). No base ships a usable launcher — the
+# ubuntu one has no notebook server at all, the MACA one has no jupyter, and the CUDA one ships
+# JupyterLab but no command that starts it — so this is the platform's. It replaces docker-stacks'
+# start.sh, which the retired CPU image ran. The controller injects the same two variables for
+# every family:
 #
 #   JUPYTER_TOKEN  the operator injects it (a secretKeyRef to <env>-jupyter-token) for every
 #                  jupyter-type environment, and jupyter-server reads that variable itself.
@@ -49,7 +50,7 @@ fi
 # prevent, one level down. A declared HOME is entered too, for the same reason it is served.
 #
 # No guard: a HOME that is not there is a root_dir that is not there, which the server refuses on
-# its own. The CPU image's launcher enters its home for the same reason (jupyter/start-jupyter.sh).
+# its own.
 cd "$HOME"
 
 # shellcheck disable=SC2086

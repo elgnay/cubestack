@@ -9,15 +9,9 @@
 # Re-include the shared runtime logic and the image directories.
 !common
 !common/**
-!ssh-ubuntu-server
-!ssh-ubuntu-server/**
-!jupyter
-!jupyter/**
-!jupyter-maca-pytorch
-!jupyter-maca-pytorch/**
-!ssh-maca-pytorch
-!ssh-maca-pytorch/**
-!jupyter-cuda-pytorch
-!jupyter-cuda-pytorch/**
-!ssh-cuda-pytorch
-!ssh-cuda-pytorch/**
+!minimal
+!minimal/**
+!maca-base
+!maca-base/**
+!cube-base
+!cube-base/**

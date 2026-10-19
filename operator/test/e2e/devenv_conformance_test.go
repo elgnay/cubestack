@@ -144,13 +144,17 @@ func teardownDevEnvConformance() {
 //
 // `:latest` under `imagePullPolicy: Always` is a moving target, and nothing this
 // suite can read knows what it ought to resolve to — so the claim worth making is
-// the weaker one that is still checkable: that one image key meant one artifact
-// for the whole run. Without it a `:latest` republished midway leaves the first
-// and last environments of a key running different software under one name, and
-// the run reports twelve green environments when it was two different things.
+// the weaker one that is still checkable: that one image reference meant one
+// artifact for the whole run. Without it a `:latest` republished midway leaves the
+// first and last environments of a reference running different software under one
+// name, and the run reports twelve green environments when it was two different
+// things.
 //
 // The report is by key and not by environment because that is the axis the
-// catalogue is asserted on: "ssh-cuda-pytorch was tested" is true of the key.
+// catalogue is asserted on: "cube-base-ssh was tested" is true of the key. The
+// conflict is judged by reference instead, because two keys — a family's SSH and
+// Jupyter rows — run the same image, and a digest that moved between them is one
+// name for two artifacts whether or not either key saw it twice.
 //
 // A plain function called from the suite's one AfterSuite rather than an
 // AfterSuite of its own, which Ginkgo allows only one of.
@@ -166,29 +170,40 @@ func reportDevEnvImageDigests() {
 	// ImageDigests is sorted by key and then digest, so each key's list is
 	// already in order and Compact leaves the distinct ones.
 	byKey := map[string][]string{}
+	byRef := map[string]map[string]struct{}{}
 	for _, d := range digests {
 		byKey[d.Key] = append(byKey[d.Key], d.Digest)
+		if byRef[d.Repo] == nil {
+			byRef[d.Repo] = map[string]struct{}{}
+		}
+		byRef[d.Repo][d.Digest] = struct{}{}
 	}
 	keys := make([]string, 0, len(byKey))
 	for k := range byKey {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
+	refs := make([]string, 0, len(byRef))
+	for r := range byRef {
+		refs = append(refs, r)
+	}
+	slices.Sort(refs)
 
 	var b strings.Builder
 	b.WriteString("\nimages this run ran:\n")
-	var conflicts []string
 	for _, k := range keys {
-		distinct := slices.Compact(byKey[k])
-		for i, d := range distinct {
+		for i, d := range slices.Compact(byKey[k]) {
 			label := ""
 			if i == 0 {
 				label = k
 			}
 			fmt.Fprintf(&b, "  %-22s %s\n", label, d)
 		}
-		if len(distinct) > 1 {
-			conflicts = append(conflicts, k)
+	}
+	var conflicts []string
+	for _, r := range refs {
+		if len(byRef[r]) > 1 {
+			conflicts = append(conflicts, r)
 		}
 	}
 	// stdout and not GinkgoWriter, which is buffered and emitted only for a failed
@@ -220,18 +235,18 @@ var environments = []struct {
 	image    devenv.Image
 	identity devenv.Identity
 }{
-	{devenv.MustImage("ssh-ubuntu22.04"), devenv.NonRoot}, // S1
-	{devenv.MustImage("ssh-ubuntu22.04"), devenv.Root},    // S2
-	{devenv.MustImage("jupyter-minimal"), devenv.NonRoot}, // J1, S3
-	{devenv.MustImage("jupyter-minimal"), devenv.Root},    // J2, S4
-	{devenv.MustImage("ssh-maca-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("ssh-maca-pytorch"), devenv.Root},
-	{devenv.MustImage("jupyter-maca-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("jupyter-maca-pytorch"), devenv.Root},
-	{devenv.MustImage("ssh-cuda-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("ssh-cuda-pytorch"), devenv.Root},
-	{devenv.MustImage("jupyter-cuda-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("jupyter-cuda-pytorch"), devenv.Root},
+	{devenv.MustImage("minimal-ssh"), devenv.NonRoot},     // S1
+	{devenv.MustImage("minimal-ssh"), devenv.Root},        // S2
+	{devenv.MustImage("minimal-jupyter"), devenv.NonRoot}, // J1, S3
+	{devenv.MustImage("minimal-jupyter"), devenv.Root},    // J2, S4
+	{devenv.MustImage("maca-base-ssh"), devenv.NonRoot},
+	{devenv.MustImage("maca-base-ssh"), devenv.Root},
+	{devenv.MustImage("maca-base-jupyter"), devenv.NonRoot},
+	{devenv.MustImage("maca-base-jupyter"), devenv.Root},
+	{devenv.MustImage("cube-base-ssh"), devenv.NonRoot},
+	{devenv.MustImage("cube-base-ssh"), devenv.Root},
+	{devenv.MustImage("cube-base-jupyter"), devenv.NonRoot},
+	{devenv.MustImage("cube-base-jupyter"), devenv.Root},
 }
 
 var _ = Describe("DevEnvironment conformance", Label(devenv.LabelConformance), Ordered, func() {
@@ -583,10 +598,10 @@ func describeRefusals(open func() *devenv.Environment, img devenv.Image, identit
 			// which only a root sshd can. A non-root sshd asks and gets nothing back
 			// (getspnam returns nothing to uid 1000), so the check is one more thing
 			// root mode turns on. The refusal is therefore the *account lock's* and not
-			// the platform's, and it holds for both the self-authored `ubuntu` and
-			// docker-stacks' `jovyan` because both are created by useradd. An image
-			// that unlocked its account would be served here, into a home the workspace
-			// claim does not cover in root mode; this case is what would say so.
+			// the platform's, and it holds for the `ubuntu` account every family image
+			// creates with useradd. An image that unlocked its account would be served
+			// here, into a home the workspace claim does not cover in root mode; this
+			// case is what would say so.
 			sess := sshReady(ctx, env)
 			_, err := sess.RunAs(ctx, img.Account, "true")
 			Expect(err).To(HaveOccurred(),

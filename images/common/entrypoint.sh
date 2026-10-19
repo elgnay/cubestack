@@ -2,8 +2,9 @@
 # Cubestack image entrypoint.
 #
 # The DevEnvironment controller never sets command/args, so this script decides
-# what a container runs. CUBESTACK_IMAGE is baked into each image at build time;
-# an optional CUBESTACK_TYPE (future platform mode injection) wins when present.
+# what a container runs. CUBESTACK_IMAGE is baked into each image at build time as
+# the standalone default; CUBSTACK_TYPE, which the controller injects from
+# spec.type, wins when present.
 #
 # sshd reads the operator's Secret mounts directly — there is no key staging. The
 # host key is a subPath mount, so it is frozen at container start; the authorized
@@ -12,15 +13,13 @@
 #
 # Modes:
 #   jupyter  start sshd only when the operator mounted the ssh Secret, then hand
-#            off to the image CMD (start-jupyter.sh in each jupyter image: the CPU
-#            one dispatches into docker-stacks' start.sh, and both vendor images run
-#            the shared common/jupyter one, which expands NOTEBOOK_ARGS into
-#            --ServerApp.base_url itself — neither vendor base starts jupyter at all,
-#            one shipping none and the other JupyterLab with no command to launch it).
+#            off to the image CMD (the shared common/jupyter/start-jupyter.sh in
+#            every family image, which expands NOTEBOOK_ARGS into
+#            --ServerApp.base_url itself — no base starts jupyter on its own).
 #   ssh      run sshd in the foreground.
 set -euo pipefail
 
-mode="${CUBESTACK_TYPE:-${CUBESTACK_IMAGE:-ssh}}"
+mode="${CUBSTACK_TYPE:-${CUBESTACK_IMAGE:-ssh}}"
 
 # The operator mounts the ssh Secret's host key here. Images ship no host keys of
 # their own, so the file's presence means ssh is enabled.

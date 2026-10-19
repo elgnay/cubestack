@@ -6,7 +6,7 @@ metadata:
 spec:
   # Core (flat) fields
   type: jupyter                # container type: jupyter / ssh / vscode
-  image: harbor.local/ai-images/base-cuda:11.8-pytorch2.2
+  image: harbor.local/ai-images/cube-base:26.08
   running: true                # desired running state
 
   # Compute / resources
@@ -14,9 +14,9 @@ spec:
     # gpu requests accelerators. It is the whole request: how many cards, of
     # which vendor, and optionally which of that vendor's models. Omit the block
     # entirely for a CPU-only environment — the pod then carries no GPU resource
-    # at all, and the image brand is not checked, which is how the CPU images
-    # (ssh-ubuntu22.04, jupyter-minimal) are used. There is no count of 0: an
-    # absent block is the only way to ask for none.
+    # at all, and the image brand is not checked, which is how the CPU-only
+    # environments on the minimal family image are used. There is no count of 0:
+    # an absent block is the only way to ask for none.
     gpu:
       vendor: nvidia             # nvidia (nvidia.com/gpu) / metax (metax-tech.com/gpu)
       count: 1                   # omit for the default of 1
@@ -148,12 +148,9 @@ spec:
   runtime:
     # The account the container runs as — the one the image's sshd serves, and the
     # account the ssh endpoint advertises. Omit it for the platform default "user";
-    # set it to the image's own account: "ubuntu" for the self-authored images
-    # (ssh-ubuntu22.04, base-cuda), "jovyan" for the stock-derived jupyter-minimal
-    # (which also needs securityContext.runAsGroup: 100, its stock gid — the
-    # platform default is 1000). The MACA images use "ubuntu" as well: the vendor
-    # package they are built on ships no account at all, so their overlay creates
-    # that one at 1000:1000.
+    # set it to the image's own account: all three family images (minimal,
+    # cube-base, maca-base) create "ubuntu" at uid/gid 1000, which is also what
+    # the platform default states.
     user: ubuntu
     env:
       - name: MODEL_REPO

@@ -394,10 +394,11 @@ func (s *Suite) TearDown(ctx context.Context) {
 //
 // The dots go too. A DevEnvironment's name is a DNS-1123 subdomain, which allows
 // them, but the controller names a Service after the environment and a Service
-// name is DNS-1035, which does not — so an environment called after
-// ssh-ubuntu22.04 fails every reconcile with "a DNS-1035 label must consist of
-// lower case alphanumeric characters or '-'". Measured, not read: the jupyter
-// case, whose key has no dot, came up first try.
+// name is DNS-1035, which does not — so a catalogue key carrying one would fail
+// every reconcile with "a DNS-1035 label must consist of lower case
+// alphanumeric characters or '-'". Measured, not read: an image key with a dot
+// failed that way, while the same run's dot-free key came up first try. The
+// current keys have none, so this is the rule rather than a repair.
 func EnvName(img Image, id Identity) string {
 	return fmt.Sprintf("e2e-%s-%s", strings.ReplaceAll(img.Key, ".", "-"), id)
 }
@@ -507,14 +508,6 @@ func (e *Environment) manifest() *aiv1alpha1.DevEnvironment {
 		}
 	default:
 		env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{User: img.Account}
-		if img.GroupOnlyWorkaround {
-			// The stock docker-stacks account is 1000:100 while the platform's
-			// default group is 1000, so the group has to be stated or the process
-			// cannot write its own home. Which images need it is the catalogue's
-			// field, not a rule this function infers.
-			gid := img.GID
-			env.Spec.Runtime.SecurityContext = &aiv1alpha1.RuntimeSecurityContext{RunAsGroup: &gid}
-		}
 	}
 	return env
 }

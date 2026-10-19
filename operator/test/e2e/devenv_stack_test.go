@@ -38,15 +38,15 @@ func describeStack(open func() *devenv.Environment, img devenv.Image, identity d
 	It("F1 runs the notebook as the image's own group",
 		Label(devenv.TierP1, devenv.LabelFamily("F")), func(ctx SpecContext) {
 			env := open()
-			if img.Key != "jupyter-minimal" {
-				Skip("the stock docker-stacks image is the one whose account is 1000:100")
+			if img.Key != "minimal-jupyter" {
+				Skip("the launcher is one program shared by all three families; the CPU image is its representative")
 			}
 			if identity != devenv.NonRoot {
 				Skip("a root environment's group is the platform's, which C1 asserts")
 			}
 			// The notebook process and not the session. The two are started
 			// differently — the launcher drops to the account for the server, while
-			// sshd starts the session for it — so a session at gid 100 says nothing
+			// sshd starts the session for it — so a session's gid says nothing
 			// about the process a user's kernel actually runs under.
 			notebook, err := notebookProcess(ctx, env)
 			Expect(err).NotTo(HaveOccurred(), "finding the notebook server")
@@ -96,7 +96,7 @@ func describeStack(open func() *devenv.Environment, img devenv.Image, identity d
 	It("F3 lands a CUDA notebook on the interpreter a session gets",
 		Label(devenv.TierP1, devenv.LabelFamily("F")), func(ctx SpecContext) {
 			env := open()
-			if !strings.Contains(img.Key, "cuda") {
+			if !strings.Contains(img.Key, "cube-base") {
 				Skip("this image carries no CUDA stack")
 			}
 			interp := torchInterpreter(ctx, env)
@@ -119,7 +119,7 @@ func describeStack(open func() *devenv.Environment, img devenv.Image, identity d
 	It("F4 puts the CUDA toolkit and torch's libraries on the session",
 		Label(devenv.TierP1, devenv.LabelFamily("F")), func(ctx SpecContext) {
 			env := open()
-			if !strings.Contains(img.Key, "cuda") {
+			if !strings.Contains(img.Key, "cube-base") {
 				Skip("this image carries no CUDA stack")
 			}
 			sess := sshReady(ctx, env)

@@ -20,7 +20,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/../.." # repository root: the paths below are the ones CI passes
 SUT=images/hack/changed-images.sh
-ALL="ssh jupyter maca ssh-maca cuda ssh-cuda"
+ALL="minimal maca-base cube-base"
 
 cases=0
 failures=0
@@ -75,22 +75,17 @@ check_groups() { # check_groups <name> <expected-json> <image>...
 check "an empty diff" "" ""
 check "another project" "" "" operator/internal/controller/devenv.go web/src/app.ts
 check "markdown at images/ root" "" "" images/README.md
-check "markdown inside an image directory" "" "" images/jupyter/README.md
+check "markdown inside an image directory" "" "" images/minimal/README.md
 
-check "an image's own file" ssh ssh images/ssh-ubuntu-server/Dockerfile
-check "the jupyter launcher" jupyter jupyter images/jupyter/start-jupyter.sh
-check "the maca image's own file" maca maca images/jupyter-maca-pytorch/Dockerfile
-check "the maca ssh daemon config" ssh-maca ssh-maca images/ssh-maca-pytorch/Dockerfile
-check "the cuda image's own file" cuda cuda images/jupyter-cuda-pytorch/Dockerfile
-check "the cuda ssh daemon config" ssh-cuda ssh-cuda images/ssh-cuda-pytorch/Dockerfile
+check "the minimal image's own file" minimal minimal images/minimal/Dockerfile
+check "the maca-base image's own file" maca-base maca-base images/maca-base/Dockerfile
+check "the cube-base image's own file" cube-base cube-base images/cube-base/Dockerfile
 
 check "a shared runtime file" "$ALL" "$ALL" images/common/sshd/install-dropin.sh
-# The vendor jupyter launcher lives under common/ because the two vendor jupyter images share
-# it, and check-dockerfile-copies.sh admits nowhere else a file two images can read from. So
-# an edit to one vendor's launcher reaches every image, the CPU pair included — none of which
-# is built from it. That is this rule's over-selecting bargain, and a path that selected
-# `maca` alone until the launcher moved.
-check "the vendor jupyter launcher" "$ALL" "$ALL" images/common/jupyter/start-jupyter.sh
+# The jupyter launcher lives under common/ because every family image shares it, and
+# check-dockerfile-copies.sh admits nowhere else a file several images can read from. So an
+# edit to it reaches every image, which is exactly the set built from it.
+check "the shared jupyter launcher" "$ALL" "$ALL" images/common/jupyter/start-jupyter.sh
 check "the Makefile" "$ALL" "$ALL" images/Makefile
 check "the context definition" "$ALL" "$ALL" images/.dockerignore
 check "the publish workflow" "$ALL" "$ALL" .github/workflows/ci-images.yml
@@ -100,20 +95,20 @@ check "the selection action" "$ALL" "$ALL" .github/actions/changed-images/action
 # The two selections differ on this path and nowhere else.
 check "the smoke harness" "" "$ALL" images/hack/smoke.sh
 
-# Deliberately a directory no image claims, and named so it reads that way: `cuda` is a real
-# token now, and a fixture calling itself pytorch-cuda would look like a near-miss of an image
-# that exists rather than like the unclaimed path this is testing.
+# Deliberately a directory no image claims, and named so it reads that way: `cube-base` is a
+# real name now, and a fixture calling itself pytorch-cuda would look like a near-miss of an
+# image that exists rather than like the unclaimed path this is testing.
 check "a new image directory" "$ALL" "$ALL" images/rocm-pytorch/Dockerfile
 check "a stray file at images/ root" "$ALL" "$ALL" images/notes.txt
 
 # A selection is a union over the whole diff, not the last path to match, and these two
 # share no input and are not each other's.
-check "two images' own files" "jupyter ssh-maca" "jupyter ssh-maca" \
-  images/jupyter/start-jupyter.sh images/ssh-maca-pytorch/Dockerfile
+check "two images' own files" "minimal maca-base" "minimal maca-base" \
+  images/minimal/Dockerfile images/maca-base/Dockerfile
 
-# The same union across bases: one selection, two legs below.
-check "images on different bases" "jupyter ssh-cuda" "jupyter ssh-cuda" \
-  images/jupyter/start-jupyter.sh images/ssh-cuda-pytorch/Dockerfile
+# The same union across the two vendor legs.
+check "images on different bases" "maca-base cube-base" "maca-base cube-base" \
+  images/maca-base/Dockerfile images/cube-base/Dockerfile
 
 # The other half of the unrecognised branch: selecting everything is a guess, so it has
 # to say so. Silence would leave the next person to find the gap by reading the script.
@@ -134,30 +129,30 @@ esac
 # One leg per base, which is what ci-operator.yml's `images-smoke` job expands from. Two
 # properties are load-bearing and neither is visible in the selection above: a base the
 # selection does not name contributes no leg at all (so a CUDA-only pull request schedules
-# one job, not three), and the two images of one base are one leg (so they share a runner
+# one job, not three), and the images of one base are one leg (so they share a runner
 # instead of unpacking that base twice).
 
 check_groups "a selection with no images has no leg" '[]'
-check_groups "the cuda pair is one leg" \
-  '[{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' cuda ssh-cuda
-check_groups "the cpu pair is one leg, and is not a vendor leg" \
-  '[{"base":"ubuntu","images":"ssh jupyter","vendor":false}]' jupyter ssh
-check_groups "a maca-only selection schedules no other base's leg" \
-  '[{"base":"maca","images":"maca ssh-maca","vendor":true}]' maca ssh-maca
+check_groups "the cube-base image is one leg" \
+  '[{"base":"cube-base","images":"cube-base","vendor":true}]' cube-base
+check_groups "the minimal image is one leg, and is not a vendor leg" \
+  '[{"base":"minimal","images":"minimal","vendor":false}]' minimal
+check_groups "a maca-base-only selection schedules no other base's leg" \
+  '[{"base":"maca-base","images":"maca-base","vendor":true}]' maca-base
 check_groups "one leg per selected base, in the table's order" \
-  '[{"base":"ubuntu","images":"ssh jupyter","vendor":false},{"base":"maca","images":"maca ssh-maca","vendor":true},{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' \
-  ssh jupyter maca ssh-maca cuda ssh-cuda
+  '[{"base":"minimal","images":"minimal","vendor":false},{"base":"maca-base","images":"maca-base","vendor":true},{"base":"cube-base","images":"cube-base","vendor":true}]' \
+  minimal maca-base cube-base
 check_groups "a repeated name does not repeat a leg" \
-  '[{"base":"cuda","images":"cuda ssh-cuda","vendor":true}]' cuda cuda ssh-cuda
+  '[{"base":"cube-base","images":"cube-base","vendor":true}]' cube-base cube-base
 
 # The primitive the action's publish matrix is sized from, asserted apart from the grouping
 # so that a `vendor` gone wrong cannot hide behind a grouping fixture that agrees with it.
 cases=$((cases + 1))
-if [ "$("$SUT" vendor cuda)" = true ] && [ "$("$SUT" vendor jupyter)" = false ]; then
+if [ "$("$SUT" vendor cube-base)" = true ] && [ "$("$SUT" vendor minimal)" = false ]; then
   printf 'ok    vendor follows the base, not a name list\n'
 else
   failures=$((failures + 1))
-  printf 'FAIL  vendor must read true for cuda and false for jupyter\n'
+  printf 'FAIL  vendor must read true for cube-base and false for minimal\n'
 fi
 
 # A name the rule does not know must fail loudly: a group silently dropped here is an image
@@ -248,7 +243,7 @@ done
 # --- the gate needs the pathspec, not a list of image names ----------------------
 
 cases=$((cases + 1))
-if [ "$("$SUT" paths jupyter | wc -l)" -lt 2 ]; then
+if [ "$("$SUT" paths minimal | wc -l)" -lt 2 ]; then
   failures=$((failures + 1))
   printf 'FAIL  `paths` must emit a pathspec for git, not a name\n'
 else

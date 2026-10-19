@@ -41,7 +41,7 @@ import (
 // underneath them would make every other case's result depend on this family's
 // running order. So each group here brings up its own environment — on the
 // cheapest image, which for these questions is representative: stopping is the
-// platform's, and a bare `ssh-ubuntu22.04` is the environment with the least in
+// platform's, and a bare `minimal-ssh` is the environment with the least in
 // it to confuse the answer. G8 is the one exception, and brings up a notebook
 // because the type is the whole of what it asks about.
 
@@ -76,7 +76,7 @@ func describeLifecycle() {
 func describeStopStart() {
 	draftCase{
 		Name:     "lifecycle-stop-start",
-		Image:    devenv.MustImage("ssh-ubuntu22.04"),
+		Image:    devenv.MustImage("minimal-ssh"),
 		Identity: devenv.NonRoot,
 		Cases: func(open func() *devenv.Environment) {
 			It("G1 keeps the phase and the conditions in agreement while the environment starts",
@@ -312,7 +312,7 @@ func describeStopStart() {
 func describeHttpStop() {
 	draftCase{
 		Name:     "lifecycle-stop-http",
-		Image:    devenv.MustImage("jupyter-minimal"),
+		Image:    devenv.MustImage("minimal-jupyter"),
 		Identity: devenv.NonRoot,
 		Shape: func(env *aiv1alpha1.DevEnvironment) {
 			// The HTTP route alone, so that the address can only go because the
@@ -408,7 +408,7 @@ func describeDeletion() {
 
 	draftCase{
 		Name:     "lifecycle-deleted",
-		Image:    devenv.MustImage("ssh-ubuntu22.04"),
+		Image:    devenv.MustImage("minimal-ssh"),
 		Identity: devenv.NonRoot,
 		Cases: func(open func() *devenv.Environment) {
 			It("G5 withdraws its routes, its port and its workload before it lets go",
@@ -525,7 +525,7 @@ func describeRetention() {
 
 	draftCase{
 		Name:     "lifecycle-retained",
-		Image:    devenv.MustImage("ssh-ubuntu22.04"),
+		Image:    devenv.MustImage("minimal-ssh"),
 		Identity: devenv.NonRoot,
 		Shape: func(want *aiv1alpha1.DevEnvironment) {
 			want.Spec.Storage.PVCRetention = aiv1alpha1.PVCRetentionRetain

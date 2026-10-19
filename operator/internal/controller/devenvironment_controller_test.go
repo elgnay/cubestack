@@ -61,7 +61,11 @@ import (
 const (
 	testDevImage      = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
 	testBaseMacaImage = "harbor.local/ai-images/base-maca:1.0"
-	testCPUImage      = "harbor.local/ai-images/ssh-ubuntu22.04:latest"
+	testCPUImage      = "harbor.isuanova.com/suanova/minimal:latest"
+	// testCubeBaseImage is the platform's own nvidia family image. Its name
+	// carries no "cuda" token, which is why the nvidia rule accepts the family
+	// name as well.
+	testCubeBaseImage = "harbor.isuanova.com/suanova/cube-base:26.08"
 	// testMetaxImage is the mirror of the upstream Metax package: the metax token
 	// is `maca` in the package's own name, whatever registry path fronts it.
 	testMetaxImage = "harbor.isuanova.com/mirrors/cr.metax-tech.com/public-library/maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64"
@@ -71,7 +75,7 @@ const (
 	// repository name — which the rule accepts, since it reads the whole
 	// reference. Kept to pin that: the gate answers "does the name say its
 	// vendor", not "is this a real platform image".
-	testMacaInPathImage   = "harbor.local/maca-images/ssh-ubuntu22.04:latest"
+	testMacaInPathImage   = "harbor.local/maca-images/minimal:latest"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
 	// testGatewayDataplaneNamespace is where the test Gateway's proxy pods run.
@@ -1575,7 +1579,10 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				}
 			},
 			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(), true),
+			Entry("nvidia with a cube-base image matches", testCubeBaseImage, nvidiaGPU(), true),
+			Entry("nvidia with a minimal image mismatches", testCPUImage, nvidiaGPU(), false),
 			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(), false),
+			Entry("metax with a cube-base image mismatches", testCubeBaseImage, metaxGPU(), false),
 			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(), false),
 			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(), true),
 			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(), true),
@@ -2866,9 +2873,52 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Key:                  jupyterTokenKey,
 				}}},
 				{Name: notebookArgsEnv, Value: notebookBaseURLFlag + webPath(env)},
+				{Name: cubstackTypeEnv, Value: "jupyter"},
 			}))
 			// A jupyter environment without ssh.enabled mounts no ssh volume.
 			Expect(c.VolumeMounts).To(BeEmpty())
+		})
+
+		// One image serves both a notebook and an ssh environment because the
+		// controller states which one this is; the mode the image bakes at build
+		// time is only a fallback (images/common/entrypoint.sh). The value has to
+		// follow spec.type or the container would contradict the probe, Service and
+		// routes the controller derived from the same field.
+		DescribeTable("states the environment type to the image",
+			func(typ aiv1alpha1.DevEnvironmentType, want string) {
+				env := newEnv()
+				env.Spec.Type = typ
+				Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).
+					To(ContainElement(corev1.EnvVar{Name: cubstackTypeEnv, Value: want}))
+			},
+			Entry("jupyter", aiv1alpha1.DevEnvironmentTypeJupyter, "jupyter"),
+			Entry("ssh", aiv1alpha1.DevEnvironmentTypeSSH, string(aiv1alpha1.DevEnvironmentTypeSSH)),
+		)
+
+		// The value is the controller's, like JUPYTER_TOKEN: a declared one could
+		// disagree with what the probe, Service and routes were built from.
+		It("drops a container type the environment declares", func() {
+			env := newEnv()
+			env.Spec.Type = aiv1alpha1.DevEnvironmentTypeSSH
+			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+				{Name: cubstackTypeEnv, Value: "jupyter"},
+			}}
+			rendered := []corev1.EnvVar{}
+			for _, v := range (&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env {
+				if v.Name == cubstackTypeEnv {
+					rendered = append(rendered, v)
+				}
+			}
+			Expect(rendered).To(Equal([]corev1.EnvVar{{
+				Name: cubstackTypeEnv, Value: string(aiv1alpha1.DevEnvironmentTypeSSH),
+			}}))
+		})
+
+		// vscode is not a mode the platform's images implement — the shared
+		// entrypoint exits on an unknown one — so its image keeps deciding what to
+		// run.
+		It("states no container type to a vscode environment", func() {
+			Expect(render(nil).Containers[0].Env).NotTo(ContainElement(HaveField("Name", cubstackTypeEnv)))
 		})
 
 		// The prefix Jupyter is told to serve under has to be the prefix its route
@@ -3025,7 +3075,10 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{
 				SecurityContext: &aiv1alpha1.RuntimeSecurityContext{RunAsUser: ptrTo(int64(0))},
 			}
-			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).To(BeEmpty())
+			Expect((&DevEnvironmentReconciler{}).desiredPodSpec(env).Containers[0].Env).
+				To(Equal([]corev1.EnvVar{{
+					Name: cubstackTypeEnv, Value: string(aiv1alpha1.DevEnvironmentTypeSSH),
+				}}))
 		})
 
 		// The whole rollout story of this feature is that an environment which

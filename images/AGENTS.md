@@ -6,38 +6,43 @@ For platform-wide principles, see `../AGENTS.md`.
 
 ## Scope
 
-Container images that back the DevEnvironment `type`/image contract served by the
-`operator/` (see `operator/internal/controller/devenvironment_controller.go` and
-`docs/design/devenv-images/decision.md`). Images belong to **two families** — the split is by
-whose layout an image keeps, and the families are **not** conformed to one layout:
+Container images that back the DevEnvironment `type` contract served by the
+`operator/` (see `operator/internal/controller/devenvironment_controller.go`,
+`docs/design/devenv-images/image-contract.md` and
+`docs/design/devenv-images/decision.md`). There is **one image per accelerator family**, and every
+image serves **both** runtime modes:
 
-- **Self-authored** images ship the platform default: account `ubuntu`, uid/gid **1000**, home/workdir
-  **`/home/ubuntu`**. Five members, differing only in their base and their mode:
-  `ssh-ubuntu22.04` (CPU, on `ubuntu:22.04`, ssh), `jupyter-maca-pytorch` / `ssh-maca-pytorch` (GPU, on
-  a vendor's Metax MACA base, jupyter+sshd and ssh alone) and `jupyter-cuda-pytorch` /
-  `ssh-cuda-pytorch` (GPU, on the vendor's NVIDIA NGC PyTorch base, the same two modes). Each vendor
-  pair is two repositories rather than one image with a mode flag, because the mode is baked
-  (`CUBESTACK_IMAGE`) and the controller injects no type — see `images/README.md`.
-- **Stock-derived** images keep their upstream-native layout **unchanged** and the overlay
-  enables only ssh (e.g. `jupyter-minimal`: account `jovyan`, uid 1000 gid 100, home
-  `/home/jovyan`, stock launch chain). The platform is told about that layout per environment,
-  through the DevEnvironment spec — no image metadata is read.
+- **`minimal`** — CPU, on `ubuntu:22.04`: the platform layer plus `python3`/pip, JupyterLab on the
+  system interpreter, and the shared launcher.
+- **`maca-base`** — GPU, on a vendor Metax MACA base.
+- **`cube-base`** — GPU, on the vendor's NVIDIA NGC PyTorch base.
 
-A self-authored image on a **vendor base** is where the overlay's size varies most, because what the
-base already ships is what decides it. The MACA base ships no account, no sshd, no `ENTRYPOINT` and no
-launcher at all, so the platform layer there is the whole of it, account included. The NGC PyTorch base
-ships the account (`ubuntu` 1000:1000 at `/home/ubuntu` — the platform default layout exactly), an
-`ENTRYPOINT`, JupyterLab, and an interpreter with torch already in it, so its overlay adds the sshd
-layer and the baked mode and nothing else. Two consequences for a new image either way: the account the
-image runs under is the one the shared sshd drop-in is written for (the drop-in is a non-root
-configuration, so a base that ships none gets it added and a base that ships one must keep it), and the
-launch chain neither vendor base provides is shared under `common/` rather than written per image.
+The mode (`jupyter` vs `ssh`) is **not** baked per image: the controller injects `CUBSTACK_TYPE`
+from `spec.type`, and `common/entrypoint.sh` runs JupyterLab or sshd from it. The images exist per
+accelerator because offline installs ship every image, and splitting a family again by mode would
+repeat its whole base for a delta of a few MB — see `images/README.md`.
+
+All three ship the **same layout**, so the platform is configured identically for each: account
+`ubuntu`, uid/gid **1000:1000**, home/workdir **`/home/ubuntu`** (the platform default, so no spec
+needs a `runAsGroup` override). A vendor-base image is where the overlay's size varies most, because
+what the base already ships is what decides it. The MACA base ships no account, no sshd, no
+`ENTRYPOINT` and no launcher at all, so the platform layer there is the whole of it, account
+included. The NGC PyTorch base ships the account (`ubuntu` 1000:1000 at `/home/ubuntu` — the
+platform default layout exactly), an `ENTRYPOINT`, JupyterLab, and an interpreter with torch already
+in it, so its overlay adds the sshd layer and the launcher and nothing else. Two consequences for a
+new image either way: the account the image runs under is the one the shared sshd drop-in is written
+for (the drop-in is a non-root configuration, so a base that ships none gets it added and a base
+that ships one must keep it), and the launch chain none of the bases provides is shared under
+`common/` rather than written per image.
 
 Every image:
 - never sets command/args (the controller provides none) — the image ENTRYPOINT decides what
-  runs (`common/entrypoint.sh`): mode `ssh` runs sshd; mode `jupyter` starts sshd only when the
-  ssh host key is mounted, then hands off to the image CMD
-- satisfies readiness = TCP listening on the image's main port (jupyter `8888`, ssh `2222`)
+  runs (`common/entrypoint.sh`): the mode is `CUBSTACK_TYPE` (controller-injected from `spec.type`,
+  falling back to the baked `CUBESTACK_IMAGE` when run by hand); mode `ssh` runs sshd and never a
+  notebook; mode `jupyter` starts sshd only when the ssh host key is mounted, then hands off to the
+  shared launcher. An unknown mode exits non-zero rather than guessing
+- satisfies readiness = TCP listening on the image's main port (jupyter `8888`, ssh `2222`) — and
+  therefore an ssh-type environment must expose no notebook on 8888
 - reads the operator's ssh Secrets **directly off Secret mounts**, with no staging:
   `ssh_host_ed25519_key` at `/etc/ssh/ssh_host_ed25519_key` (a `subPath` file mount, since sshd wants
   one exact path) and the authorized-keys entry at the absolute `/run/ssh/authorized_keys` (a
@@ -58,15 +63,15 @@ Every image:
   `make -C images build` (or `docker build -f <img>/Dockerfile ... images/`). The shared logic under
   `common/` is `COPY`ed into each image from this context.
 - **Name the platform on every build.** `make -C images build` builds `$(PLATFORM)`, default
-  `linux/amd64` — the architecture the cluster's nodes run. A bare `docker build` resolves each
-  multi-arch base (ubuntu, quay.io/jupyter) to the **host** architecture instead, which is how an
-  arm64-only pair was once published and then failed on every amd64 node with *no match for platform
+  `linux/amd64` — the architecture the cluster's nodes run. A bare `docker build` resolves a
+  multi-arch base (ubuntu) to the **host** architecture instead, which is how an
+  arm64-only image was once published and then failed on every amd64 node with *no match for platform
   in manifest*. Check what a registry actually received with
   `docker buildx imagetools inspect --raw <ref>` rather than assuming the build host's architecture.
   A vendor base published per architecture cannot follow `$(PLATFORM)` at all: it has no layers for any
-  other architecture to build from, so each vendor pair names its own — `build-maca` / `build-ssh-maca`
-  (and their `push-` forms) take `$(MACA_PLATFORM)`, the CUDA pair's take `$(CUDA_PLATFORM)` — and all
-  four publish a single-platform index. The two read alike but say so differently: the MACA package
+  other architecture to build from, so each vendor image names its own — `build-maca-base`
+  (and its `push-` form) takes `$(MACA_PLATFORM)`, `build-cube-base` takes `$(CUBE_PLATFORM)` — and both
+  publish a single-platform index. The two read alike but say so differently: the MACA package
   states it in the tag (`-amd64` is part of the tag, not a multi-arch index), the NGC PyTorch tag does
   not and the mirror carries one amd64 manifest inside an index shape. That exception belongs to the
   image, not the host — do not fold it back into `PLATFORMS`.
@@ -75,13 +80,13 @@ Every image:
 - **Shared runtime logic lives in `common/`**: `entrypoint.sh` (mode selection + optional sshd +
   hand-off to the image CMD), `sshd/` (the drop-in, where the mount contract's paths are fixed, and
   the installer that fills it in) and `jupyter/` (the launcher, which expands `NOTEBOOK_ARGS` into
-  `--ServerApp.base_url` — one launcher for both vendor jupyter images rather than a copy per vendor,
+  `--ServerApp.base_url` — one launcher for all three family images rather than a copy per family,
   since it reads the base's environment rather than naming it). The drop-in carries two per-family
   placeholders: the ssh login
   account `@SSH_USER@` (`ARG SSH_USER`) and the session environment `@SSH_ENV@`, which
   `sshd/install-dropin.sh` builds from the variable names each Dockerfile passes it, read out of the
   build shell's environment — i.e. the image's own by then: the base's, plus whatever the overlay has
-  set, which is how both MACA images get `/opt/conda/bin` onto a session's `PATH`. A placeholder is
+  set, which is how `maca-base` gets `/opt/conda/bin` onto a session's `PATH`. A placeholder is
   needed because sshd's `SetEnv`
   *replaces* the session environment, so a fixed literal would hide whichever family's toolchain it did
   not name; and it reaches past `PATH`, since the vendor images need their loader and compiler
@@ -125,29 +130,28 @@ Every image:
 ```bash
 make -C images build    # builds every image ($(PLATFORM), default linux/amd64), tagged
                         # $(REGISTRY)/$(PROJECT)/<image>:$(TAG)
-make -C images smoke    # local Docker smoke (ssh key-auth login; jupyter + optional sshd)
+make -C images smoke    # local Docker smoke: both the jupyter and the ssh mode of each image
 make -C images push TAG=<tag>   # builds each image for every $(PLATFORMS) (default
                                 # linux/amd64 linux/arm64) and pushes it as one multi-arch
                                 # index carrying :TAG and :latest
 make -C images build PLATFORM=linux/arm64   # another architecture (explicit opt-in)
-make -C images smoke-maca # one image: --ssh / --jupyter / --maca / --ssh-maca / --cuda /
-                         # --ssh-cuda select one
+make -C images smoke-maca-base # one image: --minimal / --maca-base / --cube-base select one
 ```
 
 `PLATFORM` takes a single value; a list fails in `check-platform` with that reason. On a host of a
 different architecture the build (and the smoke's throwaway containers) run emulated — slower, but
-they exercise the artifact that is actually published. Both **vendor pairs** ignore all of this and
+they exercise the artifact that is actually published. Both **vendor images** ignore all of this and
 build their own single platform, `linux/amd64` by default, on every host and for every publish — see
-the platform rule. Their published names are the pairs' other exception: the tag carries the vendor
+the platform rule. Their published names are the other exception: the tag carries the vendor
 axis read out of the base package with `$(TAG)` after it, not `$(TAG)` alone — `MACA_TAG`, three axes
-(`3.9.0.12-py310-torch2.4`), and `CUDA_TAG`, the NGC release on its own (`26.08`), because that release
+(`3.9.0.12-py310-torch2.4`), and `CUBE_TAG`, the NGC release on its own (`26.08`), because that release
 pins python, torch and CUDA together instead of naming them as separable axes (README, Publish;
 decision doc §5).
 
 `PLATFORMS` is the publish list for the same reason, and `make push PLATFORMS=linux/amd64` narrows it
 back to one. `push` is a `buildx build --push`, so it needs a builder that can do more than one
-platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU) — `push-maca`,
-`push-ssh-maca` and the two CUDA pushes are the targets that do not, since a single-platform push
+platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU) — `push-maca-base`
+and `push-cube-base` are the targets that do not, since a single-platform push
 builds on any builder. It does **not** push the
 image the local smoke ran — buildx cannot load a multi-platform result and push it in one invocation,
 so it builds a fresh one from the same source.
@@ -169,12 +173,13 @@ nothing while re-verifying everything. `make -C images check-select` runs the ru
 
 `images-smoke` builds and smokes exactly that selection, on a pull request or a `release-*` push —
 the run which gates the content, since on `main` it would smoke the tree the pull request already
-smoked — and a change that reaches no image skips it. It runs **one job per base image** rather
-than one over the whole selection: two images built on one base resolve the same base layers, so a
-leg builds both and unpacks that base once where a leg each would unpack it twice, a base the
-change did not reach has no leg at all — a CUDA-only pull request schedules one runner, not three —
-and the two *different* vendor bases never share a leg, because one runner cannot hold both (see
-the disk paragraph below). A merge is what `ci-images.yml` publishes, as
+smoked — and a change that reaches no image skips it. It runs **one job per base image** — with one
+image per base today that is one job per image, so a CUDA-only pull request schedules one runner,
+not three, and a base the change did not reach has no leg at all. The grouping is kept because it is
+the axis a leg is *sized* on, and because it is what would keep two images of one base from unpacking
+it twice if a base ever gained a second image; the two *different* vendor bases never share a leg,
+because one runner cannot hold both (see the disk paragraph below). A merge is what `ci-images.yml`
+publishes, as
 **one job per image**, and it asks the same rule: the selection *is* the job matrix, so an image the
 merge did not reach has no job at all rather than a skipped one, claims no runner and enters no
 concurrency group. Each leg smokes the image it is about to publish and then withholds `:latest`
@@ -186,8 +191,8 @@ later run would move. A `vX.Y.Z` tag publishes every image at the version it nam
 itself needs no cluster and no registry credentials: every image is built for linux/amd64 and run as
 throwaway containers on 127.0.0.1.
 
-That last point is where the vendor images are expensive: the MACA pair's shared base is a 10.5 GiB
-pull and about **33 GB unpacked**, the CUDA pair's about **38.6 GB** — that is what a runner has to
+That last point is where the vendor images are expensive: `maca-base`'s base is a 10.5 GiB
+pull and about **33 GB unpacked**, `cube-base`'s about **38.6 GB** — that is what a runner has to
 hold, twice over, if the image the smoke built and the one `push` builds land in different stores.
 That is what the steps answer: a vendor leg reclaims the runner's preinstalled SDKs first
 (`.github/actions/reclaim-disk`, because ~31 GB free is less than either of these images), and smokes
@@ -198,18 +203,18 @@ what the smoke just pulled and built instead of repeating both (a second pull of
 at 590s, and the build it feeds). `Drop what the smoke built`, `Set up QEMU` and `Set up Buildx` are
 the CPU legs' steps and all three are keyed off the same `vendor` flag the selector puts on each
 matrix leg: they exist because the container driver `Set up Buildx` installs builds in a store of its
-own — which the CPU pair needs for its amd64+arm64 index, and which a vendor leg would need a second
+own — which the CPU image needs for its amd64+arm64 index, and which a vendor leg would need a second
 copy of its base, tens of GB, to keep. Nothing pays that cost unless it can change a vendor image. One job
 per image is what keeps it that way: a merge that reaches only a CPU image, only the smoke harness or
 only markdown schedules no vendor build at all, and each vendor image gets a whole runner's disk
 rather than sharing one. The reclaim and the long timeout are the vendor legs' alone too — the CPU
-pair is a fraction of that base (`ssh-ubuntu22.04` measures 132 MB). The other side of that split is
+image is a fraction of that base (`minimal` is well under a gigabyte). The other side of that split is
 that the vendor images no longer share a runner's layer store, so a merge reaching two of them runs
 their base's pull on two runners in parallel where one lane ran it twice on one; the exchange is the
 disk, the CPU legs' 1m41s and the fact that a merge reaching one of them pays for one. Every image is
 still in the `build` / `smoke` / `push` aggregators, because an image that is never built is never
-checked and a local `make smoke` still means all six, which is every vendor base unpacked on one
+checked and a local `make smoke` still means all three, which is every vendor base unpacked on one
 machine (~72 GB) — if that cost ever outweighs the coverage, the lever is to drop the vendor images'
-`build-` targets from the aggregators and run `smoke-maca` / `smoke-ssh-maca` / `smoke-cuda` /
-`smoke-ssh-cuda` by hand — not to leave their `push-` forms out of `push`, which would publish
+`build-` targets from the aggregators and run `smoke-maca-base` / `smoke-cube-base` by hand — not to leave
+their `push-` forms out of `push`, which would publish
 nothing.
