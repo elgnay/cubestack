@@ -85,9 +85,9 @@ controller probes only the one `spec.type` selects.
 
 | Image | Base | Platforms |
 |---|---|---|
-| `ubuntu` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
-| `cuda-pytorch` | NVIDIA NGC PyTorch (`nvcr.io/nvidia/pytorch:<release>-py3`, mirrored) | `linux/amd64` |
-| `maca-pytorch` | Metax MACA (`public-library/maca-pytorch:…`, mirrored) | `linux/amd64` |
+| `minimal` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
+| `cube-base` | NVIDIA NGC PyTorch (`nvcr.io/nvidia/pytorch:<release>-py3`, mirrored) | `linux/amd64` |
+| `maca-base` | Metax MACA (`public-library/maca-pytorch:…`, mirrored) | `linux/amd64` |
 
 The vendor bases publish one architecture only, so their images do too. A registry must receive the
 platform the nodes run; verify with `docker buildx imagetools inspect --raw <ref>` rather than

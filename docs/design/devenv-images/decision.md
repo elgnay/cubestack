@@ -8,8 +8,8 @@ GPU vendor, storage, and an SSH toggle. This module delivers that **base-image s
 satisfy the image contract already fixed in the operator, are published to a container image
 registry, and can be bundled for offline installation.
 
-In scope: the image set that now ships — **one image per accelerator family**: `ubuntu` (CPU, on
-`ubuntu:22.04`), `maca-pytorch` (Metax), and `cuda-pytorch` (NVIDIA). Each image serves **both**
+In scope: the image set that now ships — **one image per accelerator family**: `minimal` (CPU, on
+`ubuntu:22.04`), `maca-base` (Metax), and `cube-base` (NVIDIA). Each image serves **both**
 runtime modes: `spec.type` is injected as `CUBSTACK_TYPE` and the entrypoint runs JupyterLab or sshd
 from it (Gap D). This supersedes the six-image set this document originally scoped — the CPU pair
 `jupyter-minimal` / `ssh-ubuntu22.04` and a jupyter/ssh pair per vendor. §6 records what shipped and
@@ -32,7 +32,7 @@ images are final** — they cannot be solved inside the images themselves.
 
 | # | Operator assumption | Code evidence | Requirement on the image | Status |
 |---|---|---|---|---|
-| 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** the vendor's token — `cuda` for nvidia, `maca` for metax. Checked **only when a GPU is requested** — an absent `spec.resources.gpu` block is exempt | Image must carry its vendor token when it is a GPU image; CPU images are named freely. The vendor images spell it out — `cuda-pytorch` for NVIDIA, and the Metax image is built on the upstream `maca-pytorch` package, whose name it keeps | ✅ consistent with the brand gate |
+| 1 | Brand marker | `devenvironment_controller.go::brandMismatchReason`: image name (lowercased) must **contain** the vendor's token — `cuda` or the family name `cube-base` for nvidia, `maca` for metax. Checked **only when a GPU is requested** — an absent `spec.resources.gpu` block is exempt | Image must name its vendor when it is a GPU image; CPU images are named freely. `cube-base` and `maca-base` both do (`maca-base` carries the vendor's own token; `cube-base` is matched by the family name the gate accepts), and a user image still satisfies it by containing `cuda` / `maca` | ✅ consistent with the brand gate |
 | 2 | Type → port | `::mainContainerPort`: jupyter 8888 / vscode 8080 / ssh `sshContainerPort`; readiness probe = TCP on the main port | The server must listen on the type's port and accept TCP — **except ssh**, where the container listens on the unprivileged **2222** (see B) and the Service publishes that as 22 | ✅ implemented (#173): the probe targets the container port (2222 for ssh) and the Service publishes `port: 22 → targetPort: 2222` |
 | 3 | Non-root default | `::desiredSecurityContext`: `runAsUser=runAsGroup=1000`, `runAsNonRoot=true` (only lifted when the user explicitly sets `0`) | Image must run as the **uid/gid the spec resolves to** (`spec.runtime.securityContext`, platform default 1000/1000), non-root, incl. writing `$HOME` (all first-party images ship uid 1000) | ✅ (but see #6, #9) |
 | 4 | `$HOME` = the workspace mount; the working directory is separate | `::withWorkspaceHome` states the resolved mount path as the container's `HOME`, for every type, whenever `spec.storage` is set; `desiredPodSpec` sets no `container.WorkingDir`, and no image's own account home is rewritten | The container is **told** where its home is; an image must act on that for anything meant to land on the workspace. The mount path is `spec.storage.mountPath`, else the home the runtime identity implies — every first-party image runs account `ubuntu` and gets `/home/ubuntu`. A non-root account must be able to **write** that mount, which no image can arrange for itself | ✅ Gap A closed for `HOME`: an init container repairs the claim's ownership — the root alone while it already matches, the whole tree when it does not — before the container starts. The one shared jupyter launcher ends up serving the stated home rather than one the image bakes, and enters it — so a notebook and a terminal opened from it both land on the workspace. **The ssh family does not read `HOME`**: it keeps `WORKDIR /home/ubuntu` (an ssh session starts there), which is the claim when the mount resolves there. A working-directory guarantee for a non-default mount is **not implemented** |
@@ -343,7 +343,7 @@ properties of the node rather than of the image.
   MACA stack).
 - **The CUDA ecosystem is not drop-in**: software must be rebuilt against MACA via `cu-bridge`, and
   PyTorch must be a customized `torch…+metax` build (conflicting cupy/flashinfer wheels removed). →
-  affects the software selection inside `maca-pytorch` (see §6).
+  affects the software selection inside `maca-base` (see §6).
 
 ### 3.D Offline delivery notes
 
@@ -366,7 +366,7 @@ the base and what the base already ships:
                                    | shared by all three images
             +----------------------+----------------------+
             |                      |                      |
-   ubuntu                    cuda-pytorch            maca-pytorch
+   minimal                   cube-base               maca-base
    on ubuntu:22.04           on the vendor's NGC     on a vendor Metax
    self-authored overlay:    PyTorch base: keeps     MACA base: ships no
    account, sshd, python3,   its account (ubuntu     account, no sshd, no
@@ -427,18 +427,18 @@ offline in-cluster registry host form. Those are fixture values for a *user-chos
 platform's own publishing target, so they do not dictate the project below.
 
 - **Project name**: `suanova` - our images publish as `harbor.isuanova.com/suanova/`
-  `{ubuntu,cuda-pytorch,maca-pytorch}`. That is the project CI already publishes operator and
+  `{minimal,maca-base,cube-base}`. That is the project CI already publishes operator and
   portal to (`suanova/cubestack-{operator,ui}`), so every CubeStack image lives under one project on
   the one host. **The repository names the axis a user selects on and that changes slowly; the tag
   carries what changes per build.** The axis is now the **accelerator family**, not the runtime
-  mode: `ubuntu` is the CPU family, `cuda-pytorch` the NVIDIA one and `maca-pytorch` the Metax one.
-  Each is what the user picks on - omit `spec.resources.gpu` for `ubuntu`, or name the vendor for
+  mode: `minimal` is the CPU family, `cube-base` the NVIDIA one and `maca-base` the Metax one.
+  Each is what the user picks on - omit `spec.resources.gpu` for `minimal`, or name the vendor for
   one of the other two - and each moves on its own cadence (an Ubuntu LTS, an NGC release, a MACA
-  package). The vendor names are the vendor's package families rather than the platform's own
-  `base-maca` / `base-cuda`, because what ships is a ready DevEnvironment image prepared from that
-  package, not a bare base (§6.1, §6.2). The CPU repository is literally `ubuntu`: its base release
-  is the compatibility contract (apt/dpkg, libc) and it is the platform's own pin, so the name says
-  what the image is built on; a distro bump renames nothing, it moves the tag (§ below).
+  package). The names are the original design's: `minimal` is the smallest image and the CPU
+  baseline, while the two vendor images are base images carrying a vendor stack, named for it
+  (`cube-base` for the platform's NVIDIA base, `maca-base` for the Metax MACA one). The base
+  release is not part of the name: the CPU image is built on `ubuntu:22.04`, but a distro bump
+  moves the tag, not the repository.
   **The mode is not an axis.** It used to be a second repository per family
   (`ssh-maca-pytorch` next to `jupyter-maca-pytorch`, and so on), which is what the six-image set
   was. It is now selected at runtime: the controller injects `spec.type` to the image (Gap D), so a
@@ -446,38 +446,37 @@ platform's own publishing target, so they do not dictate the project below.
   surface the same three images at `harbor.local`; only the host is swapped, by
   packaging/rewriting.
 - **Tags**: content-locked and reproducible. Examples:
-  - `cuda-pytorch:<ngc-release>-<sha>`, e.g. `26.08-<sha>`. Here the release *is* the
+  - `cube-base:<ngc-release>-<sha>`, e.g. `26.08-<sha>`. Here the release *is* the
     compatibility contract: NGC pins python, torch and CUDA together in one tag rather than naming
-    them as separable axes, so unlike the earlier draft's
-    `base-cuda:<cuda>-py<python>-torch<torch>` there is one axis and not three - there is no torch
+    them as separable axes, so there is one axis and not three - there is no torch
     version to state separately, and repeating the python field the release also encodes (`-py3`)
     would restate what it already fixes.
-  - `maca-pytorch:<maca-version>-py<python>-torch<ver>-<sha>`, e.g.
+  - `maca-base:<maca-version>-py<python>-torch<ver>-<sha>`, e.g.
     `3.9.0.12-py310-torch2.4-<sha>`. The same axes the base is built on: the vendor package version
     is the compatibility contract of the whole stack, and it is what a user picks between. It moves
     on the vendor's cadence, not ours, so it stays in the tag while the repository keeps the stack
     identity.
-  - `ubuntu:<sha>`, e.g. `1a2b3c4`. The base release is a build input (`UBUNTU_VERSION`, default
+  - `minimal:<sha>`, e.g. `1a2b3c4`. The base release is a build input (`UBUNTU_VERSION`, default
     `22.04`) rather than part of the repository or tag, so a distro bump moves the image a pin
     names only when the tag is published again - the digest a deployment pins is what fixes it.
   - `make push` defaults `TAG` to the short commit SHA, so a bare command yields a traceable,
     non-floating reference; pass an explicit tag from the schemes above to publish a release. The
     SHA names the last commit rather than the working tree, so publishing expects a committed
     tree. Neither vendor image waits for that explicit tag: `MACA_TAG` reads the three axes out of
-    `MACA_PACKAGE` and publishes `<maca-version>-py<python>-torch<ver>-<sha>`, and `CUDA_TAG`
+    `MACA_PACKAGE` and publishes `<maca-version>-py<python>-torch<ver>-<sha>`, and `CUBE_TAG`
     reads `CUDA_PACKAGE` for its one axis - both derived, not written twice, so a tag cannot name a
     base the image was not built from, and the SHA still ends it so a re-build of the overlay on an
     unchanged base moves the reference rather than redefining it. Both derivations are guarded - an
     unreadable vendor release stops the build rather than publishing a name with an empty field.
   - CI adds a second kind of pinned tag on a `vX.Y.Z` release: the platform release version, e.g.
-    `ubuntu:1.0.0`. The schemes above say what the image *is*; this says which CubeStack release it
+    `minimal:1.0.0`. The schemes above say what the image *is*; this says which CubeStack release it
     shipped with. A release publishes it instead of `:latest`, which stays a main-only tag.
   - Both forms of reference are published: the pinned tag above *and* a moving `:latest` that the
     push re-points at the image it just built, so a deployment may track the newest publish or pin
     exactly. Re-publishing an older commit therefore moves `:latest` backwards, which is inherent to
     the tag - the pinned tag is what a reproducible deployment should reference.
-- The brand marker only requires the image name to contain the vendor's token, `cuda` or `maca` (§2 #1),
-  orthogonal to the project/tag choices above.
+- The brand marker requires the image name to contain the vendor's token, `cuda` or `maca`, or the
+  family name `cube-base` for nvidia (§2 #1), orthogonal to the project/tag choices above.
 
 ---
 
@@ -487,9 +486,9 @@ Three images, one per accelerator family, each serving both runtime modes:
 
 | image | base | modes | platforms | compressed |
 |---|---|---|---|---|
-| `ubuntu` | `ubuntu:22.04` (self-authored overlay) | jupyter, ssh | amd64, arm64 | 0.09 GiB (measured) |
-| `cuda-pytorch` | `nvcr.io/nvidia/pytorch:<release>-py3` (mirrored) | jupyter, ssh | amd64 | 10.56 GiB |
-| `maca-pytorch` | `public-library/maca-pytorch:<ver>-<os>-<arch>` (mirrored) | jupyter, ssh | amd64 | 10.57 GiB |
+| `minimal` | `ubuntu:22.04` (self-authored overlay) | jupyter, ssh | amd64, arm64 | 0.09 GiB (measured) |
+| `cube-base` | `nvcr.io/nvidia/pytorch:<release>-py3` (mirrored) | jupyter, ssh | amd64 | 10.56 GiB |
+| `maca-base` | `public-library/maca-pytorch:<ver>-<os>-<arch>` (mirrored) | jupyter, ssh | amd64 | 10.57 GiB |
 
 The six images this replaced cost **42.80 GiB** compressed as a naive per-image sum; the three
 cost **21.2 GiB** by the same sum (the CPU image measured 0.09 GiB compressed on 2026-10-19), and
@@ -502,22 +501,22 @@ keep their published tags - pinned `spec.image` values keep pulling - but nothin
 them any more. Deduplicating the shared base layers *inside an offline bundle* is still #128;
 this merge removes the repetition, not the need for it.
 
-### 6.1 `cuda-pytorch` (NVIDIA)
+### 6.1 `cube-base` (NVIDIA)
 
-Shipped as `images/cuda-pytorch/`. This section was written as `base-cuda` on a `nvidia/cuda`
+Shipped as `images/cube-base/`. This section was written as `base-cuda` on a `nvidia/cuda`
 **runtime** base with "bake torch or not" and "runtime or devel" both open; what ships answers both
 at once and not separately, because the base is NVIDIA's own NGC **PyTorch** image
 (`nvcr.io/nvidia/pytorch:<release>-py3`) - the vendor's torch+CUDA stack rather than a bare runtime
 the platform would assemble torch onto. A `nvidia/cuda` base would have meant owning the wheel
 manifest and the CUDA/torch compatibility matrix; this one makes the vendor release the
-compatibility contract, and it is also the image a user of this stack already knows. The naming is
-§5's rule applied to it: an image prepared from the vendor package, not a bare base.
+compatibility contract, and it is also the image a user of this stack already knows. The name is
+the original design's: the platform's (`cube`) base image on the NVIDIA stack (§5).
 
 - **Base**: the NGC PyTorch release, **mirrored verbatim** into
   `harbor.isuanova.com/mirrors/nvcr.io/nvidia/…` and pinned by digest - the same delivery the Metax
   package gets, and for the same reason: a vendor artifact the platform serves rather than republishes,
   so it has no `BASE_MIRRORS` entry in `operator/Makefile` and needs none. It is **amd64-only** (the
-  mirror carries one `linux/amd64` manifest), so the image is single-platform like `maca-pytorch`.
+  mirror carries one `linux/amd64` manifest), so the image is single-platform like `maca-base`.
 - **Unlike the MACA base, it is not bare.** It ships the account - uid/gid 1000 `ubuntu` at
   `/home/ubuntu`, which is the family layout exactly, so the overlay **inherits** it and must not
   `useradd` over it - plus one python 3.12 with torch in its dist-packages (no second interpreter,
@@ -547,11 +546,10 @@ compatibility contract, and it is also the image a user of this stack already kn
   version this release requires, and whether the vendor stack works for uid 1000 once a device is
   present is untested locally.
 
-### 6.2 `maca-pytorch` (Metax)
+### 6.2 `maca-base` (Metax)
 
-Shipped as `images/maca-pytorch/`; this section was written as `base-maca`, and the rename is §5's
-naming rule applied to what actually ships - an image prepared from the vendor package, not a bare
-base.
+Shipped as `images/maca-base/`; the name is the original design's (this section was written as
+`base-maca`): the platform's base image carrying the Metax MACA stack (§5).
 
 - **Gate: cleared, differently than expected.** Metax still has no anonymous public registry (§3.C),
   but the platform does not have to build a MACA base from the commercial package: the upstream vendor
@@ -588,9 +586,9 @@ base.
   are both on-node: the **baked driver** (`/opt/mxdriver` in the base vs. whatever the node injects -
   which wins is untested), and whether the vendor stack works for uid 1000 once a device is present.
 
-### 6.3 `ubuntu` (CPU)
+### 6.3 `minimal` (CPU)
 
-Shipped as `images/ubuntu/`, built on **`ubuntu:22.04`**. This section was written as two candidate
+Shipped as `images/minimal/`, built on **`ubuntu:22.04`**. This section was written as two candidate
 CPU images - a thin overlay on docker-stacks' `minimal-notebook`, and a self-build - with Option A
 recommended. The merge reverses that: the self-build is what ships, for reasons the six-image set
 did not have.
@@ -668,12 +666,12 @@ did not have.
 
 | Item | Conclusion | Status |
 |---|---|---|
-| Three-family model, one image per accelerator family (`ubuntu`, `cuda-pytorch`, `maca-pytorch`), each serving both runtime modes - shared entrypoint, sshd drop-in and jupyter launcher; uniform account `ubuntu`/1000:1000/`$HOME=/home/ubuntu`, named per environment (`spec.runtime`, `spec.storage.mountPath`) | §4 | ✅ decided and shipped in #332; the six-image, per-mode set is retired (old repositories keep their tags) |
+| Three-family model, one image per accelerator family (`minimal`, `cube-base`, `maca-base`), each serving both runtime modes - shared entrypoint, sshd drop-in and jupyter launcher; uniform account `ubuntu`/1000:1000/`$HOME=/home/ubuntu`, named per environment (`spec.runtime`, `spec.storage.mountPath`) | §4 | ✅ decided and shipped in #332; the six-image, per-mode set is retired (old repositories keep their tags) |
 | GPU image = self-authored platform + vendor base (layered reuse) | §4 | ✅ decided |
 | Project `suanova`, host `harbor.isuanova.com` (online) / `harbor.local` (offline) | §5 | ✅ decided |
 | Dockerfiles live in monorepo `images/` | §7 | ✅ decided — landed, with CI on both sides (smoke per PR, publish on merge); the offline export script is still open |
-| NVIDIA image: self-authored platform layer on the **mirrored** NGC PyTorch vendor base, which already supplies the account, the interpreter, torch and JupyterLab — so the "bake torch or not" and "runtime or devel" questions this row used to leave open are answered together by the base choice — plus the shared launcher; amd64-only, both modes in one `cuda-pytorch` image | §6.1 | ✅ shipped in `images/` (the earlier `base-cuda` on a bare `nvidia/cuda` runtime is superseded); ⚠️ **to confirm on an NVIDIA node**: the node's driver against the release's CUDA requirement, and the vendor stack under uid 1000 once a device is present |
-| Metax image: self-authored platform layer on the **mirrored** vendor base, plus the shared launcher (`common/jupyter/` — the vendor base ships none), amd64-only — both modes in one `maca-pytorch` image | §6.2 | ✅ shipped in `images/`; ⚠️ **to confirm on a Metax node**: driver model (the base's baked `/opt/mxdriver` vs. what the node injects) and `mx-smi`/`metax-tech.com/gpu` |
-| CPU image: self-build on `ubuntu:22.04` with `python3`/pip, JupyterLab on the system interpreter, account `ubuntu`/`$HOME=/home/ubuntu`; multi-arch (amd64, arm64); both modes in one `ubuntu` image. The stock docker-stacks overlay (`jovyan`, gid 100) is retired: it was the one layout that needed a `runAsGroup` override | §6.3 | ✅ shipped in `images/` in #332; replaces both the earlier `jupyter-minimal` and `ssh-ubuntu22.04` |
+| NVIDIA image: self-authored platform layer on the **mirrored** NGC PyTorch vendor base, which already supplies the account, the interpreter, torch and JupyterLab — so the "bake torch or not" and "runtime or devel" questions this row used to leave open are answered together by the base choice — plus the shared launcher; amd64-only, both modes in one `cube-base` image | §6.1 | ✅ shipped in `images/` (the earlier `base-cuda` on a bare `nvidia/cuda` runtime is superseded); ⚠️ **to confirm on an NVIDIA node**: the node's driver against the release's CUDA requirement, and the vendor stack under uid 1000 once a device is present |
+| Metax image: self-authored platform layer on the **mirrored** vendor base, plus the shared launcher (`common/jupyter/` — the vendor base ships none), amd64-only — both modes in one `maca-base` image | §6.2 | ✅ shipped in `images/`; ⚠️ **to confirm on a Metax node**: driver model (the base's baked `/opt/mxdriver` vs. what the node injects) and `mx-smi`/`metax-tech.com/gpu` |
+| CPU image: self-build on `ubuntu:22.04` with `python3`/pip, JupyterLab on the system interpreter, account `ubuntu`/`$HOME=/home/ubuntu`; multi-arch (amd64, arm64); both modes in one `minimal` image. The stock docker-stacks overlay (`jovyan`, gid 100) is retired: it was the one layout that needed a `runAsGroup` override | §6.3 | ✅ shipped in `images/` in #332; replaces both the earlier `jupyter-minimal` and `ssh-ubuntu22.04` |
 | Gaps A/B/C/D closure | §8 | ✅ all four closed: A and C controller-side, B and D image-side (D by #332) |
 

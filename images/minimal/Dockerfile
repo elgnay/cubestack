@@ -1,4 +1,4 @@
-# Cubestack 'ubuntu' DevEnvironment image — the CPU family.
+# Cubestack 'minimal' DevEnvironment image — the CPU family.
 #
 # Serves BOTH modes from one container, selected at run time by CUBSTACK_TYPE (which the
 # controller injects from spec.type, common/entrypoint.sh):
@@ -17,9 +17,9 @@
 # Build context MUST be images/ (not this directory) so common/ is COPYable, and the platform
 # must be named: the base is multi-arch, so a bare `docker build` resolves it to the *host*
 # architecture and an arm64 host would publish an arm64-only image.
-#   docker build --platform linux/amd64 -f ubuntu/Dockerfile \
-#     -t harbor.isuanova.com/suanova/ubuntu:<tag> images/
-#   (or: make -C images build-ubuntu)
+#   docker build --platform linux/amd64 -f minimal/Dockerfile \
+#     -t harbor.isuanova.com/suanova/minimal:<tag> images/
+#   (or: make -C images build-minimal)
 
 # Base: the Ubuntu release tag plus the digest of the platform registry's copy of it, which
 # is what the build resolves (BASE_ARGS, images/Makefile). The digest is there because the

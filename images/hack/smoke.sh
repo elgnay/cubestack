@@ -6,11 +6,11 @@
 # image per accelerator family, and each serves BOTH modes — CUBSTACK_TYPE, which
 # the controller injects from spec.type, decides what the container is:
 #
-#   ubuntu        the CPU family, built on plain ubuntu:22.04 with python3 and
+#   minimal       the CPU family, built on plain ubuntu:22.04 with python3 and
 #                 JupyterLab; account 'ubuntu' uid/gid 1000, home /home/ubuntu
-#   maca-pytorch  the Metax MACA family, the same platform layer on the vendor base,
+#   maca-base     the Metax MACA family, the same platform layer on the vendor base,
 #                 whose default python3 (and torch) must be the vendor's own
-#   cuda-pytorch  the NVIDIA NGC PyTorch family, the same layer on NVIDIA's base,
+#   cube-base     the NVIDIA NGC PyTorch family, the same layer on NVIDIA's base,
 #                 whose account python3 imports the vendor torch
 #
 # Each family is run five ways, because the mode is no longer something the image
@@ -50,8 +50,8 @@
 # /run/ssh is absolute: outside $HOME, which a workspace claim may cover and make
 # unwritable.
 #
-# Reads IMG_UBUNTU / IMG_MACA / IMG_CUDA from the environment (the Makefile sets them).
-# Usage: hack/smoke.sh [--ubuntu|--maca|--cuda]   (default: all)
+# Reads IMG_MINIMAL / IMG_MACA / IMG_CUBE from the environment (the Makefile sets them).
+# Usage: hack/smoke.sh [--minimal|--maca-base|--cube-base]   (default: all)
 set -euo pipefail
 
 # Resolved before the cd: --help prints this file, and $0 is relative to wherever the
@@ -60,24 +60,24 @@ self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
 cd "$(dirname "$self")/.." # images/ workspace root
 
 # Fallback tags mirror the Makefile default: TAG is the short commit SHA, and each vendor
-# image prefixes it with the axes its published tag carries (MACA_TAG / CUDA_TAG in the
+# image prefixes it with the axes its published tag carries (MACA_TAG / CUBE_TAG in the
 # Makefile — keep the two in step). Only a direct call reaches these: the Makefile passes
 # every ref it built with.
 TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)}"
-IMG_UBUNTU="${IMG_UBUNTU:-harbor.isuanova.com/suanova/ubuntu:$TAG}"
-IMG_MACA="${IMG_MACA:-harbor.isuanova.com/suanova/maca-pytorch:3.9.0.12-py310-torch2.4-$TAG}"
-# One axis, not three: the NGC release pins python, torch and CUDA together, so CUDA_TAG is that
+IMG_MINIMAL="${IMG_MINIMAL:-harbor.isuanova.com/suanova/minimal:$TAG}"
+IMG_MACA="${IMG_MACA:-harbor.isuanova.com/suanova/maca-base:3.9.0.12-py310-torch2.4-$TAG}"
+# One axis, not three: the NGC release pins python, torch and CUDA together, so CUBE_TAG is that
 # release and nothing else.
-IMG_CUDA="${IMG_CUDA:-harbor.isuanova.com/suanova/cuda-pytorch:26.08-$TAG}"
+IMG_CUBE="${IMG_CUBE:-harbor.isuanova.com/suanova/cube-base:26.08-$TAG}"
 CONTAINER_TOOL="${CONTAINER_TOOL:-docker}"
 
-run_ubuntu=1
-run_maca=1
-run_cuda=1
+run_minimal=1
+run_maca_base=1
+run_cube_base=1
 case "${1:-}" in
-  --ubuntu) run_maca=0; run_cuda=0 ;;
-  --maca) run_ubuntu=0; run_cuda=0 ;;
-  --cuda) run_ubuntu=0; run_maca=0 ;;
+  --minimal) run_maca_base=0; run_cube_base=0 ;;
+  --maca-base) run_minimal=0; run_cube_base=0 ;;
+  --cube-base) run_minimal=0; run_maca_base=0 ;;
   -h | --help) awk 'NR > 1 && /^set -euo pipefail$/ { exit } NR > 1' "$self"; exit 0 ;;
   "") ;;
   *) echo "cubestack smoke: unknown option '$1'" >&2; exit 1 ;;
@@ -773,75 +773,75 @@ check_jupyter_home() {
 }
 
 # ---------------------------------------------------------------------------
-# ubuntu (the CPU family: JupyterLab + sshd from one image)
+# minimal (the CPU family: JupyterLab + sshd from one image)
 # ---------------------------------------------------------------------------
-if [ "$run_ubuntu" = 1 ]; then
-  echo "== smoke: $IMG_UBUNTU (ubuntu) =="
+if [ "$run_minimal" = 1 ]; then
+  echo "== smoke: $IMG_MINIMAL (minimal) =="
   base="/dev/ns/env"
 
   # jupyter + sshd, the shape a jupyter-type environment with ssh enabled gets.
-  ubuntu_cont="cs-smoke-ubuntu-$$"
-  make_secret "$tmp/ubuntussh"
-  ensure_mount_readable "$IMG_UBUNTU" "$tmp/ubuntussh/host/ssh_host_ed25519_key"
+  minimal_cont="cs-smoke-minimal-$$"
+  make_secret "$tmp/minimalssh"
+  ensure_mount_readable "$IMG_MINIMAL" "$tmp/minimalssh/host/ssh_host_ed25519_key"
 
-  start "$ubuntu_cont" \
+  start "$minimal_cont" \
     --user 1000:1000 \
     -p 127.0.0.1::8888 \
     -p 127.0.0.1::2222 \
     -e JUPYTER_TOKEN=testtoken \
     -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
-    -v "$tmp/ubuntussh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/ubuntussh/keys:/run/ssh:ro" \
-    "$IMG_UBUNTU"
-  ubuntu_port="$(port_of "$ubuntu_cont" 8888)"
-  ubuntu_ssh_port="$(port_of "$ubuntu_cont" 2222)"
+    -v "$tmp/minimalssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$tmp/minimalssh/keys:/run/ssh:ro" \
+    "$IMG_MINIMAL"
+  minimal_port="$(port_of "$minimal_cont" 8888)"
+  minimal_ssh_port="$(port_of "$minimal_cont" 2222)"
 
-  wait_jupyter "$ubuntu_cont" "$ubuntu_port" "$base" 120 "ubuntu"
-  check_jupyter_http "$ubuntu_port" "$base" "ubuntu"
+  wait_jupyter "$minimal_cont" "$minimal_port" "$base" 120 "minimal"
+  check_jupyter_http "$minimal_port" "$base" "minimal"
 
-  id_out="$("$CONTAINER_TOOL" exec "$ubuntu_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
+  id_out="$("$CONTAINER_TOOL" exec "$minimal_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
   if [ "$id_out" = "1000 1000" ]; then
-    ok "ubuntu container runs as uid 1000 gid 1000"
+    ok "minimal container runs as uid 1000 gid 1000"
   else
-    bad "ubuntu expected '1000 1000', got '$id_out'"
+    bad "minimal expected '1000 1000', got '$id_out'"
   fi
 
-  check_jupyter_ssh "$ubuntu_cont" "$ubuntu_ssh_port" "$tmp/ubuntussh" "ubuntu"
-  "$CONTAINER_TOOL" rm -f "$ubuntu_cont" >/dev/null 2>&1 || true
+  check_jupyter_ssh "$minimal_cont" "$minimal_ssh_port" "$tmp/minimalssh" "minimal"
+  "$CONTAINER_TOOL" rm -f "$minimal_cont" >/dev/null 2>&1 || true
 
   # jupyter with no ssh Secret: sshd must not start.
-  check_jupyter_only "$IMG_UBUNTU" "cs-smoke-ubuntu-juponly-$$" "ubuntu jupyter-only"
+  check_jupyter_only "$IMG_MINIMAL" "cs-smoke-minimal-juponly-$$" "minimal jupyter-only"
 
   # ssh alone, as CUBSTACK_TYPE=ssh states it.
-  ubuntu_ssh_cont="cs-smoke-ubuntu-ssh-$$"
-  check_ssh_mode "$IMG_UBUNTU" "$ubuntu_ssh_cont" "$tmp/ubuntusshonly" "ubuntu ssh-only"
-  "$CONTAINER_TOOL" rm -f "$ubuntu_ssh_cont" >/dev/null 2>&1 || true
+  minimal_ssh_cont="cs-smoke-minimal-ssh-$$"
+  check_ssh_mode "$IMG_MINIMAL" "$minimal_ssh_cont" "$tmp/minimalsshonly" "minimal ssh-only"
+  "$CONTAINER_TOOL" rm -f "$minimal_ssh_cont" >/dev/null 2>&1 || true
 
   # ssh mode without a host key is a refusal, not a fallback.
-  check_ssh_requires_key "$IMG_UBUNTU" "ubuntu"
+  check_ssh_requires_key "$IMG_MINIMAL" "minimal"
 
   # Root, in both modes: ssh always, and jupyter where the launcher has to serve the
   # derived home rather than the account the image bakes.
-  check_root_ssh "$IMG_UBUNTU" "$tmp/ubunturoot" "cs-smoke-ubunturoot-$$" \
-    "ubuntu jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
-  check_root_ssh "$IMG_UBUNTU" "$tmp/ubunturootssh" "cs-smoke-ubunturootssh-$$" \
-    "ubuntu ssh as root" -e CUBSTACK_TYPE=ssh
-  check_jupyter_home "$IMG_UBUNTU" /root \
-    "ubuntu as root: jupyter serves the derived home, /root"
-  check_jupyter_home "$IMG_UBUNTU" /workspace/home \
-    "ubuntu as root: a declared HOME is served instead" \
+  check_root_ssh "$IMG_MINIMAL" "$tmp/minimalroot" "cs-smoke-minimalroot-$$" \
+    "minimal jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
+  check_root_ssh "$IMG_MINIMAL" "$tmp/minimalrootssh" "cs-smoke-minimalrootssh-$$" \
+    "minimal ssh as root" -e CUBSTACK_TYPE=ssh
+  check_jupyter_home "$IMG_MINIMAL" /root \
+    "minimal as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_MINIMAL" /workspace/home \
+    "minimal as root: a declared HOME is served instead" \
     -e HOME=/workspace/home
 fi
 
 # ---------------------------------------------------------------------------
-# maca-pytorch (platform layer on the Metax MACA base: jupyter + sshd)
+# maca-base (platform layer on the Metax MACA base: jupyter + sshd)
 #
-# Same contract and the same assertions as ubuntu — the overlay is what differs, not the
+# Same contract and the same assertions as minimal — the overlay is what differs, not the
 # operator-facing behaviour it has to satisfy. What it adds is that the vendor stack is
 # reachable by the account that runs the container, in both modes.
 # ---------------------------------------------------------------------------
-if [ "$run_maca" = 1 ]; then
-  echo "== smoke: $IMG_MACA (maca-pytorch) =="
+if [ "$run_maca_base" = 1 ]; then
+  echo "== smoke: $IMG_MACA (maca-base) =="
   base="/dev/ns/env"
 
   maca_cont="cs-smoke-maca-$$"
@@ -860,46 +860,46 @@ if [ "$run_maca" = 1 ]; then
   maca_port="$(port_of "$maca_cont" 8888)"
   maca_ssh_port="$(port_of "$maca_cont" 2222)"
 
-  # 120s rather than the CUDA block's 300: this base's notebook is a pip install onto a
+  # 120s rather than the cube-base block's 300: this base's notebook is a pip install onto a
   # vendor interpreter, not the NGC image's own stack.
-  wait_jupyter "$maca_cont" "$maca_port" "$base" 120 "maca"
-  check_jupyter_http "$maca_port" "$base" "maca"
+  wait_jupyter "$maca_cont" "$maca_port" "$base" 120 "maca-base"
+  check_jupyter_http "$maca_port" "$base" "maca-base"
 
   id_out="$("$CONTAINER_TOOL" exec "$maca_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
   if [ "$id_out" = "1000 1000" ]; then
-    ok "maca container runs as uid 1000 gid 1000"
+    ok "maca-base container runs as uid 1000 gid 1000"
   else
-    bad "maca expected '1000 1000', got '$id_out'"
+    bad "maca-base expected '1000 1000', got '$id_out'"
   fi
 
-  check_maca_readable "$maca_cont" "maca"
+  check_maca_readable "$maca_cont" "maca-base"
   # `jupyter` as the tool name: this launcher execs a bare `jupyter`, so the tool it finds
   # is the interpreter the notebook will run on.
-  check_vendor_python "$maca_cont" "maca" jupyter
+  check_vendor_python "$maca_cont" "maca-base" jupyter
 
-  check_jupyter_ssh "$maca_cont" "$maca_ssh_port" "$tmp/macassh" "maca"
+  check_jupyter_ssh "$maca_cont" "$maca_ssh_port" "$tmp/macassh" "maca-base"
   "$CONTAINER_TOOL" rm -f "$maca_cont" >/dev/null 2>&1 || true
 
-  check_jupyter_only "$IMG_MACA" "cs-smoke-maca-juponly-$$" "maca jupyter-only"
+  check_jupyter_only "$IMG_MACA" "cs-smoke-maca-juponly-$$" "maca-base jupyter-only"
 
   maca_ssh_cont="cs-smoke-maca-ssh-$$"
-  check_ssh_mode "$IMG_MACA" "$maca_ssh_cont" "$tmp/macasshonly" "maca ssh-only"
+  check_ssh_mode "$IMG_MACA" "$maca_ssh_cont" "$tmp/macasshonly" "maca-base ssh-only"
   # The vendor toolchain has to be there in the ssh mode too — it is what makes a MACA
   # environment usable for anything but a notebook.
-  check_maca_readable "$maca_ssh_cont" "maca ssh-only"
-  check_vendor_python "$maca_ssh_cont" "maca ssh-only"
+  check_maca_readable "$maca_ssh_cont" "maca-base ssh-only"
+  check_vendor_python "$maca_ssh_cont" "maca-base ssh-only"
   "$CONTAINER_TOOL" rm -f "$maca_ssh_cont" >/dev/null 2>&1 || true
 
-  check_ssh_requires_key "$IMG_MACA" "maca"
+  check_ssh_requires_key "$IMG_MACA" "maca-base"
 
   # Running as root costs the jupyter arm one flag: jupyter-server refuses to start as root
   # without --allow-root. The controller injects it for a root DevEnvironment
   # (::withRootLauncherEnv), and a bare container has no controller, so the run is handed what
   # the pod would carry — this launcher reads NOTEBOOK_ARGS and none of the NB_* trio.
   check_root_ssh "$IMG_MACA" "$tmp/macaroot" "cs-smoke-macaroot-$$" \
-    "maca jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
+    "maca-base jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
   check_root_ssh "$IMG_MACA" "$tmp/macarootssh" "cs-smoke-macarootssh-$$" \
-    "maca ssh as root" -e CUBSTACK_TYPE=ssh
+    "maca-base ssh as root" -e CUBSTACK_TYPE=ssh
 
   # Where a root environment's workspace is. The image bakes the uid-1000 account's home, so the
   # launcher has to decide this itself: a root container's own home is /root, the one the platform
@@ -907,80 +907,80 @@ if [ "$run_maca" = 1 ]; then
   # and the declared one the launcher must leave standing, since that is where the claim really is
   # when a spec names it.
   check_jupyter_home "$IMG_MACA" /root \
-    "maca as root: jupyter serves the derived home, /root"
+    "maca-base as root: jupyter serves the derived home, /root"
   check_jupyter_home "$IMG_MACA" /workspace/home \
-    "maca as root: a declared HOME is served instead" \
+    "maca-base as root: a declared HOME is served instead" \
     -e HOME=/workspace/home
 fi
 
 # ---------------------------------------------------------------------------
-# cuda-pytorch (platform layer on the NVIDIA NGC PyTorch base: jupyter + sshd)
+# cube-base (platform layer on the NVIDIA NGC PyTorch base: jupyter + sshd)
 #
-# The MACA family's shape on the other vendor's base, and the same contract as ubuntu.
+# The MACA family's shape on the other vendor's base, and the same contract as minimal.
 # What differs is what the base brings rather than what the overlay does: no pip step, and
 # no second interpreter to correct the PATH for, since this base installs into the
 # distribution's own python. The vendor stack is therefore asserted by running it —
 # check_vendor_torch and check_notebook_kernel stand where the MACA readability check stands.
 # ---------------------------------------------------------------------------
-if [ "$run_cuda" = 1 ]; then
-  echo "== smoke: $IMG_CUDA (cuda-pytorch) =="
+if [ "$run_cube_base" = 1 ]; then
+  echo "== smoke: $IMG_CUBE (cube-base) =="
   base="/dev/ns/env"
 
-  cuda_cont="cs-smoke-cuda-$$"
-  make_secret "$tmp/cudassh"
-  ensure_mount_readable "$IMG_CUDA" "$tmp/cudassh/host/ssh_host_ed25519_key"
+  cube_cont="cs-smoke-cube-$$"
+  make_secret "$tmp/cubessh"
+  ensure_mount_readable "$IMG_CUBE" "$tmp/cubessh/host/ssh_host_ed25519_key"
 
-  start "$cuda_cont" \
+  start "$cube_cont" \
     --user 1000:1000 \
     -p 127.0.0.1::8888 \
     -p 127.0.0.1::2222 \
     -e JUPYTER_TOKEN=testtoken \
     -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
-    -v "$tmp/cudassh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/cudassh/keys:/run/ssh:ro" \
-    "$IMG_CUDA"
-  cuda_port="$(port_of "$cuda_cont" 8888)"
-  cuda_ssh_port="$(port_of "$cuda_cont" 2222)"
+    -v "$tmp/cubessh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$tmp/cubessh/keys:/run/ssh:ro" \
+    "$IMG_CUBE"
+  cube_port="$(port_of "$cube_cont" 8888)"
+  cube_ssh_port="$(port_of "$cube_cont" 2222)"
 
   # 300s where the other families wait 120: this base's JupyterLab is a far larger import, and
   # the local run is the amd64 image under emulation. CI runs it natively and breaks out at the
   # first answer either way, so the ceiling only costs a failing run its wall-clock.
-  wait_jupyter "$cuda_cont" "$cuda_port" "$base" 300 "cuda"
-  check_jupyter_http "$cuda_port" "$base" "cuda"
+  wait_jupyter "$cube_cont" "$cube_port" "$base" 300 "cube-base"
+  check_jupyter_http "$cube_port" "$base" "cube-base"
 
-  id_out="$("$CONTAINER_TOOL" exec "$cuda_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
+  id_out="$("$CONTAINER_TOOL" exec "$cube_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
   if [ "$id_out" = "1000 1000" ]; then
-    ok "cuda container runs as uid 1000 gid 1000"
+    ok "cube-base container runs as uid 1000 gid 1000"
   else
-    bad "cuda expected '1000 1000', got '$id_out'"
+    bad "cube-base expected '1000 1000', got '$id_out'"
   fi
 
-  check_vendor_torch "$cuda_cont" "cuda"
-  check_notebook_kernel "$cuda_cont" "cuda"
+  check_vendor_torch "$cube_cont" "cube-base"
+  check_notebook_kernel "$cube_cont" "cube-base"
 
-  check_jupyter_ssh "$cuda_cont" "$cuda_ssh_port" "$tmp/cudassh" "cuda"
-  "$CONTAINER_TOOL" rm -f "$cuda_cont" >/dev/null 2>&1 || true
+  check_jupyter_ssh "$cube_cont" "$cube_ssh_port" "$tmp/cubessh" "cube-base"
+  "$CONTAINER_TOOL" rm -f "$cube_cont" >/dev/null 2>&1 || true
 
-  check_jupyter_only "$IMG_CUDA" "cs-smoke-cuda-juponly-$$" "cuda jupyter-only"
+  check_jupyter_only "$IMG_CUBE" "cs-smoke-cube-juponly-$$" "cube-base jupyter-only"
 
-  cuda_ssh_cont="cs-smoke-cuda-ssh-$$"
-  check_ssh_mode "$IMG_CUDA" "$cuda_ssh_cont" "$tmp/cudasshonly" "cuda ssh-only"
-  check_vendor_torch "$cuda_ssh_cont" "cuda ssh-only"
-  "$CONTAINER_TOOL" rm -f "$cuda_ssh_cont" >/dev/null 2>&1 || true
+  cube_ssh_cont="cs-smoke-cube-ssh-$$"
+  check_ssh_mode "$IMG_CUBE" "$cube_ssh_cont" "$tmp/cubesshonly" "cube-base ssh-only"
+  check_vendor_torch "$cube_ssh_cont" "cube-base ssh-only"
+  "$CONTAINER_TOOL" rm -f "$cube_ssh_cont" >/dev/null 2>&1 || true
 
-  check_ssh_requires_key "$IMG_CUDA" "cuda"
+  check_ssh_requires_key "$IMG_CUBE" "cube-base"
 
-  check_root_ssh "$IMG_CUDA" "$tmp/cudaroot" "cs-smoke-cudaroot-$$" \
-    "cuda jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
-  check_root_ssh "$IMG_CUDA" "$tmp/cudarootssh" "cs-smoke-cudarootssh-$$" \
-    "cuda ssh as root" -e CUBSTACK_TYPE=ssh
+  check_root_ssh "$IMG_CUBE" "$tmp/cuberoot" "cs-smoke-cuberoot-$$" \
+    "cube-base jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
+  check_root_ssh "$IMG_CUBE" "$tmp/cuberootssh" "cs-smoke-cuberootssh-$$" \
+    "cube-base ssh as root" -e CUBSTACK_TYPE=ssh
 
   # The root branch of the shared launcher: root's own home is the one the platform derives for a
   # root environment and mounts the claim at, and a declared HOME is left standing.
-  check_jupyter_home "$IMG_CUDA" /root \
-    "cuda as root: jupyter serves the derived home, /root"
-  check_jupyter_home "$IMG_CUDA" /workspace/home \
-    "cuda as root: a declared HOME is served instead" \
+  check_jupyter_home "$IMG_CUBE" /root \
+    "cube-base as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_CUBE" /workspace/home \
+    "cube-base as root: a declared HOME is served instead" \
     -e HOME=/workspace/home
 fi
 

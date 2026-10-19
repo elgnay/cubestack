@@ -9,7 +9,7 @@
 CONTAINER_TOOL ?= docker
 
 # The architecture every published image must run on: the cluster's nodes are amd64, and the
-# machine building them may not be. The ubuntu family's Dockerfile starts from a multi-arch base,
+# machine building them may not be. The minimal family's Dockerfile starts from a multi-arch base,
 # and without --platform `docker build` resolves that base to the *host* architecture — so a build
 # on an arm64 host publishes an arm64-only image and every amd64 node then fails to pull it ("no
 # match for platform in manifest"). Naming the platform makes the build independent of the host;
@@ -38,10 +38,10 @@ PLATFORMS_ARG = $(foreach p,$(PLATFORMS),--platform $(p))
 # push, which buildx supports.
 MACA_PLATFORM ?= linux/amd64
 
-# The CUDA image is single-platform for the same reason and by the same mechanism: its vendor base
+# The cube-base image is single-platform for the same reason and by the same mechanism: its vendor base
 # is published per architecture too — the mirror serves one linux/amd64 manifest — so there is no
 # arm64 layer to build an arm64 manifest from either. Kept out of PLATFORMS and named here.
-CUDA_PLATFORM ?= linux/amd64
+CUBE_PLATFORM ?= linux/amd64
 
 # Buildkit's provenance and SBOM attestations are off. Harbor rejects an index carrying
 # them with a 404 on the manifest PUT — "artifact ... not found" — even when every
@@ -77,7 +77,7 @@ BASE_ARGS ?= \
 	--build-arg MACA_BASE=$(MACA_BASE) \
 	--build-arg CUDA_BASE=$(CUDA_BASE)
 
-# Base release of the ubuntu family image — the CPU image, built on plain ubuntu:<version>.
+# Base release of the minimal family image — the CPU image, built on plain ubuntu:<version>.
 # It selects the build base and nothing else; it is looked up in UBUNTU_BASE_DIGESTS below, so
 # a release and its digest can never be chosen apart.
 UBUNTU_VERSION ?= 22.04
@@ -85,7 +85,7 @@ UBUNTU_VERSION ?= 22.04
 # The pinned base, one entry per supported Ubuntu release, as <version>=<digest of the
 # platform registry's copy>. A release with no entry has no base to build from: its tag would
 # carry another release's digest, which the build resolves — so it would either fail the pull
-# or build a release the image does not claim. `make build-ubuntu UBUNTU_VERSION=24.04`
+# or build a release the image does not claim. `make build-minimal UBUNTU_VERSION=24.04`
 # stops in check-ubuntu-base instead, until 24.04 is mirrored and pinned here.
 UBUNTU_BASE_DIGESTS = 22.04=sha256:b8b6ee6aa931ecd9d0d952abc34dc0e5f7c6a30c6bb71b079fe399fde0329c02
 
@@ -153,15 +153,14 @@ TAG      ?= $(shell git rev-parse --short HEAD 2>/dev/null)
 # One repository per accelerator family: the image carries the stack, and the mode (jupyter or
 # ssh) is chosen at run time by CUBSTACK_TYPE, so there is no image-per-mode axis any more.
 #
-# The CPU family's name is the base it is built on, so `ubuntu` is both the repository and the
-# release axis (UBUNTU_VERSION above).
-UBUNTU_REPO = $(REGISTRY)/$(PROJECT)/ubuntu
-# The repository is named for the vendor stack it carries, not for its base image: several MACA
-# packages (maca, maca-pytorch, maca-tensorflow) can share one overlay, and the base is the one
-# thing that moves between them — so the name stays and MACA_BASE is what changes.
-MACA_REPO   = $(REGISTRY)/$(PROJECT)/maca-pytorch
-# The NVIDIA twin, named by the same rule: the vendor stack it carries, not its base image.
-CUDA_REPO   = $(REGISTRY)/$(PROJECT)/cuda-pytorch
+# The CPU family is `minimal`; its base is plain ubuntu:<UBUNTU_VERSION> (above), which is a
+# build detail the repository name no longer repeats.
+MINIMAL_REPO = $(REGISTRY)/$(PROJECT)/minimal
+# The vendor families are named `maca-base` and `cube-base`: they carry the vendor's stack on
+# top of the vendor base, and a base package bump (MACA_PACKAGE / CUDA_PACKAGE below) moves
+# the layers without moving the name.
+MACA_REPO   = $(REGISTRY)/$(PROJECT)/maca-base
+CUBE_REPO   = $(REGISTRY)/$(PROJECT)/cube-base
 
 # The MACA image's tag carries the vendor axes a user picks between (decision doc §5), not only the
 # commit: this is the one base the platform does not choose, and the vendor package version is the
@@ -180,7 +179,7 @@ MACA_PKG_TORCH   = $(filter torch%,$(MACA_PKG_FIELDS))
 MACA_TAG_AXES    = $(MACA_PKG_VERSION)-$(MACA_PKG_PY)-$(MACA_PKG_TORCH)
 MACA_TAG        ?= $(MACA_TAG_AXES)-$(TAG)
 
-# The CUDA image's tag carries its vendor release for the same reason, and is derived the same way —
+# The cube-base image's tag carries its vendor release for the same reason, and is derived the same way —
 # but the NGC tag has a different shape, so the derivation is not the same one. `pytorch:26.08-py3`
 # encodes no torch axis: the release *is* the combination of python, torch and CUDA, pinned
 # together upstream, which is why the whole compatibility contract is the release. What is read out
@@ -188,17 +187,17 @@ MACA_TAG        ?= $(MACA_TAG_AXES)-$(TAG)
 # remaining field is dropped rather than appended: '-py3' names a python the release already
 # fixes, with one interpreter in the image for it to be ambiguous about.
 CUDA_PKG_VERSION = $(firstword $(subst -, ,$(lastword $(subst :, ,$(CUDA_PACKAGE)))))
-CUDA_TAG        ?= $(CUDA_PKG_VERSION)-$(TAG)
+CUBE_TAG        ?= $(CUDA_PKG_VERSION)-$(TAG)
 
-IMG_UBUNTU ?= $(UBUNTU_REPO):$(TAG)
-IMG_MACA   ?= $(MACA_REPO):$(MACA_TAG)
-IMG_CUDA   ?= $(CUDA_REPO):$(CUDA_TAG)
+IMG_MINIMAL ?= $(MINIMAL_REPO):$(TAG)
+IMG_MACA    ?= $(MACA_REPO):$(MACA_TAG)
+IMG_CUBE    ?= $(CUBE_REPO):$(CUBE_TAG)
 
 # The moving publish tag: added by `make push`, never produced by `make build`, so a
 # local :latest means it came from a publish.
-LATEST_UBUNTU = $(UBUNTU_REPO):latest
-LATEST_MACA   = $(MACA_REPO):latest
-LATEST_CUDA   = $(CUDA_REPO):latest
+LATEST_MINIMAL = $(MINIMAL_REPO):latest
+LATEST_MACA    = $(MACA_REPO):latest
+LATEST_CUBE    = $(CUBE_REPO):latest
 
 # Whether `make push` also moves :latest. A caller that may not move it — CI, which
 # only moves :latest when the run's commit is still the head of main — passes
@@ -207,17 +206,17 @@ LATEST_CUDA   = $(CUDA_REPO):latest
 # whole index a second time. See .github/workflows/ci-images.yml.
 PUSH_LATEST ?= 1
 
-LATEST_ARG_UBUNTU = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_UBUNTU))
-LATEST_ARG_MACA   = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MACA))
-LATEST_ARG_CUDA   = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_CUDA))
+LATEST_ARG_MINIMAL = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MINIMAL))
+LATEST_ARG_MACA    = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_MACA))
+LATEST_ARG_CUBE    = $(if $(filter 1,$(PUSH_LATEST)),-t $(LATEST_CUBE))
 
-.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base check-cuda-base check-deps check-select build build-ubuntu build-maca build-cuda \
-	smoke smoke-ubuntu smoke-maca smoke-cuda push push-ubuntu push-maca push-cuda retag-latest \
-	retag-latest-ubuntu retag-latest-maca retag-latest-cuda
+.PHONY: help check-tag check-platform check-platforms check-push-latest check-ubuntu-base check-maca-base check-cuda-base check-deps check-select build build-minimal build-maca-base build-cube-base \
+	smoke smoke-minimal smoke-maca-base smoke-cube-base push push-minimal push-maca-base push-cube-base retag-latest \
+	retag-latest-minimal retag-latest-maca-base retag-latest-cube-base
 
 .DEFAULT_GOAL := help
 
-# Every build/smoke/push target funnels through build-ubuntu, build-maca or build-cuda, so this
+# Every build/smoke/push target funnels through build-minimal, build-maca-base or build-cube-base, so this
 # is the one place a missing TAG has to be caught.
 check-tag:
 	@test -n "$(TAG)" || { \
@@ -260,7 +259,7 @@ check-push-latest:
 		   exit 1;; \
 	esac
 
-# UBUNTU_VERSION selects the base the ubuntu image is built from, so a release misspelled or not
+# UBUNTU_VERSION selects the base the minimal image is built from, so a release misspelled or not
 # yet pinned would build against a tag carrying another release's digest — a base the image does
 # not claim. Only the defaulted BASE_ARGS is guarded — that one is this file's own pin, and the
 # lookup is what has to answer. A caller-supplied BASE_ARGS is the caller's own base, pinned or
@@ -295,7 +294,7 @@ check-maca-base:
 		echo "                then verify the digest against the mirror rather than the tag." >&2; \
 		exit 1; }
 
-# CUDA_TAG is read out of CUDA_PACKAGE too, and its derivation reads only the first field of the
+# CUBE_TAG is read out of CUDA_PACKAGE too, and its derivation reads only the first field of the
 # tag — so a re-tagged or renamed release whose version cannot be picked out would publish
 # '-<sha>', a name with no vendor release in it at all. Stop instead; the fix is the derivation
 # above.
@@ -331,54 +330,54 @@ check-deps: ## Assert no Dockerfile reads from outside common/ and its own direc
 check-select: ## Run the image-selection rule's fixtures
 	hack/changed-images.test.sh
 
-build: build-ubuntu build-maca build-cuda ## Build every image
+build: build-minimal build-maca-base build-cube-base ## Build every image
 
-build-ubuntu: check-tag check-platform check-ubuntu-base ## Build the CPU (ubuntu) image
+build-minimal: check-tag check-platform check-ubuntu-base ## Build the CPU (minimal) image
 	$(CONTAINER_TOOL) build --platform "$(PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) --build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
-		-f ubuntu/Dockerfile -t $(IMG_UBUNTU) .
+		-f minimal/Dockerfile -t $(IMG_MINIMAL) .
 
-# MACA_PLATFORM, not PLATFORM: the MACA image has no arm64 base to build from, so it stays
-# amd64 on every host rather than following the platform the ubuntu image builds for.
-build-maca: check-tag check-maca-base ## Build the metax MACA image (linux/amd64 only)
+# MACA_PLATFORM, not PLATFORM: the maca-base image has no arm64 base to build from, so it stays
+# amd64 on every host rather than following the platform the minimal image builds for.
+build-maca-base: check-tag check-maca-base ## Build the Metax (maca-base) image (linux/amd64 only)
 	$(CONTAINER_TOOL) build --platform "$(MACA_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
-		-f maca-pytorch/Dockerfile -t $(IMG_MACA) .
+		-f maca-base/Dockerfile -t $(IMG_MACA) .
 
-# CUDA_PLATFORM, for the same reason.
+# CUBE_PLATFORM, for the same reason.
 #
 # No PIP_INDEX_URL_ARG: this overlay installs nothing from pip — the NGC base carries its own
 # jupyter stack.
-build-cuda: check-tag check-cuda-base ## Build the NVIDIA CUDA image (linux/amd64 only)
-	$(CONTAINER_TOOL) build --platform "$(CUDA_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) \
-		-f cuda-pytorch/Dockerfile -t $(IMG_CUDA) .
+build-cube-base: check-tag check-cuda-base ## Build the NVIDIA (cube-base) image (linux/amd64 only)
+	$(CONTAINER_TOOL) build --platform "$(CUBE_PLATFORM)" $(BASE_ARGS) $(APT_MIRROR_ARG) \
+		-f cube-base/Dockerfile -t $(IMG_CUBE) .
 
 smoke: build ## Build and run the full local Docker smoke
-	IMG_UBUNTU=$(IMG_UBUNTU) IMG_MACA=$(IMG_MACA) IMG_CUDA=$(IMG_CUDA) hack/smoke.sh
+	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh
 
-smoke-ubuntu: build-ubuntu ## Build and smoke only the ubuntu image
-	IMG_UBUNTU=$(IMG_UBUNTU) IMG_MACA=$(IMG_MACA) IMG_CUDA=$(IMG_CUDA) hack/smoke.sh --ubuntu
+smoke-minimal: build-minimal ## Build and smoke only the minimal image
+	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --minimal
 
-smoke-maca: build-maca ## Build and smoke only the metax MACA image
-	IMG_UBUNTU=$(IMG_UBUNTU) IMG_MACA=$(IMG_MACA) IMG_CUDA=$(IMG_CUDA) hack/smoke.sh --maca
+smoke-maca-base: build-maca-base ## Build and smoke only the Metax (maca-base) image
+	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --maca-base
 
-smoke-cuda: build-cuda ## Build and smoke only the NVIDIA CUDA image
-	IMG_UBUNTU=$(IMG_UBUNTU) IMG_MACA=$(IMG_MACA) IMG_CUDA=$(IMG_CUDA) hack/smoke.sh --cuda
+smoke-cube-base: build-cube-base ## Build and smoke only the NVIDIA (cube-base) image
+	IMG_MINIMAL=$(IMG_MINIMAL) IMG_MACA=$(IMG_MACA) IMG_CUBE=$(IMG_CUBE) hack/smoke.sh --cube-base
 
-push: push-ubuntu push-maca push-cuda ## Publish every image (TAG + :latest)
+push: push-minimal push-maca-base push-cube-base ## Publish every image (TAG + :latest)
 
-push-ubuntu: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the ubuntu image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
+push-minimal: check-tag check-platforms check-push-latest check-ubuntu-base ## Publish the minimal image as a multi-arch index (TAG, and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build $(PLATFORMS_ARG) $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
 		--build-arg UBUNTU_VERSION=$(UBUNTU_VERSION) \
-		-f ubuntu/Dockerfile -t $(IMG_UBUNTU) $(LATEST_ARG_UBUNTU) --push .
+		-f minimal/Dockerfile -t $(IMG_MINIMAL) $(LATEST_ARG_MINIMAL) --push .
 
 # check-platforms would be checking PLATFORMS, which this target deliberately does not read;
 # MACA_PLATFORM is the whole of what it publishes, and PLATFORMS_ARG is what would break it.
-push-maca: check-tag check-maca-base check-push-latest ## Publish the metax MACA image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
+push-maca-base: check-tag check-maca-base check-push-latest ## Publish the Metax (maca-base) image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
 	$(CONTAINER_TOOL) buildx build --platform "$(MACA_PLATFORM)" $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) $(PIP_INDEX_URL_ARG) \
-		-f maca-pytorch/Dockerfile -t $(IMG_MACA) $(LATEST_ARG_MACA) --push .
+		-f maca-base/Dockerfile -t $(IMG_MACA) $(LATEST_ARG_MACA) --push .
 
-push-cuda: check-tag check-cuda-base check-push-latest ## Publish the NVIDIA CUDA image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
-	$(CONTAINER_TOOL) buildx build --platform "$(CUDA_PLATFORM)" $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
-		-f cuda-pytorch/Dockerfile -t $(IMG_CUDA) $(LATEST_ARG_CUDA) --push .
+push-cube-base: check-tag check-cuda-base check-push-latest ## Publish the NVIDIA (cube-base) image (linux/amd64 only, TAG and :latest unless PUSH_LATEST=0)
+	$(CONTAINER_TOOL) buildx build --platform "$(CUBE_PLATFORM)" $(BUILDX_ATTEST) $(BASE_ARGS) $(APT_MIRROR_ARG) \
+		-f cube-base/Dockerfile -t $(IMG_CUBE) $(LATEST_ARG_CUBE) --push .
 
 # Repoint :latest at a TAG already in the registry rather than rebuilding: imagetools
 # writes an index naming the same manifests, so this cannot publish anything the build
@@ -389,15 +388,15 @@ push-cuda: check-tag check-cuda-base check-push-latest ## Publish the NVIDIA CUD
 # the rest: the ref a skipped image would name is one this run never pushed, so its retag
 # would fail on a missing manifest, and a tag that another run published is that run's to
 # move. Defaults to every image, which is what a human means.
-RETAG ?= ubuntu maca cuda
+RETAG ?= minimal maca-base cube-base
 
 retag-latest: $(addprefix retag-latest-,$(RETAG)) ## Repoint :latest at an already-published TAG (no rebuild; RETAG names the images)
-retag-latest-ubuntu: check-tag
-	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_UBUNTU) $(IMG_UBUNTU)
-retag-latest-maca: check-tag
+retag-latest-minimal: check-tag
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MINIMAL) $(IMG_MINIMAL)
+retag-latest-maca-base: check-tag
 	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_MACA) $(IMG_MACA)
-retag-latest-cuda: check-tag
-	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_CUDA) $(IMG_CUDA)
+retag-latest-cube-base: check-tag
+	$(CONTAINER_TOOL) buildx imagetools create -t $(LATEST_CUBE) $(IMG_CUBE)
 
 help: ## Show this help message
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \

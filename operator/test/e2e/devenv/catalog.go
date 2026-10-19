@@ -36,9 +36,10 @@ const (
 	envTag      = "DEVENV_E2E_TAG"
 )
 
-// The image's own account, shared by the four self-authored images. Having one
-// name for it is also the assertion: these images are built on the same base and
-// serve the same login, and a divergence would be a deliberate change.
+// The image's own account, shared by all three family images. Having one name
+// for it is also the assertion: each family is a different base, and they still
+// serve the same login, the same uid and gid and the same home — a divergence
+// would be a deliberate change.
 const (
 	ubuntuAccount = "ubuntu"
 	ubuntuHome    = "/home/ubuntu"
@@ -53,7 +54,7 @@ type Image struct {
 	// is the registry's to decide anyway.
 	Key string
 
-	// Repo is the image path under the registry: "suanova/jupyter-minimal" style,
+	// Repo is the image path under the registry: "suanova/minimal" style,
 	// without the registry host or the tag.
 	Repo string
 
@@ -74,13 +75,6 @@ type Image struct {
 	// Home is the account's home as the image bakes it, and the default workspace
 	// mount path the controller derives from spec.runtime.user.
 	Home string
-
-	// GroupOnlyWorkaround is true for the stock docker-stacks images, whose
-	// account is 1000:100 but whose platform default group is 1000. The manifest
-	// must state runAsGroup explicitly for those, and omitting it is the failure
-	// this field exists to prevent. The self-authored images are 1000:1000 and
-	// need no securityContext at all.
-	GroupOnlyWorkaround bool
 
 	// Stack is the image's own toolchain, as a probe a session runs to prove the
 	// session's PATH resolves it. Empty for an image that is a base system and
@@ -117,43 +111,50 @@ func (i Image) Ref() string {
 	return fmt.Sprintf("%s/%s:%s", registry, i.Repo, tag)
 }
 
-// Images is every published DevEnvironment image.
+// Images is every published DevEnvironment image, one entry per family and
+// runtime mode.
+//
+// The key is family × mode rather than the repository alone, because the mode is
+// a property of the environment, not of the image: the same reference serves an
+// SSH environment and a Jupyter one, and the entries differ only in the Type
+// they state and the stack the environment is expected to expose. Keeping both
+// modes in the catalogue is what lets the matrix assert the mode switch on the
+// image the offline package actually ships.
 //
 // Order matters only for the report: environments come up one at a time and the
 // cheap ones first means a broken cluster is diagnosed before the first
 // multi-gigabyte pull rather than after it.
 var Images = []Image{
 	{
-		Key:     "ssh-ubuntu22.04",
-		Repo:    "suanova/ssh-ubuntu22.04",
+		Key:     "minimal-ssh",
+		Repo:    "suanova/minimal",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,
 		GID:     1000,
 		Home:    ubuntuHome,
-		// No stack: ubuntu:22.04 with sshd and nothing else, which is what the
-		// image is for — a session that reaches the workspace, not a toolchain.
+		// No stack: the minimal image is ubuntu:22.04 with sshd and JupyterLab, and
+		// a session that reaches the workspace is what it is for — not a vendor
+		// toolchain.
 	},
 	{
-		Key:                 "jupyter-minimal",
-		Repo:                "suanova/jupyter-minimal",
-		Type:                aiv1alpha1.DevEnvironmentTypeJupyter,
-		Account:             "jovyan",
-		UID:                 1000,
-		GID:                 100,
-		Home:                "/home/jovyan",
-		GroupOnlyWorkaround: true,
-		// JupyterLab is the stack here, and the interpreter that serves it is the
-		// conda one the base publishes — the same interpreter the notebook kernel
-		// and the ssh session have to agree on.
+		Key:     "minimal-jupyter",
+		Repo:    "suanova/minimal",
+		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
+		Account: ubuntuAccount,
+		UID:     1000,
+		GID:     1000,
+		Home:    ubuntuHome,
+		// JupyterLab is the stack here, on the image's one interpreter — the same
+		// interpreter the notebook kernel and the ssh session have to agree on.
 		Stack: Stack{
 			Name:    "jupyterlab",
 			Command: `python3 -c 'import jupyterlab; print(jupyterlab.__version__)'`,
 		},
 	},
 	{
-		Key:     "jupyter-maca-pytorch",
-		Repo:    "suanova/jupyter-maca-pytorch",
+		Key:     "maca-base-jupyter",
+		Repo:    "suanova/maca-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -168,8 +169,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "ssh-maca-pytorch",
-		Repo:    "suanova/ssh-maca-pytorch",
+		Key:     "maca-base-ssh",
+		Repo:    "suanova/maca-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -181,8 +182,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "jupyter-cuda-pytorch",
-		Repo:    "suanova/jupyter-cuda-pytorch",
+		Key:     "cube-base-jupyter",
+		Repo:    "suanova/cube-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -197,8 +198,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "ssh-cuda-pytorch",
-		Repo:    "suanova/ssh-cuda-pytorch",
+		Key:     "cube-base-ssh",
+		Repo:    "suanova/cube-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,

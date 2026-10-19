@@ -1,4 +1,4 @@
-# Cubestack 'cuda-pytorch' DevEnvironment image — the NVIDIA family.
+# Cubestack 'cube-base' DevEnvironment image — the NVIDIA family.
 #
 # Serves BOTH modes from one container, selected at run time by CUBSTACK_TYPE (which the
 # controller injects from spec.type, common/entrypoint.sh):
@@ -37,16 +37,16 @@
 #   authorized_keys      -> /run/ssh/authorized_keys        (platform keys, directory mount)
 #
 # Build context MUST be images/ (not this directory) so common/ is COPYable.
-#   docker build --platform linux/amd64 -f cuda-pytorch/Dockerfile \
-#     -t harbor.isuanova.com/suanova/cuda-pytorch:<tag> images/
-#   (or: make -C images build-cuda)
+#   docker build --platform linux/amd64 -f cube-base/Dockerfile \
+#     -t harbor.isuanova.com/suanova/cube-base:<tag> images/
+#   (or: make -C images build-cube-base)
 
 # The platform registry's mirrored copy of the vendor image, which is what a bare `docker build`
 # resolves. Every published build substitutes the same reference pinned by digest through BASE_ARGS
 # in images/Makefile — which is where the base is bumped, and the pin is the only difference.
 #
 # The mirror serves a single-arch manifest (linux/amd64) rather than an index, so this image is
-# amd64-only — see CUDA_PLATFORM in the Makefile.
+# amd64-only — see CUBE_PLATFORM in the Makefile.
 ARG CUDA_BASE=harbor.isuanova.com/mirrors/nvcr.io/nvidia/pytorch:26.08-py3
 FROM ${CUDA_BASE}
 
@@ -54,7 +54,7 @@ FROM ${CUDA_BASE}
 USER root
 
 # Optional apt mirror override for CN/offline builds; empty = upstream. No PIP_INDEX_URL, unlike
-# the ubuntu family: this overlay installs nothing from pip — JupyterLab here is the base's.
+# the minimal family: this overlay installs nothing from pip — JupyterLab here is the base's.
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i -E "s#https?://(archive|ports)\.ubuntu\.com/(ubuntu|ubuntu-ports)#${APT_MIRROR}#g" \

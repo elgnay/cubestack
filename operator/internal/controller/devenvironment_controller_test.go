@@ -61,7 +61,11 @@ import (
 const (
 	testDevImage      = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
 	testBaseMacaImage = "harbor.local/ai-images/base-maca:1.0"
-	testCPUImage      = "harbor.local/ai-images/ssh-ubuntu22.04:latest"
+	testCPUImage      = "harbor.isuanova.com/suanova/minimal:latest"
+	// testCubeBaseImage is the platform's own nvidia family image. Its name
+	// carries no "cuda" token, which is why the nvidia rule accepts the family
+	// name as well.
+	testCubeBaseImage = "harbor.isuanova.com/suanova/cube-base:26.08"
 	// testMetaxImage is the mirror of the upstream Metax package: the metax token
 	// is `maca` in the package's own name, whatever registry path fronts it.
 	testMetaxImage = "harbor.isuanova.com/mirrors/cr.metax-tech.com/public-library/maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64"
@@ -71,7 +75,7 @@ const (
 	// repository name — which the rule accepts, since it reads the whole
 	// reference. Kept to pin that: the gate answers "does the name say its
 	// vendor", not "is this a real platform image".
-	testMacaInPathImage   = "harbor.local/maca-images/ssh-ubuntu22.04:latest"
+	testMacaInPathImage   = "harbor.local/maca-images/minimal:latest"
 	testGPUResource       = "nvidia.com/gpu"
 	testDevEnvGatewayName = "test-gw"
 	// testGatewayDataplaneNamespace is where the test Gateway's proxy pods run.
@@ -1575,7 +1579,10 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				}
 			},
 			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(), true),
+			Entry("nvidia with a cube-base image matches", testCubeBaseImage, nvidiaGPU(), true),
+			Entry("nvidia with a minimal image mismatches", testCPUImage, nvidiaGPU(), false),
 			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(), false),
+			Entry("metax with a cube-base image mismatches", testCubeBaseImage, metaxGPU(), false),
 			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(), false),
 			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(), true),
 			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(), true),

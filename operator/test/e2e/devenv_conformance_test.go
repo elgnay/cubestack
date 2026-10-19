@@ -150,7 +150,7 @@ func teardownDevEnvConformance() {
 // the run reports twelve green environments when it was two different things.
 //
 // The report is by key and not by environment because that is the axis the
-// catalogue is asserted on: "ssh-cuda-pytorch was tested" is true of the key.
+// catalogue is asserted on: "cube-base-ssh was tested" is true of the key.
 //
 // A plain function called from the suite's one AfterSuite rather than an
 // AfterSuite of its own, which Ginkgo allows only one of.
@@ -220,18 +220,18 @@ var environments = []struct {
 	image    devenv.Image
 	identity devenv.Identity
 }{
-	{devenv.MustImage("ssh-ubuntu22.04"), devenv.NonRoot}, // S1
-	{devenv.MustImage("ssh-ubuntu22.04"), devenv.Root},    // S2
-	{devenv.MustImage("jupyter-minimal"), devenv.NonRoot}, // J1, S3
-	{devenv.MustImage("jupyter-minimal"), devenv.Root},    // J2, S4
-	{devenv.MustImage("ssh-maca-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("ssh-maca-pytorch"), devenv.Root},
-	{devenv.MustImage("jupyter-maca-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("jupyter-maca-pytorch"), devenv.Root},
-	{devenv.MustImage("ssh-cuda-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("ssh-cuda-pytorch"), devenv.Root},
-	{devenv.MustImage("jupyter-cuda-pytorch"), devenv.NonRoot},
-	{devenv.MustImage("jupyter-cuda-pytorch"), devenv.Root},
+	{devenv.MustImage("minimal-ssh"), devenv.NonRoot},     // S1
+	{devenv.MustImage("minimal-ssh"), devenv.Root},        // S2
+	{devenv.MustImage("minimal-jupyter"), devenv.NonRoot}, // J1, S3
+	{devenv.MustImage("minimal-jupyter"), devenv.Root},    // J2, S4
+	{devenv.MustImage("maca-base-ssh"), devenv.NonRoot},
+	{devenv.MustImage("maca-base-ssh"), devenv.Root},
+	{devenv.MustImage("maca-base-jupyter"), devenv.NonRoot},
+	{devenv.MustImage("maca-base-jupyter"), devenv.Root},
+	{devenv.MustImage("cube-base-ssh"), devenv.NonRoot},
+	{devenv.MustImage("cube-base-ssh"), devenv.Root},
+	{devenv.MustImage("cube-base-jupyter"), devenv.NonRoot},
+	{devenv.MustImage("cube-base-jupyter"), devenv.Root},
 }
 
 var _ = Describe("DevEnvironment conformance", Label(devenv.LabelConformance), Ordered, func() {
@@ -583,10 +583,10 @@ func describeRefusals(open func() *devenv.Environment, img devenv.Image, identit
 			// which only a root sshd can. A non-root sshd asks and gets nothing back
 			// (getspnam returns nothing to uid 1000), so the check is one more thing
 			// root mode turns on. The refusal is therefore the *account lock's* and not
-			// the platform's, and it holds for both the self-authored `ubuntu` and
-			// docker-stacks' `jovyan` because both are created by useradd. An image
-			// that unlocked its account would be served here, into a home the workspace
-			// claim does not cover in root mode; this case is what would say so.
+			// the platform's, and it holds for the `ubuntu` account every family image
+			// creates with useradd. An image that unlocked its account would be served
+			// here, into a home the workspace claim does not cover in root mode; this
+			// case is what would say so.
 			sess := sshReady(ctx, env)
 			_, err := sess.RunAs(ctx, img.Account, "true")
 			Expect(err).To(HaveOccurred(),

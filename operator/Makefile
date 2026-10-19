@@ -184,7 +184,7 @@ HELM_RELEASE ?= cubestack
 # without a pre-load, and it is why the kind node has to reach the platform
 # registry: it does so over the runner's docker network, the same route the
 # mirrored bases in helm-e2e-images are already pulled over.
-DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/jupyter-minimal:latest
+DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/minimal:latest
 # The platform the kind node runs. A kind node matches the docker daemon's
 # architecture, which on an arm64 laptop is not the amd64 these images publish
 # as — and an image loaded for the wrong one fails at container start with an
@@ -377,14 +377,15 @@ helm-e2e-images: ## Build the manager and echo images and pull the init containe
 	echo "Pulling $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
 	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)"
 	# What is deliberately absent above is the environment's image: the pod pulls
-	# it from the platform registry at start (see DEV_ENV_IMAGE). Only
-	# jupyter-minimal is involved — the environment is a jupyter one, and that
-	# image serves the ssh endpoint too, since its entrypoint starts sshd when the
-	# operator mounts the ssh material; ssh-ubuntu22.04 is neither built nor pulled.
+	# it from the platform registry at start (see DEV_ENV_IMAGE). Only the minimal
+	# image is involved — the environment is a jupyter one, and the same image
+	# serves ssh from the controller's CUBSTACK_TYPE, since its entrypoint starts
+	# sshd when the operator mounts the ssh material; the vendor images are
+	# neither built nor pulled.
 	#
 	# A change under images/ is therefore not validated here; it is covered by
 	# `make -C images smoke` — the images-smoke job in ci-operator.yml — which builds
-	# both families and asserts the same contract against them.
+	# all three families and asserts the same contract against them.
 
 .PHONY: helm-e2e-images-load
 helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulled images into the kind cluster
@@ -568,7 +569,7 @@ helm-e2e-cleanup: ## Delete the dedicated kind cluster
 #
 #   DEVENV_E2E_LABELS='devenv-conformance && p0'
 #   DEVENV_E2E_LABELS='devenv-conformance && identity:root'
-#   DEVENV_E2E_LABELS='devenv-conformance && image:jupyter-minimal'
+#   DEVENV_E2E_LABELS='devenv-conformance && image:minimal-jupyter'
 #
 # It duplicates the constants in test/e2e/devenv/labels.go, which a Makefile cannot
 # import. Keep the two adjacent in review and do not add a third copy.

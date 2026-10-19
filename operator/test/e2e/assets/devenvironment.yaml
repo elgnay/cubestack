@@ -2,7 +2,7 @@
 # sshd, published through the platform Gateway.
 #
 # __DEV_ENV_IMAGE__ is substituted by `make helm-e2e-devenv-verify` with the
-# published jupyter-minimal:latest reference. The pod pulls it from the platform
+# published minimal:latest reference. The pod pulls it from the platform
 # registry itself — nothing pre-loads it on the node — so the reference is the
 # one a deployment would write, and reaching the registry is part of what the
 # test asserts.
@@ -13,11 +13,11 @@
 # they name: applied as literals, an overridden run would create its own namespace, install
 # this manifest into demo/e2e-devenv, and then poll the name it asked for until it timed out.
 #
-# The two runtime settings are not decoration, they are the documented contract
-# for this image (images/README.md): 'jovyan' is the docker-stacks account, which
-# is what derives the /home/jovyan workspace mount, and gid 100 is the image's
-# native group while the operator's default runAsGroup is 1000. Get either wrong
-# and the container cannot write its own home.
+# The runtime setting is not decoration, it is the documented contract for every
+# family image (images/README.md): 'ubuntu' is the account all three create,
+# uid/gid 1000, which is what derives the /home/ubuntu workspace mount and what
+# the platform's default security context already states — so no runAsGroup is
+# needed here.
 apiVersion: ai.cubestack.io/v1alpha1
 kind: DevEnvironment
 metadata:
@@ -41,6 +41,4 @@ spec:
   ssh:
     enabled: true
   runtime:
-    user: jovyan
-    securityContext:
-      runAsGroup: 100
+    user: ubuntu

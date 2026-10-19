@@ -38,8 +38,8 @@ set -euo pipefail
 
 # One row per image, `<name>:<directory>:<base>`, in the order output is emitted.
 #
-# The name is the Makefile's RETAG vocabulary (`make -C images push-ubuntu`,
-# `retag-latest-maca`), because the callers feed them straight back to make; neither the
+# The name is the Makefile's RETAG vocabulary (`make -C images push-minimal`,
+# `retag-latest-maca-base`), because the callers feed them straight back to make; neither the
 # directory nor the published repository name is what a caller wants. The directory is where
 # that image's Dockerfile lives and what it COPYs from — the path that selects it, and the
 # path every other image's `paths` pathspec excludes. The base is the base image it is built
@@ -52,9 +52,9 @@ set -euo pipefail
 # can reach, and none of the fixtures below would notice, because they are driven by what
 # this rule produces rather than by the table.
 IMAGE_ROWS=(
-  ubuntu:ubuntu:ubuntu
-  maca:maca-pytorch:maca
-  cuda:cuda-pytorch:cuda
+  minimal:minimal:minimal
+  maca-base:maca-base:maca-base
+  cube-base:cube-base:cube-base
 )
 
 ALL_IMAGES=()
@@ -142,12 +142,12 @@ image_base() {
 # disagree about it — and so an image added on a new base is classified by the one
 # field that says what it is built from. The vendor bases unpack to tens of GB (MACA ~33 GB,
 # CUDA ~38.6 GB) against the ~31 GB a standard runner has free on /, where the CPU family is a
-# fraction of that (`ubuntu` measures a few hundred MB). A base this does not recognise reads
+# fraction of that (`minimal` measures well under a GB). A base this does not recognise reads
 # as a vendor base, which is the direction `select` fails in too: over-sizing costs a disk
 # reclaim and a longer leash, where under-sizing loses the runner part-way through a publish.
 vendor_of_base() {
   case "$1" in
-    ubuntu) printf 'false\n' ;;
+    minimal) printf 'false\n' ;;
     *) printf 'true\n' ;;
   esac
 }
@@ -183,7 +183,7 @@ print_selection() {
 # The smoke selection as the legs a matrix runs, as JSON: one entry per base that has a
 # selected image, in the table's order, carrying that base's images in the table's order. A
 # base none of whose images is selected has no entry at all, so a change reaching only the
-# CUDA image schedules one leg rather than three, and no leg is ever empty.
+# cube-base image schedules one leg rather than three, and no leg is ever empty.
 #
 # It lives here rather than in the action that emits it because it is a fact about the
 # selection, read off the same table `select` walks — and because this is the half of it the

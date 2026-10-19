@@ -1023,11 +1023,12 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 // reference has to satisfy, and the phrase naming it in a mismatch message.
 //
 // The rule is the vendor's own token — "cuda" for nvidia, "maca" for metax —
-// anywhere in the reference. nvidia products are self-built and spell it out in
-// "base-cuda"; metax products are mirrored from the upstream Metax library under
-// each package's own name: maca, maca-pytorch, maca-tensorflow. The two rules are
-// deliberately the same shape, so the gate reads as one question — does the image
-// name its vendor? — rather than a different check per vendor.
+// anywhere in the reference. nvidia products are self-built, so the rule also
+// accepts the platform's family name "cube-base"; metax products are mirrored
+// from the upstream Metax library under each package's own name: maca,
+// maca-pytorch, maca-tensorflow. The rules stay the same shape, so the gate
+// reads as one question — does the image name its vendor? — rather than a
+// different check per vendor.
 //
 // Like vendorResource it is total, and for the same reason: an unresolvable
 // vendor resolves to the metax rule rather than falling out of the switch and
@@ -1037,8 +1038,10 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 func brandRule(vendor aiv1alpha1.AcceleratorVendor) (matches func(image string) bool, want string) {
 	switch vendor {
 	case aiv1alpha1.AcceleratorVendorNvidia:
-		return func(image string) bool { return strings.Contains(image, "cuda") },
-			`an image containing "cuda"`
+		return func(image string) bool {
+				return strings.Contains(image, "cuda") || strings.Contains(image, "cube-base")
+			},
+			`an image containing "cuda" or "cube-base"`
 	default:
 		return func(image string) bool { return strings.Contains(image, "maca") },
 			`an image containing "maca"`
@@ -1740,9 +1743,10 @@ func isRootLauncherEnvName(name string) bool {
 // names that one, and the two are deliberately different numbers. start.sh rewrites
 // the account whenever the two disagree, and that rewrite cannot complete for root:
 // the launcher dies there ("userdel: user root is currently used by process 1") and
-// takes the container with it. Measured on jupyter-minimal: a pod running as 0:1000
-// with NB_GID=1000 exits before the notebook is up, and the same pod with NB_GID=0
-// starts. So the pod's group is not a value these may be derived from.
+// takes the container with it. Measured on the retired stock-derived image: a pod
+// running as 0:1000 with NB_GID=1000 exits before the notebook is up, and the same
+// pod with NB_GID=0 starts. So the pod's group is not a value these may be derived
+// from.
 //
 // The shipped images no longer read them: a root container on the CPU image leaves
 // start.sh out of the chain entirely (images/jupyter/start-jupyter.sh), and the MACA
