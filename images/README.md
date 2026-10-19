@@ -365,7 +365,7 @@ passes: `MACA_TAG` reads them out of `MACA_PACKAGE` and `CUBE_TAG` its release o
 so a tag cannot name a base the image was not built from, and `TAG` still ends it — re-building an
 overlay on an unchanged base moves the reference rather than redefining it. There is one axis for CUDA
 rather than three because the NGC release pins python, torch and CUDA together, so naming it names all
-of them. All three targets refuse to publish (`check-maca-base` / `check-cuda-base`) if a base bump
+of them. Both vendor targets refuse to publish (`check-maca-base` / `check-cuda-base`) if a base bump
 lands a package tag the axes cannot be read from.
 
 A deployment tracking `:latest` follows the newest publish while a pinned one keeps its SHA/release

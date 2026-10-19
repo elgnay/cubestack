@@ -144,14 +144,14 @@ they exercise the artifact that is actually published. Both **vendor images** ig
 build their own single platform, `linux/amd64` by default, on every host and for every publish — see
 the platform rule. Their published names are the other exception: the tag carries the vendor
 axis read out of the base package with `$(TAG)` after it, not `$(TAG)` alone — `MACA_TAG`, three axes
-(`3.9.0.12-py310-torch2.4`), and `CUDA_TAG`, the NGC release on its own (`26.08`), because that release
+(`3.9.0.12-py310-torch2.4`), and `CUBE_TAG`, the NGC release on its own (`26.08`), because that release
 pins python, torch and CUDA together instead of naming them as separable axes (README, Publish;
 decision doc §5).
 
 `PLATFORMS` is the publish list for the same reason, and `make push PLATFORMS=linux/amd64` narrows it
 back to one. `push` is a `buildx build --push`, so it needs a builder that can do more than one
-platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU) — `push-maca`
-and `push-cuda` are the targets that do not, since a single-platform push
+platform (Docker Desktop's can; otherwise `docker buildx create --use` plus QEMU) — `push-maca-base`
+and `push-cube-base` are the targets that do not, since a single-platform push
 builds on any builder. It does **not** push the
 image the local smoke ran — buildx cannot load a multi-platform result and push it in one invocation,
 so it builds a fresh one from the same source.

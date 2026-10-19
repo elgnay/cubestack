@@ -401,8 +401,8 @@ Key points:
   Dockerfile gives it, read out of the build shell's environment, i.e. the base's own. It is a
   placeholder because sshd's `SetEnv` replaces a session's environment rather than extending it, so
   a fixed literal would hide whichever family's toolchain it did not name. The mount-contract paths
-  (`AuthorizedKeysFile`, `HostKey`) are `%h`-relative, so one file serves every family and the
-  shared parts cannot drift apart.
+  (`HostKey`, the platform `AuthorizedKeysFile` entry) are absolute and outside every home, so one
+  file serves every family and the shared parts cannot drift apart.
 - **Account / `HOME` are uniform across all three** (see §2 contract): account `ubuntu`, uid/gid
   **1000:1000**, `$HOME=/home/ubuntu`, named per environment via `spec.runtime.user`. On the CPU
   and MACA images this is the platform layer's own choice; on the NGC PyTorch base it is what the

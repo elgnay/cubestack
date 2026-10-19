@@ -144,13 +144,17 @@ func teardownDevEnvConformance() {
 //
 // `:latest` under `imagePullPolicy: Always` is a moving target, and nothing this
 // suite can read knows what it ought to resolve to — so the claim worth making is
-// the weaker one that is still checkable: that one image key meant one artifact
-// for the whole run. Without it a `:latest` republished midway leaves the first
-// and last environments of a key running different software under one name, and
-// the run reports twelve green environments when it was two different things.
+// the weaker one that is still checkable: that one image reference meant one
+// artifact for the whole run. Without it a `:latest` republished midway leaves the
+// first and last environments of a reference running different software under one
+// name, and the run reports twelve green environments when it was two different
+// things.
 //
 // The report is by key and not by environment because that is the axis the
-// catalogue is asserted on: "cube-base-ssh was tested" is true of the key.
+// catalogue is asserted on: "cube-base-ssh was tested" is true of the key. The
+// conflict is judged by reference instead, because two keys — a family's SSH and
+// Jupyter rows — run the same image, and a digest that moved between them is one
+// name for two artifacts whether or not either key saw it twice.
 //
 // A plain function called from the suite's one AfterSuite rather than an
 // AfterSuite of its own, which Ginkgo allows only one of.
@@ -166,29 +170,40 @@ func reportDevEnvImageDigests() {
 	// ImageDigests is sorted by key and then digest, so each key's list is
 	// already in order and Compact leaves the distinct ones.
 	byKey := map[string][]string{}
+	byRef := map[string]map[string]struct{}{}
 	for _, d := range digests {
 		byKey[d.Key] = append(byKey[d.Key], d.Digest)
+		if byRef[d.Repo] == nil {
+			byRef[d.Repo] = map[string]struct{}{}
+		}
+		byRef[d.Repo][d.Digest] = struct{}{}
 	}
 	keys := make([]string, 0, len(byKey))
 	for k := range byKey {
 		keys = append(keys, k)
 	}
 	slices.Sort(keys)
+	refs := make([]string, 0, len(byRef))
+	for r := range byRef {
+		refs = append(refs, r)
+	}
+	slices.Sort(refs)
 
 	var b strings.Builder
 	b.WriteString("\nimages this run ran:\n")
-	var conflicts []string
 	for _, k := range keys {
-		distinct := slices.Compact(byKey[k])
-		for i, d := range distinct {
+		for i, d := range slices.Compact(byKey[k]) {
 			label := ""
 			if i == 0 {
 				label = k
 			}
 			fmt.Fprintf(&b, "  %-22s %s\n", label, d)
 		}
-		if len(distinct) > 1 {
-			conflicts = append(conflicts, k)
+	}
+	var conflicts []string
+	for _, r := range refs {
+		if len(byRef[r]) > 1 {
+			conflicts = append(conflicts, r)
 		}
 	}
 	// stdout and not GinkgoWriter, which is buffered and emitted only for a failed

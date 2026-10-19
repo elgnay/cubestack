@@ -2,7 +2,7 @@
 # Cubestack image entrypoint.
 #
 # The DevEnvironment controller never sets command/args, so this script decides
-# what a container runs. CUBSTACK_IMAGE is baked into each image at build time as
+# what a container runs. CUBESTACK_IMAGE is baked into each image at build time as
 # the standalone default; CUBSTACK_TYPE, which the controller injects from
 # spec.type, wins when present.
 #

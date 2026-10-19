@@ -96,7 +96,7 @@ func describeStack(open func() *devenv.Environment, img devenv.Image, identity d
 	It("F3 lands a CUDA notebook on the interpreter a session gets",
 		Label(devenv.TierP1, devenv.LabelFamily("F")), func(ctx SpecContext) {
 			env := open()
-			if !strings.Contains(img.Key, "cuda") {
+			if !strings.Contains(img.Key, "cube-base") {
 				Skip("this image carries no CUDA stack")
 			}
 			interp := torchInterpreter(ctx, env)
@@ -119,7 +119,7 @@ func describeStack(open func() *devenv.Environment, img devenv.Image, identity d
 	It("F4 puts the CUDA toolkit and torch's libraries on the session",
 		Label(devenv.TierP1, devenv.LabelFamily("F")), func(ctx SpecContext) {
 			env := open()
-			if !strings.Contains(img.Key, "cuda") {
+			if !strings.Contains(img.Key, "cube-base") {
 				Skip("this image carries no CUDA stack")
 			}
 			sess := sshReady(ctx, env)
