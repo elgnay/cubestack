@@ -170,6 +170,36 @@ func podCondition(pod *corev1.Pod, t corev1.PodConditionType) *corev1.PodConditi
 	return nil
 }
 
+// schedulerRefusal waits for the scheduler to refuse the environment's pod on what
+// the cluster lacks — Insufficient something — and returns the condition that says
+// so. The caller asserts which resource the message names.
+//
+// A wait rather than a read, because the first verdict may be about the workspace
+// claim instead: a claim still being provisioned is an unbound claim, and the
+// scheduler names that until it binds and then reconsiders. Which verdict comes
+// first depends on how fast the StorageClass provisions, not on anything a case is
+// asserting.
+func schedulerRefusal(ctx context.Context, env *devenv.Environment) *corev1.PodCondition {
+	GinkgoHelper()
+	var cond *corev1.PodCondition
+	Eventually(func() string {
+		pod, err := env.Pod(ctx)
+		if err != nil {
+			return err.Error()
+		}
+		cond = podCondition(pod, corev1.PodScheduled)
+		if cond == nil {
+			return "the pod records no PodScheduled condition"
+		}
+		return cond.Message
+	}).WithTimeout(2*time.Minute).WithPolling(2*time.Second).
+		Should(ContainSubstring("Insufficient"),
+			"the scheduler's message has to name what it could not find")
+	Expect(cond.Reason).To(Equal(corev1.PodReasonUnschedulable),
+		"the scheduler's reason for refusing the pod: %s", cond.Message)
+	return cond
+}
+
 // assertPodAllocated asserts the container was rendered both asking for and
 // limiting the device's extended resource — the thing that makes the scheduler
 // choose a node that has one, and the device plugin hand one over.

@@ -6,7 +6,7 @@
 # image per accelerator family, and each serves BOTH modes — CUBSTACK_TYPE, which
 # the controller injects from spec.type, decides what the container is:
 #
-#   minimal       the CPU family, built on plain ubuntu:22.04 with python3 and
+#   cpu-base      the CPU family, built on plain ubuntu:22.04 with python3 and
 #                 JupyterLab; account 'ubuntu' uid/gid 1000, home /home/ubuntu
 #   maca-base     the Metax MACA family, the same platform layer on the vendor base,
 #                 whose default python3 (and torch) must be the vendor's own
@@ -50,8 +50,8 @@
 # /run/ssh is absolute: outside $HOME, which a workspace claim may cover and make
 # unwritable.
 #
-# Reads IMG_MINIMAL / IMG_MACA / IMG_CUBE from the environment (the Makefile sets them).
-# Usage: hack/smoke.sh [--minimal|--maca-base|--cube-base]   (default: all)
+# Reads IMG_CPU_BASE / IMG_MACA / IMG_CUBE from the environment (the Makefile sets them).
+# Usage: hack/smoke.sh [--cpu-base|--maca-base|--cube-base]   (default: all)
 set -euo pipefail
 
 # Resolved before the cd: --help prints this file, and $0 is relative to wherever the
@@ -64,20 +64,20 @@ cd "$(dirname "$self")/.." # images/ workspace root
 # Makefile — keep the two in step). Only a direct call reaches these: the Makefile passes
 # every ref it built with.
 TAG="${TAG:-$(git rev-parse --short HEAD 2>/dev/null || echo latest)}"
-IMG_MINIMAL="${IMG_MINIMAL:-harbor.isuanova.com/suanova/minimal:$TAG}"
+IMG_CPU_BASE="${IMG_CPU_BASE:-harbor.isuanova.com/suanova/cpu-base:$TAG}"
 IMG_MACA="${IMG_MACA:-harbor.isuanova.com/suanova/maca-base:3.9.0.12-py310-torch2.4-$TAG}"
 # One axis, not three: the NGC release pins python, torch and CUDA together, so CUBE_TAG is that
 # release and nothing else.
 IMG_CUBE="${IMG_CUBE:-harbor.isuanova.com/suanova/cube-base:26.08-$TAG}"
 CONTAINER_TOOL="${CONTAINER_TOOL:-docker}"
 
-run_minimal=1
+run_cpu_base=1
 run_maca_base=1
 run_cube_base=1
 case "${1:-}" in
-  --minimal) run_maca_base=0; run_cube_base=0 ;;
-  --maca-base) run_minimal=0; run_cube_base=0 ;;
-  --cube-base) run_minimal=0; run_maca_base=0 ;;
+  --cpu-base) run_maca_base=0; run_cube_base=0 ;;
+  --maca-base) run_cpu_base=0; run_cube_base=0 ;;
+  --cube-base) run_cpu_base=0; run_maca_base=0 ;;
   -h | --help) awk 'NR > 1 && /^set -euo pipefail$/ { exit } NR > 1' "$self"; exit 0 ;;
   "") ;;
   *) echo "cubestack smoke: unknown option '$1'" >&2; exit 1 ;;
@@ -773,70 +773,70 @@ check_jupyter_home() {
 }
 
 # ---------------------------------------------------------------------------
-# minimal (the CPU family: JupyterLab + sshd from one image)
+# cpu-base (the CPU family: JupyterLab + sshd from one image)
 # ---------------------------------------------------------------------------
-if [ "$run_minimal" = 1 ]; then
-  echo "== smoke: $IMG_MINIMAL (minimal) =="
+if [ "$run_cpu_base" = 1 ]; then
+  echo "== smoke: $IMG_CPU_BASE (cpu-base) =="
   base="/dev/ns/env"
 
   # jupyter + sshd, the shape a jupyter-type environment with ssh enabled gets.
-  minimal_cont="cs-smoke-minimal-$$"
-  make_secret "$tmp/minimalssh"
-  ensure_mount_readable "$IMG_MINIMAL" "$tmp/minimalssh/host/ssh_host_ed25519_key"
+  cpu_base_cont="cs-smoke-cpu-base-$$"
+  make_secret "$tmp/cpu-base-ssh"
+  ensure_mount_readable "$IMG_CPU_BASE" "$tmp/cpu-base-ssh/host/ssh_host_ed25519_key"
 
-  start "$minimal_cont" \
+  start "$cpu_base_cont" \
     --user 1000:1000 \
     -p 127.0.0.1::8888 \
     -p 127.0.0.1::2222 \
     -e JUPYTER_TOKEN=testtoken \
     -e NOTEBOOK_ARGS="--ServerApp.base_url=$base/" \
-    -v "$tmp/minimalssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
-    -v "$tmp/minimalssh/keys:/run/ssh:ro" \
-    "$IMG_MINIMAL"
-  minimal_port="$(port_of "$minimal_cont" 8888)"
-  minimal_ssh_port="$(port_of "$minimal_cont" 2222)"
+    -v "$tmp/cpu-base-ssh/host/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key:ro" \
+    -v "$tmp/cpu-base-ssh/keys:/run/ssh:ro" \
+    "$IMG_CPU_BASE"
+  cpu_base_port="$(port_of "$cpu_base_cont" 8888)"
+  cpu_base_ssh_port="$(port_of "$cpu_base_cont" 2222)"
 
-  wait_jupyter "$minimal_cont" "$minimal_port" "$base" 120 "minimal"
-  check_jupyter_http "$minimal_port" "$base" "minimal"
+  wait_jupyter "$cpu_base_cont" "$cpu_base_port" "$base" 120 "cpu-base"
+  check_jupyter_http "$cpu_base_port" "$base" "cpu-base"
 
-  id_out="$("$CONTAINER_TOOL" exec "$minimal_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
+  id_out="$("$CONTAINER_TOOL" exec "$cpu_base_cont" sh -c 'printf "%s %s" "$(id -u)" "$(id -g)"' 2>/dev/null || true)"
   if [ "$id_out" = "1000 1000" ]; then
-    ok "minimal container runs as uid 1000 gid 1000"
+    ok "cpu-base container runs as uid 1000 gid 1000"
   else
-    bad "minimal expected '1000 1000', got '$id_out'"
+    bad "cpu-base expected '1000 1000', got '$id_out'"
   fi
 
-  check_jupyter_ssh "$minimal_cont" "$minimal_ssh_port" "$tmp/minimalssh" "minimal"
-  "$CONTAINER_TOOL" rm -f "$minimal_cont" >/dev/null 2>&1 || true
+  check_jupyter_ssh "$cpu_base_cont" "$cpu_base_ssh_port" "$tmp/cpu-base-ssh" "cpu-base"
+  "$CONTAINER_TOOL" rm -f "$cpu_base_cont" >/dev/null 2>&1 || true
 
   # jupyter with no ssh Secret: sshd must not start.
-  check_jupyter_only "$IMG_MINIMAL" "cs-smoke-minimal-juponly-$$" "minimal jupyter-only"
+  check_jupyter_only "$IMG_CPU_BASE" "cs-smoke-cpu-base-juponly-$$" "cpu-base jupyter-only"
 
   # ssh alone, as CUBSTACK_TYPE=ssh states it.
-  minimal_ssh_cont="cs-smoke-minimal-ssh-$$"
-  check_ssh_mode "$IMG_MINIMAL" "$minimal_ssh_cont" "$tmp/minimalsshonly" "minimal ssh-only"
-  "$CONTAINER_TOOL" rm -f "$minimal_ssh_cont" >/dev/null 2>&1 || true
+  cpu_base_ssh_cont="cs-smoke-cpu-base-ssh-$$"
+  check_ssh_mode "$IMG_CPU_BASE" "$cpu_base_ssh_cont" "$tmp/cpu-base-ssh-only" "cpu-base ssh-only"
+  "$CONTAINER_TOOL" rm -f "$cpu_base_ssh_cont" >/dev/null 2>&1 || true
 
   # ssh mode without a host key is a refusal, not a fallback.
-  check_ssh_requires_key "$IMG_MINIMAL" "minimal"
+  check_ssh_requires_key "$IMG_CPU_BASE" "cpu-base"
 
   # Root, in both modes: ssh always, and jupyter where the launcher has to serve the
   # derived home rather than the account the image bakes.
-  check_root_ssh "$IMG_MINIMAL" "$tmp/minimalroot" "cs-smoke-minimalroot-$$" \
-    "minimal jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
-  check_root_ssh "$IMG_MINIMAL" "$tmp/minimalrootssh" "cs-smoke-minimalrootssh-$$" \
-    "minimal ssh as root" -e CUBSTACK_TYPE=ssh
-  check_jupyter_home "$IMG_MINIMAL" /root \
-    "minimal as root: jupyter serves the derived home, /root"
-  check_jupyter_home "$IMG_MINIMAL" /workspace/home \
-    "minimal as root: a declared HOME is served instead" \
+  check_root_ssh "$IMG_CPU_BASE" "$tmp/cpu-base-root" "cs-smoke-cpu-base-root-$$" \
+    "cpu-base jupyter as root" -e NOTEBOOK_ARGS="--allow-root"
+  check_root_ssh "$IMG_CPU_BASE" "$tmp/cpu-base-root-ssh" "cs-smoke-cpu-base-root-ssh-$$" \
+    "cpu-base ssh as root" -e CUBSTACK_TYPE=ssh
+  check_jupyter_home "$IMG_CPU_BASE" /root \
+    "cpu-base as root: jupyter serves the derived home, /root"
+  check_jupyter_home "$IMG_CPU_BASE" /workspace/home \
+    "cpu-base as root: a declared HOME is served instead" \
     -e HOME=/workspace/home
 fi
 
 # ---------------------------------------------------------------------------
 # maca-base (platform layer on the Metax MACA base: jupyter + sshd)
 #
-# Same contract and the same assertions as minimal — the overlay is what differs, not the
+# Same contract and the same assertions as cpu-base — the overlay is what differs, not the
 # operator-facing behaviour it has to satisfy. What it adds is that the vendor stack is
 # reachable by the account that runs the container, in both modes.
 # ---------------------------------------------------------------------------
@@ -916,7 +916,7 @@ fi
 # ---------------------------------------------------------------------------
 # cube-base (platform layer on the NVIDIA NGC PyTorch base: jupyter + sshd)
 #
-# The MACA family's shape on the other vendor's base, and the same contract as minimal.
+# The MACA family's shape on the other vendor's base, and the same contract as cpu-base.
 # What differs is what the base brings rather than what the overlay does: no pip step, and
 # no second interpreter to correct the PATH for, since this base installs into the
 # distribution's own python. The vendor stack is therefore asserted by running it —

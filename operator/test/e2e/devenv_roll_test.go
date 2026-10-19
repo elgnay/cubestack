@@ -42,11 +42,21 @@ const rollProbePortName = "roll-probe-tcp"
 func describeRoll() {
 	draftCase{
 		Name:     "roll-edits",
-		Image:    devenv.MustImage("minimal-jupyter"),
+		Image:    devenv.MustImage("cpu-base-jupyter"),
 		Identity: devenv.NonRoot,
 		Cases: func(open func() *devenv.Environment) {
 			It("L1 rolls the workload onto the image a spec edit names",
 				Label(devenv.TierP1, devenv.LabelFamily("L")), func(ctx SpecContext) {
+					// The instrument below is a digest, and a digest reference
+					// is the one a node with preloaded images cannot resolve:
+					// containerd answers a tagged reference from its store and
+					// sends a digest to the registry. There is no second tag to
+					// pin to either, since the case would have to be told what
+					// this run named it.
+					if conformance.PreloadedImages {
+						Skip("the case pins the spec to the digest the node ran, and a node whose " +
+							"images were loaded rather than pulled resolves only tagged references")
+					}
 					env := open()
 					running(ctx, env)
 

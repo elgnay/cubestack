@@ -54,7 +54,7 @@ FROM ${CUDA_BASE}
 USER root
 
 # Optional apt mirror override for CN/offline builds; empty = upstream. No PIP_INDEX_URL, unlike
-# the minimal family: this overlay installs nothing from pip — JupyterLab here is the base's.
+# the cpu-base family: this overlay installs nothing from pip — JupyterLab here is the base's.
 ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i -E "s#https?://(archive|ports)\.ubuntu\.com/(ubuntu|ubuntu-ports)#${APT_MIRROR}#g" \

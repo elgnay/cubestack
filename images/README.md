@@ -9,7 +9,7 @@ See `docs/design/devenv-images/decision.md` for the sourcing/composition decisio
 
 There are **three** images, one per accelerator family, and each serves **both** runtime modes:
 
-- `minimal` — the CPU family, built on `ubuntu:22.04`;
+- `cpu-base` — the CPU family, built on `ubuntu:22.04`;
 - `maca-base` — the Metax/MACA family, on a vendor MACA base;
 - `cube-base` — the NVIDIA family, on NVIDIA's NGC PyTorch base.
 
@@ -28,14 +28,16 @@ every one of them: account `ubuntu`, uid/gid **1000:1000**, home and workdir **`
 
 | Image | Base | Account (uid:gid) | Home / workspace | Modes | Exposes |
 |-------|------|-------------------|------------------|-------|---------|
-| `harbor.isuanova.com/suanova/minimal` | `ubuntu:22.04` | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter + ssh | jupyter `8888`, ssh `2222` |
+| `harbor.isuanova.com/suanova/cpu-base` | `ubuntu:22.04` | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter + ssh | jupyter `8888`, ssh `2222` |
 | `harbor.isuanova.com/suanova/maca-base` | `maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64` (mirror of `cr.metax-tech.com/public-library/…`) | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter + ssh | jupyter `8888`, ssh `2222` |
 | `harbor.isuanova.com/suanova/cube-base` | `pytorch:26.08-py3` (mirror of `nvcr.io/nvidia/pytorch`) | `ubuntu` 1000:1000 | `/home/ubuntu` | jupyter + ssh | jupyter `8888`, ssh `2222` |
 
-The six repositories the old images were published under keep their existing tags; they are
-simply no longer published. A pinned `spec.image` keeps pulling.
+The repositories the old images were published under keep their existing tags; they are simply
+no longer published. A pinned `spec.image` keeps pulling. That includes `suanova/minimal`, this
+family's name before it was `cpu-base`: the repository is named for the accelerator family it
+serves, as the other two are, rather than for how small the image is.
 
-`minimal` is the thinnest overlay but no longer a bare ssh server: it is `ubuntu:22.04` plus
+`cpu-base` is the thinnest overlay but no longer a bare ssh server: it is `ubuntu:22.04` plus
 `openssh-server`, `python3`/`pip`, `tini`, and **JupyterLab from pip on the system interpreter**,
 with the shared launcher as its CMD. It replaces both `ssh-ubuntu22.04` (plain ssh) and
 `jupyter-minimal` (stock-derived, with the `jovyan` 1000:100 and `/home/jovyan` layout).
@@ -79,7 +81,7 @@ three, that is the same statement every time:
 
 | Image | `spec.runtime.user` | `spec.runtime.securityContext` | Workspace mount |
 |-------|--------------------|-------------------------------|-----------------|
-| `minimal` | `ubuntu` | *(omit — 1000:1000 is already the platform default)* | `/home/ubuntu` (derived) |
+| `cpu-base` | `ubuntu` | *(omit — 1000:1000 is already the platform default)* | `/home/ubuntu` (derived) |
 | `maca-base` | `ubuntu` | *(omit — 1000:1000)* | `/home/ubuntu` (derived) |
 | `cube-base` | `ubuntu` | *(omit — 1000:1000)* | `/home/ubuntu` (derived) |
 
@@ -273,7 +275,7 @@ make -C images build     # every image, tagged $(REGISTRY)/$(PROJECT)/<image>:$(
 make -C images smoke     # build + local Docker smoke (no cluster)
 ```
 
-Per-image: `make -C images build-minimal` / `smoke-minimal`, `build-maca-base` / `smoke-maca-base`,
+Per-image: `make -C images build-cpu-base` / `smoke-cpu-base`, `build-maca-base` / `smoke-maca-base`,
 `build-cube-base` / `smoke-cube-base`.
 
 The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Secrets under
@@ -337,7 +339,7 @@ the two vendor images, which publish a single-platform index (see Platform):
 ```bash
 docker login harbor.isuanova.com              # once — the Makefile never authenticates
 make -C images push                           # publish every image
-make -C images push-minimal    TAG=20260910
+make -C images push-cpu-base    TAG=20260910
 make -C images push-maca-base  # maca-base:3.9.0.12-py310-torch2.4-<sha>
 make -C images push-cube-base  # cube-base:26.08-<sha>
 make -C images push PLATFORMS=linux/amd64     # narrow back to one platform
@@ -357,7 +359,7 @@ publish.
 traceable, non-floating reference. It names the **last commit, not the working tree** — commit before
 publishing, or the tag will not describe the built content — and it is resolved per make invocation, so
 a commit landing after `make smoke` would have `make push` publish a tag nothing accepted; pass an
-explicit TAG. §5 gives the release schemes per image — `minimal` on its `TAG` (a SHA, or a date you
+explicit TAG. §5 gives the release schemes per image — `cpu-base` on its `TAG` (a SHA, or a date you
 choose), `maca-base` on `<maca-version>-py<python>-torch<ver>`, and `cube-base` on
 `<ngc-release>-<sha>` — the families
 version on different axes, hence the per-target form. Neither vendor's axes are a `TAG` the caller
@@ -407,7 +409,7 @@ image rather than of the host or the platform list, and each vendor image has it
 Verify what a registry received rather than assuming the build host's architecture:
 
 ```bash
-docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/minimal:latest
+docker buildx imagetools inspect --raw harbor.isuanova.com/suanova/cpu-base:latest
 ```
 
 ### Overrides / mirror builds (CN or offline)
@@ -449,7 +451,7 @@ make -C images build
 `ca-certificates`, so rewriting its sources to an `https` mirror before that fails InRelease
 verification.
 
-`IMG_MINIMAL` / `IMG_MACA` / `IMG_CUBE` override the
+`IMG_CPU_BASE` / `IMG_MACA` / `IMG_CUBE` override the
 output tags (`MACA_TAG` / `CUBE_TAG` the axes the vendor images derive); `BASE_ARGS` the base images
 (above); `CONTAINER_TOOL` overrides `docker` (e.g. `podman`); `PLATFORM` the build/smoke architecture,
 `PLATFORMS` what `push` publishes, and `MACA_PLATFORM` / `CUBE_PLATFORM` the one architecture each
@@ -465,7 +467,7 @@ images/
     jupyter/start-jupyter.sh  every family's CMD: the launcher none of the bases ships
     sshd/10-devenv.conf    sshd_config.d drop-in; @SSH_USER@ login account, @SSH_ENV@ session env
     sshd/install-dropin.sh fills both placeholders in, or fails the build
-  minimal/
+  cpu-base/
     Dockerfile             the CPU family: plain ubuntu:22.04 + python3, JupyterLab, sshd
   maca-base/
     Dockerfile             platform layer on the Metax MACA vendor base

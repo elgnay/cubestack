@@ -119,7 +119,7 @@ func describeRDMAFabric(f rdmaFabric) {
 		// instead.
 		draftCase{
 			Name:     "rdma-" + f.device,
-			Image:    devenv.MustImage("minimal-ssh"),
+			Image:    devenv.MustImage("cpu-base-ssh"),
 			Identity: devenv.NonRoot,
 			Shape: func(d *aiv1alpha1.DevEnvironment) {
 				d.Spec.Network = &aiv1alpha1.NetworkSpec{
@@ -170,7 +170,7 @@ func describeRDMAFabric(f rdmaFabric) {
 		// platform's. The same shape as E9 and N4, on a third resource.
 		draftCase{
 			Name:     "rdma-" + f.device + "-absent",
-			Image:    devenv.MustImage("minimal-ssh"),
+			Image:    devenv.MustImage("cpu-base-ssh"),
 			Identity: devenv.NonRoot,
 			Shape: func(d *aiv1alpha1.DevEnvironment) {
 				d.Spec.Network = &aiv1alpha1.NetworkSpec{
@@ -223,15 +223,7 @@ func describeRDMAFabric(f rdmaFabric) {
 						Expect(env.Object().Status.Phase.Name).To(Equal(aiv1alpha1.PhasePending),
 							"an environment waiting for a device it cannot get is waiting, not failed")
 
-						pod, err := env.Pod(ctx)
-						Expect(err).NotTo(HaveOccurred())
-						cond := podCondition(pod, corev1.PodScheduled)
-						Expect(cond).NotTo(BeNil(),
-							"the pod records no PodScheduled condition, so nothing anywhere says why it is stuck")
-						Expect(cond.Reason).To(Equal(corev1.PodReasonUnschedulable),
-							"the scheduler's reason for refusing the pod: %s", cond.Message)
-						Expect(cond.Message).To(ContainSubstring("Insufficient"),
-							"the scheduler's message has to name what it could not find: %q", cond.Message)
+						cond := schedulerRefusal(ctx, env)
 						Expect(cond.Message).To(ContainSubstring(string(resource)),
 							"the scheduler reports the resource it could not find, and that name is the contract: %q",
 							cond.Message)

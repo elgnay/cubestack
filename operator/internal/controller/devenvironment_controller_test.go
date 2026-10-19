@@ -61,7 +61,7 @@ import (
 const (
 	testDevImage      = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
 	testBaseMacaImage = "harbor.local/ai-images/base-maca:1.0"
-	testCPUImage      = "harbor.isuanova.com/suanova/minimal:latest"
+	testCPUImage      = "harbor.isuanova.com/suanova/cpu-base:latest"
 	// testCubeBaseImage is the platform's own nvidia family image. Its name
 	// carries no "cuda" token, which is why the nvidia rule accepts the family
 	// name as well.

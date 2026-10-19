@@ -38,7 +38,7 @@ set -euo pipefail
 
 # One row per image, `<name>:<directory>:<base>`, in the order output is emitted.
 #
-# The name is the Makefile's RETAG vocabulary (`make -C images push-minimal`,
+# The name is the Makefile's RETAG vocabulary (`make -C images push-cpu-base`,
 # `retag-latest-maca-base`), because the callers feed them straight back to make; neither the
 # directory nor the published repository name is what a caller wants. The directory is where
 # that image's Dockerfile lives and what it COPYs from — the path that selects it, and the
@@ -52,7 +52,7 @@ set -euo pipefail
 # can reach, and none of the fixtures below would notice, because they are driven by what
 # this rule produces rather than by the table.
 IMAGE_ROWS=(
-  minimal:minimal:minimal
+  cpu-base:cpu-base:cpu-base
   maca-base:maca-base:maca-base
   cube-base:cube-base:cube-base
 )
@@ -142,12 +142,12 @@ image_base() {
 # disagree about it — and so an image added on a new base is classified by the one
 # field that says what it is built from. The vendor bases unpack to tens of GB (MACA ~33 GB,
 # CUDA ~38.6 GB) against the ~31 GB a standard runner has free on /, where the CPU family is a
-# fraction of that (`minimal` measures well under a GB). A base this does not recognise reads
+# fraction of that (`cpu-base` measures well under a GB). A base this does not recognise reads
 # as a vendor base, which is the direction `select` fails in too: over-sizing costs a disk
 # reclaim and a longer leash, where under-sizing loses the runner part-way through a publish.
 vendor_of_base() {
   case "$1" in
-    minimal) printf 'false\n' ;;
+    cpu-base) printf 'false\n' ;;
     *) printf 'true\n' ;;
   esac
 }

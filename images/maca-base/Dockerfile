@@ -12,7 +12,7 @@
 # Unlike the cube-base image this is not stock-native: the vendor base ships no launcher, no sshd,
 # no non-root account, and no ENTRYPOINT at all (config.User is unset, so it would run as root and
 # its CMD is a bare /bin/bash that exits immediately). So this Dockerfile adds the platform
-# layer the minimal family image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
+# layer the cpu-base family image defines — account ubuntu 1000:1000 with $HOME=/home/ubuntu,
 # openssh-server, the shared entrypoint — on top of the vendor's own python/torch/MACA stack,
 # inherited as the base published it except for PATH, which the overlay corrects so that `python3`
 # is the interpreter that owns the vendor torch (see below). The account is not a preference: the

@@ -33,7 +33,15 @@
 # `cephfs-ephemeral` would break kind's default class for everything else in the
 # cluster.
 #
-# Idempotent: re-running patches the same config and reapplies the same class.
+# The class binds immediately, unlike the provisioner's own `standard` class. Waiting
+# for a first consumer picks the node the volume is created on; this class has no node
+# to pick — the shared filesystem is every node — and the class it stands in for, the
+# Rook cephfs StorageClass behind a real cephfs-ephemeral, sets no binding mode. A
+# waiting stand-in also strands a claim created ahead of the pod that mounts it: the
+# storage cases prepare their claims before the environment exists, and a claim nothing
+# has consumed yet must bind on its own.
+#
+# Idempotent: re-running patches the same config and replaces the class.
 set -euo pipefail
 
 KIND_CLUSTER="${KIND_CLUSTER_HELM:-cubestack-helm-e2e}"
@@ -105,6 +113,11 @@ echo "restarting the provisioner to pick the config up now rather than within 30
 kubectl_e2e rollout restart deployment/local-path-provisioner -n "${PROVISIONER_NS}"
 kubectl_e2e rollout status deployment/local-path-provisioner -n "${PROVISIONER_NS}" --timeout=120s
 
+# volumeBindingMode is immutable, so a class an earlier run created with another mode
+# would refuse the apply. The object is this script's own, and replacing it leaves the
+# volumes already bound from it — their PVs and claims — untouched.
+kubectl_e2e delete storageclass "${STORAGE_CLASS}" --ignore-not-found
+
 cat <<YAML | kubectl_e2e apply -f -
 apiVersion: storage.k8s.io/v1
 kind: StorageClass
@@ -112,7 +125,8 @@ metadata:
   name: ${STORAGE_CLASS}
 provisioner: rancher.io/local-path
 reclaimPolicy: Delete
-volumeBindingMode: WaitForFirstConsumer
+# Immediate rather than WaitForFirstConsumer: see the header for why.
+volumeBindingMode: Immediate
 YAML
 
 echo "StorageClass ${STORAGE_CLASS} ready"

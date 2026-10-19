@@ -54,7 +54,7 @@ type Image struct {
 	// is the registry's to decide anyway.
 	Key string
 
-	// Repo is the image path under the registry: "suanova/minimal" style,
+	// Repo is the image path under the registry: "suanova/cpu-base" style,
 	// without the registry host or the tag.
 	Repo string
 
@@ -126,20 +126,20 @@ func (i Image) Ref() string {
 // multi-gigabyte pull rather than after it.
 var Images = []Image{
 	{
-		Key:     "minimal-ssh",
-		Repo:    "suanova/minimal",
+		Key:     "cpu-base-ssh",
+		Repo:    "suanova/cpu-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,
 		GID:     1000,
 		Home:    ubuntuHome,
-		// No stack: the minimal image is ubuntu:22.04 with sshd and JupyterLab, and
+		// No stack: the cpu-base image is ubuntu:22.04 with sshd and JupyterLab, and
 		// a session that reaches the workspace is what it is for — not a vendor
 		// toolchain.
 	},
 	{
-		Key:     "minimal-jupyter",
-		Repo:    "suanova/minimal",
+		Key:     "cpu-base-jupyter",
+		Repo:    "suanova/cpu-base",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,

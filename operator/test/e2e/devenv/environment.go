@@ -157,12 +157,20 @@ const (
 )
 
 const (
-	envRunID           = "DEVENV_E2E_RUN_ID"
-	envNamespace       = "DEVENV_E2E_NAMESPACE"
-	envPlatformNS      = "DEVENV_E2E_PLATFORM_NAMESPACE"
-	envPullSecret      = "DEVENV_E2E_PULL_SECRET"
-	envProxy           = "DEVENV_E2E_PROXY"
-	envUpTimeout       = "DEVENV_E2E_UP_TIMEOUT"
+	envRunID      = "DEVENV_E2E_RUN_ID"
+	envNamespace  = "DEVENV_E2E_NAMESPACE"
+	envPlatformNS = "DEVENV_E2E_PLATFORM_NAMESPACE"
+	envPullSecret = "DEVENV_E2E_PULL_SECRET"
+	envProxy      = "DEVENV_E2E_PROXY"
+	envUpTimeout  = "DEVENV_E2E_UP_TIMEOUT"
+	// envAllowKind admits a kind cluster, the one context the preflight otherwise
+	// refuses. Set by CI, where the cluster being tested is the one the job built.
+	envAllowKind = "DEVENV_E2E_ALLOW_KIND"
+	// envPreloadedImages says the images are already on the nodes, so there is no
+	// registry credential to copy into the run's namespace. Set by CI beside
+	// envAllowKind: kind loads the image under a non-latest tag, which Kubernetes
+	// defaults to IfNotPresent, so the kubelet uses its own copy.
+	envPreloadedImages = "DEVENV_E2E_PRELOADED_IMAGES"
 	defaultPlatformNS  = "cubestack-system"
 	defaultPullSecret  = "harbor-credentials"
 	defaultUpTimeout   = 20 * time.Minute
@@ -196,9 +204,23 @@ type Suite struct {
 	// PlatformNamespace and PullSecret are where the pull credential lives. The
 	// controller sets no imagePullSecrets on an environment's pod, so copying this
 	// into the run's namespace and naming it on the default ServiceAccount is the
-	// only way the kubelet gets it.
+	// only way the kubelet gets it. PullSecret is empty when the images are
+	// preloaded on the nodes (envPreloadedImages), where there is nothing to
+	// authenticate and no credential to copy.
 	PlatformNamespace string
 	PullSecret        string
+
+	// AllowKind admits a kind cluster, which the preflight otherwise refuses. A
+	// run that CI drove against the cluster it just built sets it deliberately;
+	// leaving it false is what keeps DEVENV_E2E left set by accident from
+	// pointing this suite at the kind specs' cluster.
+	AllowKind bool
+
+	// PreloadedImages says the images are on the nodes rather than in a registry,
+	// which is what leaves PullSecret empty. A node that was loaded rather than
+	// pulled resolves only tagged references — a digest-pinned reference is
+	// handed to the registry — so a case that pins a digest has to skip here.
+	PreloadedImages bool
 
 	// Cluster is what the preflight established about the cluster this run is
 	// against: the Gateway, the L4 pool, the dataplane Service. Assigned by the
@@ -259,6 +281,11 @@ func NewSuite() (*Suite, error) {
 		Dialer:            Dialer{Proxy: os.Getenv(envProxy)},
 		PlatformNamespace: envOr(envPlatformNS, defaultPlatformNS),
 		PullSecret:        envOr(envPullSecret, defaultPullSecret),
+		AllowKind:         os.Getenv(envAllowKind) == "1",
+	}
+	if os.Getenv(envPreloadedImages) == "1" {
+		s.PullSecret = ""
+		s.PreloadedImages = true
 	}
 	s.Namespace = os.Getenv(envNamespace)
 	if s.Namespace == "" {
@@ -325,7 +352,13 @@ func (s *Suite) RemoveNamespace(ctx context.Context, name string) error {
 // the namespace default is the only path the credential has to the kubelet. A
 // run that skips this fails as ImagePullBackOff, which reads as an image finding
 // rather than a setup one.
+//
+// A run whose images are on the nodes has no credential to copy, and
+// PullSecret is empty for it.
 func (s *Suite) providePullCredential(ctx context.Context, namespace string) error {
+	if s.PullSecret == "" {
+		return nil
+	}
 	var src corev1.Secret
 	key := client.ObjectKey{Namespace: s.PlatformNamespace, Name: s.PullSecret}
 	if err := s.Client.Get(ctx, key, &src); err != nil {

@@ -15,7 +15,7 @@ permissions: {}
 
 # One job per image, chosen by the rule both workflows ask
 # (images/hack/changed-images.sh), because the images are independent: no Dockerfile
-# reads across them, so a merge that changes only images/minimal/** cannot change what is
+# reads across them, so a merge that changes only images/cpu-base/** cannot change what is
 # in the MACA image. Running one job for several images made every such merge pull the
 # 10.5 GiB vendor base on its way to publishing images it could not have altered.
 #
@@ -96,7 +96,7 @@ jobs:
       - name: Reclaim disk space
         # The vendor images are why this step exists: each unpacks to tens of GB against
         # the ~31 GB a standard runner has free on /. The CPU image is a fraction of that
-        # (`minimal` measures well under a gigabyte), so its leg skips the 1m41s.
+        # (`cpu-base` measures well under a gigabyte), so its leg skips the 1m41s.
         if: ${{ matrix.vendor }}
         uses: ./.github/actions/reclaim-disk
       - name: Smoke the image before publishing it
