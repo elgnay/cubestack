@@ -519,6 +519,21 @@ spec:
                         format: int64
                         type: integer
                     type: object
+                  sudo:
+                    default: false
+                    description: |-
+                      Sudo grants the environment's non-root account passwordless sudo, so the
+                      processes it runs may act as root inside the container. Off by default:
+                      without it the account cannot elevate at all. The grant follows the uid the
+                      container runs as, not spec.runtime.user. It is confined to the container:
+                      the workload gains no capability, reaches no host resource, does not need a
+                      looser Pod Security Standard than an environment without it, and the grant
+                      ends with the pod. An environment that runs as root already has this
+                      privilege and needs nothing from the field.
+
+                      The platform's images include sudo; an image named through spec.image must
+                      include it as well.
+                    type: boolean
                   user:
                     description: |-
                       User is the container account the environment runs as — the account the

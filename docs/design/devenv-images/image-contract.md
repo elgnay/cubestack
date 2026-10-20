@@ -71,6 +71,38 @@ Images ship no host keys and no authorized keys.
 - A **root sshd needs `/run/sshd`** (privilege separation directory). Every first-party Dockerfile
   creates it; an image that does not cannot serve a root environment.
 
+## Elevation (`spec.runtime.sudo`)
+
+`spec.runtime.sudo: true` (default `false`) lets the environment's account run commands as root
+**inside the container**. Every first-party image installs `sudo` and grants nothing: the binary runs
+only for accounts a sudoers rule names, and the images name none. The account therefore cannot
+install system packages, write outside what it owns, or run `apt-get` until the environment asks for
+the grant.
+
+What the controller renders when the field is true and the container runs as a positive uid:
+
+| Piece | Value |
+|---|---|
+| volume | `emptyDir` named `sudoers` |
+| init container | `initialize-sudoers`: root, every capability dropped, read-only root filesystem |
+| rule | `#<uid> ALL=(ALL) NOPASSWD: ALL` in `<volume>/20-cubestack`, mode `0440` |
+| mount | that one file at `/etc/sudoers.d/20-cubestack`, `subPath`, read-only |
+
+- The rule names the **uid the container runs as**, not `spec.runtime.user`: sudoers' numeric-user
+  form is `#<uid>` with no space. It is written inside the pod rather than kept in a Secret: it is
+  derived from the spec, holds nothing secret, and must not outlive the pod.
+- An environment that runs as root (`runAsUser: 0`) already holds the privilege, so the field renders
+  nothing there. `false` is the default and renders the pod exactly as it was before the field
+  existed.
+- The main container's `allowPrivilegeEscalation` stays unset (Kubernetes' default, true): `sudo` is a
+  setuid binary, so an explicit `false` would make the grant inert.
+- The grant is confined to the container: it adds no capability to the pod, reaches no host resource,
+  and needs no change to the namespace's Pod Security Standard. See `decision.md` Gap E.
+
+A **bring-your-own image** that a spec grants elevation to must ship `sudo` and read
+`/etc/sudoers.d` (every Ubuntu/Debian image does). The controller writes the rule but cannot install
+the binary.
+
 ## Ports
 
 | Mode | Container port | Service |

@@ -39,6 +39,10 @@
 # what keeps the shared sshd drop-in's build-time substitution honest (see
 # check_session_env below).
 #
+# Every family also asserts the elevation contract (check_sudo): the image ships sudo,
+# sudo grants nothing by itself, and the rule the controller writes for spec.runtime.sudo
+# elevates the account.
+#
 # sshd listens on the unprivileged :2222 (so no NET_BIND_SERVICE is needed); the
 # platform's Service publishes it as 22. The smoke talks to 2222 directly.
 #
@@ -705,6 +709,55 @@ check_notebook_kernel() {
   fi
 }
 
+# check_sudo <image> <label> — the elevation contract, in the three states the platform
+# puts an environment through. The image ships sudo and grants nothing: sudo runs only
+# for the accounts a sudoers rule names, and the image names none. The controller
+# supplies the rule when spec.runtime.sudo asks for it — a numeric uid, which is the
+# form that follows the container's identity rather than an account name the image may
+# not have — and this writes the same bytes to check that they elevate.
+#
+# The rule has to be written *inside* the container by root: sudo refuses a drop-in root
+# does not own, and a bind-mounted host file belongs to the host user with a host mode.
+check_sudo() {
+  local img=$1 label=$2 cont out
+  # 1. the binary is there for the account.
+  out="$("$CONTAINER_TOOL" run --rm --user 1000:1000 --entrypoint /bin/sh "$img" \
+    -c 'command -v sudo' 2>/dev/null || true)"
+  if [ -n "$out" ]; then
+    ok "$label sudo installed ($out)"
+  else
+    bad "$label sudo is not installed"
+  fi
+
+  # 2. and grants nothing until a rule names it. The run is the image without the
+  # controller's file, which is exactly what an environment that does not ask for the
+  # grant gets.
+  if "$CONTAINER_TOOL" run --rm --user 1000:1000 --entrypoint /bin/sh "$img" \
+    -c 'sudo -n true' >/dev/null 2>&1; then
+    bad "$label sudo granted an account no rule names"
+  else
+    ok "$label sudo refused before the platform grants it"
+  fi
+
+  # 3. with the controller's file in place, the grant is live for uid 1000.
+  cont="cs-smoke-sudo-$$"
+  start "$cont" --user 0:0 --entrypoint /bin/sh "$img" -c 'sleep 300'
+  out="$("$CONTAINER_TOOL" exec "$cont" sh -c '
+    umask 077
+    printf "#1000 ALL=(ALL) NOPASSWD: ALL\n" > /etc/sudoers.d/20-cubestack
+    chmod 0440 /etc/sudoers.d/20-cubestack
+    visudo -cf /etc/sudoers.d/20-cubestack' 2>&1 || true)"
+  check_contains "$out" "parsed OK" "$label the controller's rule passes visudo"
+  out="$("$CONTAINER_TOOL" exec --user 1000:1000 "$cont" sudo -n id -u 2>&1 || true)"
+  if [ "$out" = 0 ]; then
+    ok "$label sudo elevates the account to root under the controller's rule"
+  else
+    bad "$label sudo did not elevate under the controller's rule (got '${out:-<nothing>}')"
+    "$CONTAINER_TOOL" exec "$cont" visudo -c 2>&1 | tail -n 5 || true
+  fi
+  "$CONTAINER_TOOL" rm -f "$cont" >/dev/null 2>&1 || true
+}
+
 # check_jupyter_home <image> <home> <label> [extra run args...]
 #
 # The home a jupyter container actually runs with, and the directory its notebook serves — the same
@@ -808,6 +861,8 @@ if [ "$run_cpu_pytorch" = 1 ]; then
     bad "cpu-pytorch expected '1000 1000', got '$id_out'"
   fi
 
+  check_sudo "$IMG_CPU_PYTORCH" "cpu-pytorch"
+
   check_torch "$cpu_pytorch_cont" "cpu-pytorch"
   check_notebook_kernel "$cpu_pytorch_cont" "cpu-pytorch"
 
@@ -876,6 +931,8 @@ if [ "$run_maca_pytorch" = 1 ]; then
   else
     bad "maca-pytorch expected '1000 1000', got '$id_out'"
   fi
+
+  check_sudo "$IMG_MACA" "maca-pytorch"
 
   check_maca_readable "$maca_cont" "maca-pytorch"
   # `jupyter` as the tool name: this launcher execs a bare `jupyter`, so the tool it finds
@@ -959,6 +1016,8 @@ if [ "$run_cuda_pytorch" = 1 ]; then
   else
     bad "cuda-pytorch expected '1000 1000', got '$id_out'"
   fi
+
+  check_sudo "$IMG_CUDA" "cuda-pytorch"
 
   check_torch "$cuda_cont" "cuda-pytorch"
   check_notebook_kernel "$cuda_cont" "cuda-pytorch"
