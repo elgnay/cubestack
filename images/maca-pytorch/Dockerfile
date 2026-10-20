@@ -26,7 +26,7 @@
 # Build context MUST be images/ (not this directory) so common/ is COPYable.
 #   docker build --platform linux/amd64 -f maca-pytorch/Dockerfile \
 #     -t harbor.isuanova.com/suanova/maca-pytorch:<tag> images/
-#   (or: make -C images build-maca)
+#   (or: make -C images build-maca-pytorch)
 
 # The platform registry's mirrored copy of the vendor package, which is what a bare `docker build`
 # resolves. Every published build substitutes the same reference pinned by digest through BASE_ARGS
