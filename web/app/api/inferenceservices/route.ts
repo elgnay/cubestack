@@ -1,5 +1,6 @@
 import { getCoreClient, getCustomObjectsClient } from "@/lib/kubernetes";
 import { withAuth } from "@/lib/auth/guard";
+import { CATALOG_PATHS, isAIGatewayRouter, isCatalogPath, type CatalogPath } from "@/lib/inference-routes";
 
 // @kubernetes/client-node needs Node APIs (TLS, fs), not the Edge runtime.
 export const runtime = "nodejs";
@@ -35,6 +36,9 @@ export interface InferenceServiceSummary {
   profileRef: string;
   modelRef: string;
   published: boolean;
+  // The shared catalog route the service publishes to (public or private), or
+  // null when it is not published. Drives which endpoint the detail card shows.
+  aigatewayRouter: string | null;
   routeModelName: string | null;
   timeoutSeconds: number | null;
   idleTimeoutSeconds: number | null;
@@ -113,7 +117,7 @@ interface IsvcSpec {
   profileRef?: string;
   overrides?: Record<string, unknown>;
   route?: {
-    publish?: boolean;
+    aigatewayRouter?: string;
     modelName?: string;
     timeoutSeconds?: number;
     idleTimeoutSeconds?: number;
@@ -365,7 +369,8 @@ function project(
     namespace: isvc.metadata?.namespace ?? "",
     profileRef: spec.profileRef ?? "—",
     modelRef: spec.modelRef ?? "—",
-    published: spec.route?.publish ?? false,
+    published: (spec.route?.aigatewayRouter ?? "") !== "",
+    aigatewayRouter: spec.route?.aigatewayRouter ?? null,
     routeModelName: spec.route?.modelName ?? null,
     timeoutSeconds: spec.route?.timeoutSeconds ?? null,
     idleTimeoutSeconds: spec.route?.idleTimeoutSeconds ?? null,
@@ -551,10 +556,9 @@ interface CreateBody {
   modelRef?: string;
   overrides?: Record<string, number | string | boolean>;
   route?: {
-    publish?: boolean;
+    aigatewayRouter?: string;
     modelName?: string;
-    timeoutSeconds?: number;
-    idleTimeoutSeconds?: number;
+    paths?: string[];
   };
 }
 interface ModelVersionRef {
@@ -624,31 +628,33 @@ export const POST = withAuth(async (req) => {
     const oerr = overrideError(body.overrides ?? {}, profile);
     if (oerr) return ValidationError(oerr.code, oerr.params);
 
-    // Route: publishing joins the platform model catalog, which requires a
-    // valid catalog model name. Both timeouts are bounded by the operator's CRD
-    // ranges; timeoutSeconds 0 means "no total-duration cap".
-    const timeout = body.route?.timeoutSeconds;
-    const idle = body.route?.idleTimeoutSeconds;
-    if (timeout !== undefined && timeout !== null && (Number.isNaN(timeout) || timeout < 0 || timeout > 86400)) {
-      return ValidationError("timeoutInvalid");
-    }
-    if (idle !== undefined && idle !== null && (Number.isNaN(idle) || idle < 1 || idle > 86400)) {
-      return ValidationError("idleTimeoutInvalid");
-    }
-    let route: {
-      publish: boolean;
-      modelName?: string;
-      timeoutSeconds?: number;
-      idleTimeoutSeconds?: number;
-    };
-    if (body.route?.publish) {
+    // Route: a non-empty aigatewayRouter publishes the service into the model
+    // catalog attached to that pre-installed AIGatewayRoute, which requires a
+    // valid catalog model name and at least one exposed path. An absent router
+    // leaves the service unpublished; the CRD supplies the timeout defaults.
+    let route: { aigatewayRouter: string; modelName: string; paths: CatalogPath[] } | undefined;
+    const router = body.route?.aigatewayRouter;
+    if (router !== undefined && router !== "") {
+      if (!isAIGatewayRouter(router)) {
+        return ValidationError("aigatewayRouterInvalid");
+      }
       const modelName = body.route?.modelName;
       if (!modelName || !MODEL_NAME_RE.test(modelName)) {
         return ValidationError("routeModelNameInvalid");
       }
-      route = { publish: true, modelName, timeoutSeconds: timeout ?? 0, idleTimeoutSeconds: idle ?? 300 };
-    } else {
-      route = { publish: false };
+      const paths = body.route?.paths;
+      // Untrusted JSON: the CreateBody type does not survive the wire, so a
+      // null or a bare string must be refused here instead of throwing into
+      // the 500 handler.
+      if (!Array.isArray(paths) || !paths.every(isCatalogPath)) {
+        return ValidationError("routePathsInvalid");
+      }
+      if (paths.length === 0) {
+        return ValidationError("routePathsRequired");
+      }
+      // The CRD list is a set: dedupe instead of rejecting a repeated path.
+      const unique = CATALOG_PATHS.filter((p) => paths.includes(p));
+      route = { aigatewayRouter: router, modelName, paths: unique };
     }
 
     const cr = {
@@ -659,7 +665,7 @@ export const POST = withAuth(async (req) => {
         modelRef: body.modelRef,
         profileRef: body.profileRef,
         overrides: body.overrides ?? {},
-        route,
+        ...(route ? { route } : {}),
       },
     };
 
