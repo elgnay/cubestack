@@ -85,13 +85,19 @@ controller probes only the one `spec.type` selects.
 
 | Image | Base | Platforms |
 |---|---|---|
-| `cpu-base` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
-| `cube-base` | NVIDIA NGC PyTorch (`nvcr.io/nvidia/pytorch:<release>-py3`, mirrored) | `linux/amd64` |
-| `maca-base` | Metax MACA (`public-library/maca-pytorch:…`, mirrored) | `linux/amd64` |
+| `cpu-pytorch` | `ubuntu:22.04` | `linux/amd64`, `linux/arm64` (multi-arch index) |
+| `cuda-pytorch` | NVIDIA NGC PyTorch (`nvcr.io/nvidia/pytorch:<release>-py3`, mirrored) | `linux/amd64` |
+| `maca-pytorch` | Metax MACA (`public-library/maca-pytorch:…`, mirrored) | `linux/amd64` |
 
 The vendor bases publish one architecture only, so their images do too. A registry must receive the
 platform the nodes run; verify with `docker buildx imagetools inspect --raw <ref>` rather than
 assuming the build host's architecture.
+
+Every first-party image bakes PyTorch on the interpreter its sessions resolve — the CPU image
+installs the CPU build from `download.pytorch.org/whl/cpu`, the vendor images keep the one their
+base ships. The image name states the stack (decision doc §5.1), so a session can rely on `import
+torch` working without naming a framework. JupyterLab is on that same interpreter, so the notebook
+kernel and an ssh session never disagree about which Python — and which torch — they see.
 
 ## Notes for bring-your-own images
 

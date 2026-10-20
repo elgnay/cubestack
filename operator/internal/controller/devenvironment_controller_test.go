@@ -61,11 +61,11 @@ import (
 const (
 	testDevImage      = "harbor.local/ai-images/base-cuda:11.8-pytorch2.2"
 	testBaseMacaImage = "harbor.local/ai-images/base-maca:1.0"
-	testCPUImage      = "harbor.isuanova.com/suanova/cpu-base:latest"
-	// testCubeBaseImage is the platform's own nvidia family image. Its name
-	// carries no "cuda" token, which is why the nvidia rule accepts the family
-	// name as well.
-	testCubeBaseImage = "harbor.isuanova.com/suanova/cube-base:26.08"
+	testCPUImage      = "harbor.isuanova.com/suanova/cpu-pytorch:latest"
+	// testCUDAPytorchImage is the platform's own nvidia family image. Its name
+	// carries the accelerator token the nvidia rule checks, as every family
+	// image's does.
+	testCUDAPytorchImage = "harbor.isuanova.com/suanova/cuda-pytorch:26.08"
 	// testMetaxImage is the mirror of the upstream Metax package: the metax token
 	// is `maca` in the package's own name, whatever registry path fronts it.
 	testMetaxImage = "harbor.isuanova.com/mirrors/cr.metax-tech.com/public-library/maca-pytorch:3.9.0.12-torch2.4-py310-ubuntu22.04-amd64"
@@ -1579,10 +1579,10 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				}
 			},
 			Entry("nvidia with a base-cuda image matches", testDevImage, nvidiaGPU(), true),
-			Entry("nvidia with a cube-base image matches", testCubeBaseImage, nvidiaGPU(), true),
+			Entry("nvidia with a cuda-pytorch image matches", testCUDAPytorchImage, nvidiaGPU(), true),
 			Entry("nvidia with a minimal image mismatches", testCPUImage, nvidiaGPU(), false),
 			Entry("nvidia with a base-maca image mismatches", testBaseMacaImage, nvidiaGPU(), false),
-			Entry("metax with a cube-base image mismatches", testCubeBaseImage, metaxGPU(), false),
+			Entry("metax with a cuda-pytorch image mismatches", testCUDAPytorchImage, metaxGPU(), false),
 			Entry("metax with a base-cuda image mismatches", testDevImage, metaxGPU(), false),
 			Entry("metax with a mirrored maca-pytorch image matches", testMetaxImage, metaxGPU(), true),
 			Entry("metax with an unqualified maca image matches", testBareMacaImage, metaxGPU(), true),

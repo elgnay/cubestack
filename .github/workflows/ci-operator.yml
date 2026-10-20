@@ -149,7 +149,7 @@ jobs:
           persist-credentials: false
       - name: Reclaim disk space
         # The vendor bases are why this step exists, exactly as on a publishing leg. The CPU
-        # image is a fraction of one (`cpu-base` measures well under a gigabyte), so its leg
+        # image is a fraction of one (`cpu-pytorch` measures well under a gigabyte), so its leg
         # skips the 1m41s. `vendor` is the rule's, carried on the group it sized: one
         # derivation, so a smoke leg and a publish leg cannot come out sized differently.
         if: ${{ matrix.vendor }}
@@ -157,7 +157,7 @@ jobs:
       - name: Build and smoke the images this base group reaches
         # Every image is built for linux/amd64 and started as a throwaway container on
         # 127.0.0.1, so this needs neither a cluster nor registry credentials. The e2e
-        # exercises the cpu-base image alone and leaves the rest neither built nor pulled
+        # exercises the cpu-pytorch image alone and leaves the rest neither built nor pulled
         # (operator/Makefile), so this is the only job that covers them.
         #
         # Only the images the change reaches are built, which is what keeps a CPU-only
@@ -170,7 +170,7 @@ jobs:
           # One target per image rather than `smoke`, which builds all three: smoke.sh takes
           # one image per invocation, so naming the targets is how a subset is asked for.
           # The names are the selector's vocabulary, which is the Makefile's
-          # (`make -C images smoke-cpu-base`), and `matrix.images` is that vocabulary for this
+          # (`make -C images smoke-cpu-pytorch`), and `matrix.images` is that vocabulary for this
           # leg's base.
           targets=""
           for img in ${{ matrix.images }}; do

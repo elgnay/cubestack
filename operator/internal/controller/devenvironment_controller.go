@@ -1022,13 +1022,11 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 // brandRule is vendor's image-naming rule (design §4.2): the predicate an image
 // reference has to satisfy, and the phrase naming it in a mismatch message.
 //
-// The rule is the vendor's own token — "cuda" for nvidia, "maca" for metax —
-// anywhere in the reference. nvidia products are self-built, so the rule also
-// accepts the platform's family name "cube-base"; metax products are mirrored
-// from the upstream Metax library under each package's own name: maca,
-// maca-pytorch, maca-tensorflow. The rules stay the same shape, so the gate
-// reads as one question — does the image name its vendor? — rather than a
-// different check per vendor.
+// The rule is the accelerator token the platform names its own images by —
+// "cuda" for nvidia, "maca" for metax — anywhere in the reference. One token,
+// because the family images and the vendor packages share it (`cuda-pytorch`,
+// `maca-pytorch`), so the gate reads as one question — does the image name its
+// accelerator? — rather than a different check per vendor.
 //
 // Like vendorResource it is total, and for the same reason: an unresolvable
 // vendor resolves to the metax rule rather than falling out of the switch and
@@ -1038,10 +1036,8 @@ func gatewayAPICRDInstalled(mgr ctrl.Manager, kind string) (bool, error) {
 func brandRule(vendor aiv1alpha1.AcceleratorVendor) (matches func(image string) bool, want string) {
 	switch vendor {
 	case aiv1alpha1.AcceleratorVendorNvidia:
-		return func(image string) bool {
-				return strings.Contains(image, "cuda") || strings.Contains(image, "cube-base")
-			},
-			`an image containing "cuda" or "cube-base"`
+		return func(image string) bool { return strings.Contains(image, "cuda") },
+			`an image containing "cuda"`
 	default:
 		return func(image string) bool { return strings.Contains(image, "maca") },
 			`an image containing "maca"`
