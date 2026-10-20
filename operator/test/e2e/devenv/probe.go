@@ -39,7 +39,9 @@ const (
 // The image is the caller's, and the callers pass the environment's own — a node
 // is already running it, so the pod pulls only where it finds nothing, which is
 // what a preloaded cluster with no registry credential can serve.
-func (s *Suite) RunToCompletion(ctx context.Context, namespace, image string, command []string, timeout time.Duration) (int32, string, error) {
+func (s *Suite) RunToCompletion(
+	ctx context.Context, namespace, image string, command []string, timeout time.Duration,
+) (int32, string, error) {
 	zero := int64(0)
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{GenerateName: probePodNamePrefix, Namespace: namespace},
@@ -94,7 +96,9 @@ func (s *Suite) RunToCompletion(ctx context.Context, namespace, image string, co
 // against: a connection the network refused and a connection nothing was
 // serving produce the same error, so the control has to be answering before the
 // probe asks anything. The caller deletes the pod; it never exits on its own.
-func (s *Suite) RunServer(ctx context.Context, namespace, image string, command []string, port int32, timeout time.Duration) (*corev1.Pod, error) {
+func (s *Suite) RunServer(
+	ctx context.Context, namespace, image string, command []string, port int32, timeout time.Duration,
+) (*corev1.Pod, error) {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{GenerateName: serverPodNamePrefix, Namespace: namespace},
 		Spec: corev1.PodSpec{
