@@ -97,6 +97,12 @@ type Stack struct {
 	Command string
 }
 
+// torchProbe is the Stack command for every image that carries PyTorch: the
+// version an ssh session's python3 resolves. It is one constant because the
+// claim is the same one on each family — that image's torch, on that image's
+// interpreter.
+const torchProbe = `python3 -c 'import torch; print(torch.__version__)'`
+
 // Ref is the image reference to pull: <registry>/<repo>:<tag>, with the registry
 // and tag overridable through the environment.
 func (i Image) Ref() string {
@@ -138,7 +144,7 @@ var Images = []Image{
 		// probe is one import.
 		Stack: Stack{
 			Name:    "CPU torch",
-			Command: `python3 -c 'import torch; print(torch.__version__)'`,
+			Command: torchProbe,
 		},
 	},
 	{
@@ -169,7 +175,7 @@ var Images = []Image{
 		// succeeds is the whole of the claim.
 		Stack: Stack{
 			Name:    "MACA torch",
-			Command: `python3 -c 'import torch; print(torch.__version__)'`,
+			Command: torchProbe,
 		},
 	},
 	{
@@ -182,7 +188,7 @@ var Images = []Image{
 		Home:    ubuntuHome,
 		Stack: Stack{
 			Name:    "MACA torch",
-			Command: `python3 -c 'import torch; print(torch.__version__)'`,
+			Command: torchProbe,
 		},
 	},
 	{
