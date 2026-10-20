@@ -54,7 +54,7 @@ type Image struct {
 	// is the registry's to decide anyway.
 	Key string
 
-	// Repo is the image path under the registry: "suanova/cpu-base" style,
+	// Repo is the image path under the registry: "suanova/cpu-pytorch" style,
 	// without the registry host or the tag.
 	Repo string
 
@@ -126,20 +126,24 @@ func (i Image) Ref() string {
 // multi-gigabyte pull rather than after it.
 var Images = []Image{
 	{
-		Key:     "cpu-base-ssh",
-		Repo:    "suanova/cpu-base",
+		Key:     "cpu-pytorch-ssh",
+		Repo:    "suanova/cpu-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,
 		GID:     1000,
 		Home:    ubuntuHome,
-		// No stack: the cpu-base image is ubuntu:22.04 with sshd and JupyterLab, and
-		// a session that reaches the workspace is what it is for — not a vendor
-		// toolchain.
+		// torch is the stack the family is named for, installed into the
+		// distribution's python — the same interpreter an ssh session gets, so the
+		// probe is one import.
+		Stack: Stack{
+			Name:    "CPU torch",
+			Command: `python3 -c 'import torch; print(torch.__version__)'`,
+		},
 	},
 	{
-		Key:     "cpu-base-jupyter",
-		Repo:    "suanova/cpu-base",
+		Key:     "cpu-pytorch-jupyter",
+		Repo:    "suanova/cpu-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -153,8 +157,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "maca-base-jupyter",
-		Repo:    "suanova/maca-base",
+		Key:     "maca-pytorch-jupyter",
+		Repo:    "suanova/maca-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -169,8 +173,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "maca-base-ssh",
-		Repo:    "suanova/maca-base",
+		Key:     "maca-pytorch-ssh",
+		Repo:    "suanova/maca-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -182,8 +186,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "cube-base-jupyter",
-		Repo:    "suanova/cube-base",
+		Key:     "cuda-pytorch-jupyter",
+		Repo:    "suanova/cuda-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeJupyter,
 		Account: ubuntuAccount,
 		UID:     1000,
@@ -198,8 +202,8 @@ var Images = []Image{
 		},
 	},
 	{
-		Key:     "cube-base-ssh",
-		Repo:    "suanova/cube-base",
+		Key:     "cuda-pytorch-ssh",
+		Repo:    "suanova/cuda-pytorch",
 		Type:    aiv1alpha1.DevEnvironmentTypeSSH,
 		Account: ubuntuAccount,
 		UID:     1000,

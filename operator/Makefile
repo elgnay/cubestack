@@ -187,10 +187,10 @@ HELM_RELEASE ?= cubestack
 # The published-artifact claim moves with it: that the reference a deployment
 # pulls exists is the images-smoke job's, which builds the same tree and asserts
 # its contract. This flow is about the operator serving an environment.
-DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/cpu-base:e2e
+DEV_ENV_IMAGE ?= harbor.isuanova.com/suanova/cpu-pytorch:e2e
 # The tag images/Makefile builds the environment's image under. Kept apart from
 # DEV_ENV_IMAGE because that Makefile reads TAG for its own default reference,
-# which is overridden here by IMG_CPU_BASE.
+# which is overridden here by IMG_CPU_PYTORCH.
 DEV_ENV_IMAGE_TAG ?= e2e
 # The platform the kind node runs. A kind node matches the docker daemon's
 # architecture, which on an arm64 laptop is not the amd64 these images publish
@@ -384,12 +384,12 @@ helm-e2e-images: ## Build the manager, echo and environment images and pull the 
 	echo "Pulling $(PERMISSION_INIT_IMAGE) (busybox, for the workspace init container)..." ; \
 	$(CONTAINER_TOOL) pull --platform "$(DEV_ENV_PLATFORM)" "$(PERMISSION_INIT_IMAGE)"
 	# The environment's own image, built from this tree (see DEV_ENV_IMAGE). Only
-	# the cpu-base image is involved — the environment is a jupyter one, and the
+	# the cpu-pytorch image is involved — the environment is a jupyter one, and the
 	# same image serves ssh from the controller's CUBSTACK_TYPE, since its
 	# entrypoint starts sshd when the operator mounts the ssh material; the
 	# vendor images are neither built nor pulled.
-	$(MAKE) -C ../images build-cpu-base \
-		TAG=$(DEV_ENV_IMAGE_TAG) PLATFORM=$(DEV_ENV_PLATFORM) IMG_CPU_BASE=$(DEV_ENV_IMAGE)
+	$(MAKE) -C ../images build-cpu-pytorch \
+		TAG=$(DEV_ENV_IMAGE_TAG) PLATFORM=$(DEV_ENV_PLATFORM) IMG_CPU_PYTORCH=$(DEV_ENV_IMAGE)
 
 .PHONY: helm-e2e-images-load
 helm-e2e-images-load: helm-e2e-setup helm-e2e-images ## Load the built and pulled images into the kind cluster
@@ -556,7 +556,7 @@ helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and S
 #
 # One line, because Ginkgo's tokenizer skips spaces but not a newline: a
 # backslash continuation would put one inside the filter.
-DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-base-ssh && !image:maca-base-jupyter && !image:cube-base-ssh && !image:cube-base-jupyter$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_PRIORITY))
+DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-pytorch-ssh && !image:maca-pytorch-jupyter && !image:cuda-pytorch-ssh && !image:cuda-pytorch-jupyter$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_PRIORITY))
 
 # Optional shard, `p0` or `p1`. Every spec in the selection above carries exactly
 # one of the two priority labels (96 and 84 of them today), so the two shards
@@ -641,7 +641,7 @@ helm-e2e-cleanup: ## Delete the dedicated kind cluster
 #
 #   DEVENV_E2E_LABELS='devenv-conformance && p0'
 #   DEVENV_E2E_LABELS='devenv-conformance && identity:root'
-#   DEVENV_E2E_LABELS='devenv-conformance && image:cpu-base-jupyter'
+#   DEVENV_E2E_LABELS='devenv-conformance && image:cpu-pytorch-jupyter'
 #
 # It duplicates the constants in test/e2e/devenv/labels.go, which a Makefile cannot
 # import. Keep the two adjacent in review and do not add a third copy.

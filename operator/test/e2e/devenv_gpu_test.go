@@ -98,7 +98,7 @@ var gpuVendors = []gpuVendor{
 		vendor:       aiv1alpha1.AcceleratorVendorNvidia,
 		resource:     nvidiaGPU,
 		productLabel: nvidiaProduct,
-		image:        "cube-base-ssh",
+		image:        "cuda-pytorch-ssh",
 		tool:         "nvidia-smi -L",
 	},
 	{
@@ -106,7 +106,7 @@ var gpuVendors = []gpuVendor{
 		vendor:       aiv1alpha1.AcceleratorVendorMetax,
 		resource:     metaxGPU,
 		productLabel: metaxProduct,
-		image:        "maca-base-ssh",
+		image:        "maca-pytorch-ssh",
 		tool:         "mx-smi",
 	},
 }
@@ -430,7 +430,7 @@ func describeGPUVendorAbsent(v gpuVendor) {
 func describeGPUShortfall() {
 	draftCase{
 		Name:     "gpu-shortfall",
-		Image:    devenv.MustImage("cube-base-ssh"),
+		Image:    devenv.MustImage("cuda-pytorch-ssh"),
 		Identity: devenv.NonRoot,
 		Shape: func(d *aiv1alpha1.DevEnvironment) {
 			// One more than the largest single node holds, which makes the request
