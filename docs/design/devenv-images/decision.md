@@ -293,6 +293,60 @@ when it is absent (a hand-run container) and exiting non-zero on an unknown valu
 participates in the StatefulSet template hash, so upgrading the operator rolls every jupyter/ssh
 environment once to deliver it. `vscode` injects nothing: no first-party image serves it.
 
+### Gap E — closed: opt-in non-root elevation (`spec.runtime.sudo`)
+
+An environment runs as uid 1000 and had no way to become root: no image shipped `sudo`, and the
+platform holds no privilege a non-root process could borrow. A tenant who needs `apt-get install` —
+the reason the issue was filed — had exactly one option: `spec.runtime.securityContext.runAsUser: 0`,
+which turns the whole environment root and changes its identity (login account, workspace ownership,
+the `Accepted` report). That is a different environment, not an elevation.
+
+Three options were considered:
+
+1. **Run the environment as root.** The status quo. It answers "install a package" by making
+   everything the environment runs root: the grant is permanent, the workspace belongs to root, and
+   the account the ssh endpoint advertises is not the one in use.
+2. **Add capabilities to the container.** Capabilities are not what `apt-get` needs — it needs the
+   whole of root, including writing anywhere and executing setuid binaries — and widening a
+   container's capability set is what the Restricted Pod Security Standard refuses.
+3. **Ship `sudo`, grant it opt-in per environment.** *Decided.* The image carries the binary and no
+   rule; the controller writes the rule when, and only when, the spec asks.
+
+**Decided (issue #330):** `spec.runtime.sudo: true`, default `false`. All three family images install
+`sudo` and grant nothing: sudo runs only for accounts a sudoers rule names, and the images name none.
+When the field is true and the container runs as a positive uid, the controller adds:
+
+- an `emptyDir` volume;
+- a root init container (`initialize-sudoers`, the mirrored busybox the workspace repair already
+  uses) that writes `#<uid> ALL=(ALL) NOPASSWD: ALL` to `/sudoers/20-cubestack`, mode `0440`;
+- a read-only `subPath` mount of that one file at `/etc/sudoers.d/20-cubestack` in the main container.
+
+The rule names the **uid**, not `spec.runtime.user`: sudoers' numeric-user form is `#<uid>` (no space),
+and it follows the container's identity whatever name the image's passwd gives it. The rule is
+written inside the pod rather than kept in a Secret: it is derived from the spec, holds nothing
+secret, and must not outlive the pod. An environment that runs as root already holds the privilege
+the field asks for, so the field
+renders nothing there. `allowPrivilegeEscalation` on the main container stays unset (Kubernetes'
+default, true): `sudo` is a setuid binary, and an explicit `false` would make the grant inert.
+
+**Pod Security.** The field adds no requirement to the namespace. A `baseline` namespace already admits
+the root init container — the workspace repair is one too — and the main container still runs as its
+non-root account; sudo is a setuid binary inside the container, not a pod capability. The one
+host-adjacent consequence follows the network, not sudo: a RoCE environment
+(`spec.network.rdmaEnabled: true` with `rdmaType: roce`) shares the node's network namespace, so root
+there acts on the node's network exactly as a `runAsUser: 0` environment on the same fabric already
+does. A namespace enforcing `restricted` refuses every DevEnvironment pod at admission for reasons
+unrelated to sudo, so the field cannot be the thing that decides whether an environment is admitted.
+The operator reads no Namespace objects and holds no `namespaces` RBAC, so it cannot preflight a
+namespace's enforced level either; that is documented in `operator/README.md` rather than reported on
+the `Accepted` condition.
+
+**Bring-your-own images** must ship `sudo`, read `/etc/sudoers.d`, and have a passwd entry for the uid
+the container runs as for the grant to take effect: the controller writes the rule but cannot install
+the binary or the account. See `image-contract.md`.
+
+**Not in scope:** a console control for the field, and a permanent e2e conformance case.
+
 ---
 
 ## 3. Upstream base survey findings (2026-09-08)
@@ -725,5 +779,6 @@ six-image set did not have.
 | NVIDIA image: self-authored platform layer on the **mirrored** NGC PyTorch vendor base, which already supplies the account, the interpreter, torch and JupyterLab — so the "bake torch or not" and "runtime or devel" questions this row used to leave open are answered together by the base choice — plus the shared launcher; amd64-only, both modes in one `cuda-pytorch` image | §6.1 | ✅ shipped in `images/` (the earlier `base-cuda` on a bare `nvidia/cuda` runtime is superseded); ⚠️ **to confirm on an NVIDIA node**: the node's driver against the release's CUDA requirement, and the vendor stack under uid 1000 once a device is present |
 | Metax image: self-authored platform layer on the **mirrored** vendor base, plus the shared launcher (`common/jupyter/` — the vendor base ships none), amd64-only — both modes in one `maca-pytorch` image | §6.2 | ✅ shipped in `images/`; ⚠️ **to confirm on a Metax node**: driver model (the base's baked `/opt/mxdriver` vs. what the node injects) and `mx-smi`/`metax-tech.com/gpu` |
 | CPU image: self-build on `ubuntu:22.04` with `python3`/pip, the CPU build of PyTorch and JupyterLab on the system interpreter, account `ubuntu`/`$HOME=/home/ubuntu`; multi-arch (amd64, arm64); both modes in one `cpu-pytorch` image. The stock docker-stacks overlay (`jovyan`, gid 100) is retired: it was the one layout that needed a `runAsGroup` override | §6.3 | ✅ shipped in `images/` in #332; PyTorch and the `cpu-pytorch` name added in #343; replaces both the earlier `jupyter-minimal` and `ssh-ubuntu22.04` |
-| Gaps A/B/C/D closure | §8 | ✅ all four closed: A and C controller-side, B and D image-side (D by #332) |
+| Non-root elevation: `spec.runtime.sudo` (default `false`) grants the container's uid passwordless sudo through a controller-written sudoers drop-in. The images ship `sudo` and grant nothing; a root environment needs no grant; the field adds no Pod Security requirement | Gap E | ✅ decided and implemented (issue #330) |
+| Gaps A/B/C/D/E closure | §8, Gap E | ✅ all five closed: A and C controller-side, B and D image-side (D by #332), E by `spec.runtime.sudo` — the images ship sudo and grant nothing, and the controller writes the rule only when the spec asks (issue #330) |
 

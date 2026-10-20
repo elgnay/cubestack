@@ -49,11 +49,15 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     fi
 
 ARG DEBIAN_FRONTEND=noninteractive
+# sudo is installed but grants nothing: it runs only for the accounts a sudoers rule
+# names, and the image names none. spec.runtime.sudo is what supplies the rule
+# (images/README.md, image-contract.md).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates \
       openssh-server \
       python3 \
       python3-pip \
+      sudo \
       tini \
     && rm -rf /var/lib/apt/lists/*
 

@@ -39,9 +39,9 @@ family's original name) and `suanova/cpu-base` (its name in #336): the repositor
 accelerator and stack it serves, as the other two are, rather than for how small the image is.
 
 `cpu-pytorch` is the thinnest overlay but no longer a bare ssh server: it is `ubuntu:22.04` plus
-`openssh-server`, `python3`/`pip`, `tini`, the **CPU build of PyTorch**, **numpy** (torch's array
-bridge) and **JupyterLab on the system interpreter**, with the shared launcher as its CMD. Torch
-comes from PyTorch's own
+`openssh-server`, `python3`/`pip`, `sudo`, `tini`, the **CPU build of PyTorch**, **numpy** (torch's
+array bridge) and **JupyterLab on the system interpreter**, with the shared launcher as its CMD.
+Torch comes from PyTorch's own
 `download.pytorch.org/whl/cpu` index rather than PyPI, whose linux wheel is the CUDA build this
 family does not have; `TORCH_INDEX_URL` overrides that index for an offline mirror. It replaces
 both `ssh-ubuntu22.04` (plain ssh) and `jupyter-minimal` (stock-derived, with the `jovyan` 1000:100
@@ -130,6 +130,12 @@ vendor image is that its stack exists for the GPU.
   port without `CAP_NET_BIND_SERVICE`, so no image needs that capability granted. The platform's
   Service carries `port: 22` → `targetPort: 2222`, which is invisible to users — the ssh endpoint is
   published through the Gateway's TCP listener pool, not on 22 either way.
+- All three images **install `sudo` and grant nothing**: sudo runs only for accounts a sudoers rule
+  names, and the images name none. `spec.runtime.sudo: true` is what makes the account able to run
+  commands as root inside the container — the controller writes the rule by uid and mounts it, so the
+  image needs no change and an environment that does not ask is exactly as it was. A root environment
+  already holds the privilege and renders no grant. See `image-contract.md`, Elevation, and
+  `decision.md` Gap E.
 - ssh is enabled by the presence of the mounted host key file — images ship no host keys of their own,
   and there is no key staging (see the mount contract below). In `ssh` mode a missing host key fails
   the container start rather than falling back to another mode; in `jupyter` mode it simply means no
@@ -306,6 +312,11 @@ The smoke runs throwaway containers on `127.0.0.1` (ephemeral ports, fake ssh Se
   one the spec declares, and *runs in* it (the server's cwd, which a new terminal inherits). The
   family-specific checks ride along: the vendor stack has to be reachable by the account in both
   modes.
+- **elevation** — the image's `sudo` is installed, refuses an account no rule names (which is the
+  image as shipped), and elevates uid 1000 to root once the controller's rule is written inside the
+  container, passes `visudo`, and is mode `0440`. The rule is written by a root container and used by
+  a uid-1000 `docker exec`, the same split the operator's init container and main container are; a
+  host-side bind mount would not do, because sudo requires the drop-in to be owned by root.
 
 Docker has no `subPath`, so the smoke reproduces the mount contract with bind mounts — the host key
 as a file, the authorized keys as a directory holding a single `authorized_keys` entry (the shape the

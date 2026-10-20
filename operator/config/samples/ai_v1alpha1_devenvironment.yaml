@@ -152,6 +152,10 @@ spec:
     # cuda-pytorch, maca-pytorch) create "ubuntu" at uid/gid 1000, which is also what
     # the platform default states.
     user: ubuntu
+    # Passwordless sudo for that account, so it can install system packages.
+    # Off by default: the images include sudo but grant it only when asked.
+    # An environment running as root needs no grant. See spec.runtime.sudo.
+    # sudo: true
     env:
       - name: MODEL_REPO
         value: /models/llama3-8b
