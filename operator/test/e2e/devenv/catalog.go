@@ -155,11 +155,12 @@ var Images = []Image{
 		UID:     1000,
 		GID:     1000,
 		Home:    ubuntuHome,
-		// JupyterLab is the stack here, on the image's one interpreter — the same
-		// interpreter the notebook kernel and the ssh session have to agree on.
+		// The family is named for PyTorch, so both it and JupyterLab are probed, on
+		// the image's one interpreter — the same interpreter the notebook kernel and
+		// the ssh session have to agree on.
 		Stack: Stack{
-			Name:    "jupyterlab",
-			Command: `python3 -c 'import jupyterlab; print(jupyterlab.__version__)'`,
+			Name:    "jupyterlab and CPU torch",
+			Command: `python3 -c 'import jupyterlab; print(jupyterlab.__version__)' && ` + torchProbe,
 		},
 	},
 	{
