@@ -73,13 +73,15 @@ RUN python3 -m pip install --no-cache-dir \
 # notebook kernel has to be the interpreter an ssh session and the launcher both reach.
 # numpy rides along: torch does not depend on it, but its array bridge does — importing torch
 # without numpy warns on every start and `Tensor.numpy()` fails — and the torch index above
-# does not carry it.
+# does not carry it. It is held below 2 because torch 2.4.0 predates its official NumPy 2
+# support; the bridge does work against the 2.x that was current when this was built, but
+# leaving it floating would let a rebuild change the answer under an unchanged image tag.
 # pip's cache is dropped; the image carries the installed packages only.
 ARG PIP_INDEX_URL=""
 RUN set -eu; \
     pip_args=""; \
     if [ -n "$PIP_INDEX_URL" ]; then pip_args="--index-url $PIP_INDEX_URL"; fi; \
-    python3 -m pip install --no-cache-dir $pip_args jupyterlab numpy
+    python3 -m pip install --no-cache-dir $pip_args jupyterlab 'numpy<2'
 
 # Platform account: literal 'ubuntu', uid/gid 1000, home /home/ubuntu — the same account,
 # group, and home every family image ships, so a DevEnvironment states it once

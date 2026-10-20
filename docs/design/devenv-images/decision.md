@@ -648,7 +648,8 @@ six-image set did not have.
   by an order of magnitude, so the overlay costs little against what the offline set already ships.
 - **Overlay**: `ca-certificates`, `openssh-server`, `python3`, `python3-pip` and `tini` from the
   Ubuntu mirror (`APT_MIRROR`), the **CPU build of PyTorch**, `numpy` (torch's array bridge, which
-  torch does not pull in itself) and `jupyterlab` from pip into the
+  torch does not pull in itself, held below 2 because torch 2.4.0 predates its NumPy 2 support)
+  and `jupyterlab` from pip into the
   **system interpreter** (no venv, no conda), account `ubuntu` uid/gid 1000 at `/home/ubuntu`,
   `/run/sshd` at 0700, and the shared entrypoint, launcher and sshd drop-in (session environment:
   `PATH`). Torch comes from PyTorch's own `download.pytorch.org/whl/cpu` index rather than from
