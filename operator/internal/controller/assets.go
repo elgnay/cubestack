@@ -272,10 +272,11 @@ echo "permission-init: $WORKSPACE_PATH ready"
 // sudoersInitScript writes the opt-in sudo grant into the pod-local volume.
 //
 // The rule names the uid numerically — sudo's User_List accepts #<uid> — rather
-// than an account name, because the container's identity is a number the
-// controller derives and the image is free to give that number no account file
-// of its own. There must be no space after the '#': " 1000" is then a comment,
-// and the file would grant nobody anything.
+// than an account name, because the controller never learns which account the
+// image gives that number. The image must still have a passwd entry for the uid
+// the container runs as: sudo refuses an invoking user it cannot resolve before
+// it reads any rule. There must be no space after the '#': " 1000" is then a
+// comment, and the file would grant nobody anything.
 //
 // The file is removed first because a retried init container runs with every
 // capability dropped: root without CAP_DAC_OVERRIDE cannot reopen a 0440 file

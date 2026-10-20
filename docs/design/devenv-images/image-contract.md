@@ -96,12 +96,16 @@ What the controller renders when the field is true and the container runs as a p
   existed.
 - The main container's `allowPrivilegeEscalation` stays unset (Kubernetes' default, true): `sudo` is a
   setuid binary, so an explicit `false` would make the grant inert.
-- The grant is confined to the container: it adds no capability to the pod, reaches no host resource,
-  and needs no change to the namespace's Pod Security Standard. See `decision.md` Gap E.
+- The grant is confined to the container: it adds no capability to the pod beyond the container's own
+  set, and needs no change to the namespace's Pod Security Standard. The exception is a RoCE
+  environment (`spec.network.rdmaEnabled: true` with `rdmaType: roce`), which runs in the node's
+  network namespace: root there holds `NET_RAW` and `NET_BIND_SERVICE` in that namespace, exactly as
+  a root environment already does. See `decision.md` Gap E.
 
-A **bring-your-own image** that a spec grants elevation to must ship `sudo` and read
-`/etc/sudoers.d` (every Ubuntu/Debian image does). The controller writes the rule but cannot install
-the binary.
+A **bring-your-own image** that a spec grants elevation to must ship `sudo`, read
+`/etc/sudoers.d` (every Ubuntu/Debian image does), and have a passwd entry for the uid the container
+runs as: `sudo` refuses an invoking uid it cannot resolve, before it reads any rule. The controller
+writes the rule but cannot install the binary or the account.
 
 ## Ports
 

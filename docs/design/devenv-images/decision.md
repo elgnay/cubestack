@@ -331,15 +331,19 @@ default, true): `sudo` is a setuid binary, and an explicit `false` would make th
 
 **Pod Security.** The field adds no requirement to the namespace. A `baseline` namespace already admits
 the root init container — the workspace repair is one too — and the main container still runs as its
-non-root account; sudo is a setuid binary inside the container, not a pod capability and not a host
-resource. A namespace enforcing `restricted` refuses every DevEnvironment pod at admission for reasons
+non-root account; sudo is a setuid binary inside the container, not a pod capability. The one
+host-adjacent consequence follows the network, not sudo: a RoCE environment
+(`spec.network.rdmaEnabled: true` with `rdmaType: roce`) shares the node's network namespace, so root
+there acts on the node's network exactly as a `runAsUser: 0` environment on the same fabric already
+does. A namespace enforcing `restricted` refuses every DevEnvironment pod at admission for reasons
 unrelated to sudo, so the field cannot be the thing that decides whether an environment is admitted.
 The operator reads no Namespace objects and holds no `namespaces` RBAC, so it cannot preflight a
 namespace's enforced level either; that is documented in `operator/README.md` rather than reported on
 the `Accepted` condition.
 
-**Bring-your-own images** must ship `sudo` and read `/etc/sudoers.d` for the grant to take effect: the
-controller writes the rule but cannot install the binary. See `image-contract.md`.
+**Bring-your-own images** must ship `sudo`, read `/etc/sudoers.d`, and have a passwd entry for the uid
+the container runs as for the grant to take effect: the controller writes the rule but cannot install
+the binary or the account. See `image-contract.md`.
 
 **Not in scope:** a console control for the field, and a permanent e2e conformance case.
 
