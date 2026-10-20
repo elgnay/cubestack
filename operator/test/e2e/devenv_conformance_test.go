@@ -285,6 +285,20 @@ var _ = Describe("DevEnvironment conformance", Label(devenv.LabelConformance), O
 	// down where the device is missing, so the same tree runs everywhere.
 	describeGPU()
 	describeRDMA()
+	// Family P, which asks the cluster's CNI to enforce the isolation every
+	// environment's NetworkPolicy renders, and family G's idle case, which needs
+	// a platform capability the kind cluster does not have: the activity agent's
+	// image is pulled, never built here (see DEVENV_E2E_CPU_LABELS).
+	//
+	// The three are last, and family S after the two, because this tree is
+	// Ordered: a failure skips everything declared after it. G9 is the case most
+	// likely to fail for a reason outside the controller — a registry without the
+	// agent image, a cluster that reads as idle differently — and S is the one
+	// case that leaves the platform changed if it does not finish, so nothing
+	// else may depend on either.
+	describeIsolation()
+	describeIdle()
+	describeControllerRestart()
 })
 
 // DescribeEnvironment declares the container for one (image, identity): the
