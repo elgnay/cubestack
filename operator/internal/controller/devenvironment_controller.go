@@ -3264,6 +3264,14 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		// environments that predate the agent digest exactly as they did before it
 		// existed and are not rolled on upgrade.
 		ActivityAgent string `json:"activityAgent,omitempty"`
+		// ActivityAgentImage is ::activityAgentImage, and is empty for every
+		// environment that carries no sidecar. The sentinel above covers a change
+		// to how the sidecar is delivered; this covers the reference itself, which
+		// is a build-time constant nothing in the spec moves. Left out, a manager
+		// that names a new reference would find the digest unchanged and return
+		// early, leaving every environment that carries the sidecar on the
+		// reference the previous manager baked in.
+		ActivityAgentImage string `json:"activityAgentImage,omitempty"`
 		// ServiceAccount is the account the pod template names, and is empty for
 		// every environment that runs under the namespace's default. It is the one
 		// pod-spec field here that is neither the spec nor a constant, so nothing
@@ -3314,13 +3322,15 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 	if sudoGranted(env) {
 		sudoers = sudoersVersion
 	}
-	// Both empty unless the environment asks for an idle timeout, so the
+	// All three empty unless the environment asks for an idle timeout, so the
 	// environments that ask for none — every one that predates the sidecar —
 	// digest exactly as they did before it existed.
 	activityAgent := ""
+	activityAgentRef := ""
 	serviceAccount := ""
 	if activityAgentEnabled(env) {
 		activityAgent = activityAgentVersion
+		activityAgentRef = activityAgentImage
 		serviceAccount = activityAgentServiceAccountName(env)
 	}
 	h := sha256.New()
@@ -3344,6 +3354,7 @@ func (r *DevEnvironmentReconciler) stsSpecHash(env *aiv1alpha1.DevEnvironment) s
 		RDMA:                  rdma,
 		ShareProcessNamespace: activityAgentEnabled(env),
 		ActivityAgent:         activityAgent,
+		ActivityAgentImage:    activityAgentRef,
 		ServiceAccount:        serviceAccount,
 		Sudoers:               sudoers,
 	}))

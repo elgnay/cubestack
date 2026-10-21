@@ -128,7 +128,7 @@ const (
 	// sidecar — the way a rebuilt agent that reached the nodes under an
 	// unchanged tag is picked up, since the sidecar's IfNotPresent policy
 	// reuses the node's copy rather than pulling it again. A changed image
-	// reference rolls the pod by itself and needs no bump.
+	// reference is in the hash by itself (::stsSpecHash) and needs no bump.
 	activityAgentVersion = "1"
 
 	// activityAgentNameSuffix names the three objects that authorize the sidecar
