@@ -747,10 +747,14 @@ func phaseAgreement(st aiv1alpha1.DevEnvironmentStatus) error {
 // --- lifecycle helpers --------------------------------------------------------
 
 // running waits for an environment to be up and usable.
+//
+// Polled no more slowly than BringUp does, for the same reason: the wait is for
+// the platform to finish, and a coarse poll is time added to every case that
+// stops and starts an environment.
 func running(ctx SpecContext, env *devenv.Environment) {
 	GinkgoHelper()
 	Eventually(func() error { return env.Ready(ctx) }).
-		WithTimeout(devenv.UpTimeout()).WithPolling(5*time.Second).
+		WithTimeout(devenv.UpTimeout()).WithPolling(2*time.Second).
 		Should(Succeed(), "%s never became running", env.Name)
 }
 

@@ -194,7 +194,11 @@ const (
 	defaultPlatformNS  = "cubestack-system"
 	defaultPullSecret  = "harbor-credentials"
 	defaultUpTimeout   = 20 * time.Minute
-	upPollInterval     = 10 * time.Second
+	// How often BringUp asks whether the environment is ready. Short, because
+	// the answer is a read and the wait is the platform's own work: every
+	// second of poll granularity is a second added to each environment a leg
+	// brings up, and a leg brings them up one after another.
+	upPollInterval     = 2 * time.Second
 	namespaceRunLabel  = "e2e.cubestack.io/run"
 	namespaceRunLabelV = "devenv-conformance"
 )
