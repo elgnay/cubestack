@@ -286,9 +286,8 @@ var _ = Describe("DevEnvironment conformance", Label(devenv.LabelConformance), O
 	describeGPU()
 	describeRDMA()
 	// Family P, which asks the cluster's CNI to enforce the isolation every
-	// environment's NetworkPolicy renders, and family G's idle case, which needs
-	// a platform capability the kind cluster does not have: the activity agent's
-	// image is pulled, never built here (see DEVENV_E2E_CPU_LABELS).
+	// environment's NetworkPolicy renders, and family G's idle case, whose
+	// sidecar image the kind e2e builds and loads itself (see helm-e2e-images).
 	//
 	// The three are last, and family S after the two, because this tree is
 	// Ordered: a failure skips everything declared after it. G9 is the case most

@@ -2417,12 +2417,13 @@ func (r *DevEnvironmentReconciler) desiredActivityAgent(env *aiv1alpha1.DevEnvir
 	return corev1.Container{
 		Name:  activityAgentContainerName,
 		Image: activityAgentImage,
-		// Always, because the reference above is not guaranteed to be immutable:
-		// a manager built without one names the agent's default `latest` tag, and
-		// a cached layer under a mutable tag is a rebuilt agent that no node ever
-		// picks up. Pulling every time costs a manifest request next to the image
-		// layers the node already holds.
-		ImagePullPolicy: corev1.PullAlways,
+		// IfNotPresent, the policy the chart gives the manager: an image the node
+		// already holds is used without a registry round trip, which is how the
+		// kind e2e runs this sidecar beside the manager's own. A manager built
+		// from source names the default `latest` tag, and a node that cached an
+		// older copy keeps it until the node's copy is replaced; released builds
+		// name the commit-addressed reference CI publishes, which cannot go stale.
+		ImagePullPolicy: corev1.PullIfNotPresent,
 		Args:            []string{"--ports=" + strings.Join(watched, ",")},
 		// The pod's own identity, so the agent needs no flag and no guess about
 		// which pod it is in. Both come from the downward API rather than from

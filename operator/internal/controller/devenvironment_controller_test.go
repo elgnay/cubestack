@@ -3287,10 +3287,11 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			s := spec.Containers[1]
 			Expect(s.Name).To(Equal(activityAgentContainerName))
 			Expect(s.Image).To(Equal(activityAgentImage))
-			// The image is a mutable tag, so a node that cached an older layer
-			// would keep running an older agent: only the pull policy makes a
-			// rebuilt agent reach a node that already has the tag.
-			Expect(s.ImagePullPolicy).To(Equal(corev1.PullAlways))
+			// The manager's policy, so the e2e's kind-loaded copy of this image
+			// is used rather than pulled from a registry the cluster cannot
+			// reach. A released manager names the commit-addressed reference CI
+			// published, so only a from-source build's `latest` can go stale.
+			Expect(s.ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
 			Expect(s.Args).To(Equal([]string{"--ports=8080"}))
 			// A probe is the one thing a sidecar must not have: a failing one
 			// makes the pod NotReady, and the environment with it.

@@ -595,13 +595,11 @@ func describeRetention() {
 // describeIdle is G9: the environment nothing is happening in, and the platform
 // stopping it on its own clock.
 //
-// The one lifecycle case that cannot run on the kind cluster the CI job builds.
-// The sidecar an idle timeout injects is pulled from a registry, never built or
-// loaded there, and it is pulled with Always — so the environment would sit in
-// ImagePullBackOff and the case would report the cluster's plumbing rather than
-// the controller's behaviour. The capability label says so, and the kind
-// shard's label filter excludes it; the real-cluster run, where the suite
-// already copies the pull secret, is where it runs.
+// Its sidecar is the one image beyond the environment's own that the case needs
+// on the node: an idle timeout injects the activity agent, and helm-e2e-images
+// builds it while helm-e2e-images-load puts it there under the reference the
+// manager names. The sidecar's IfNotPresent policy — the manager's own — takes
+// that copy, so the kind shard runs this case with no registry round trip.
 func describeIdle() {
 	draftCase{
 		Name: "lifecycle-idle",
@@ -617,7 +615,7 @@ func describeIdle() {
 		},
 		Cases: func(open func() *devenv.Environment) {
 			It("G9 stops an environment left idle, and marks it as the platform's stop",
-				Label(devenv.TierP1, devenv.LabelFamily("G"), devenv.LabelCapability("activity-agent")),
+				Label(devenv.TierP1, devenv.LabelFamily("G")),
 				func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
