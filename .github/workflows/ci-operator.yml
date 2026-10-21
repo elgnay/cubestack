@@ -59,19 +59,24 @@ jobs:
             # harness that gates it — plus the build and CI it needs, and not on
             # a PR that only touches another controller.
             #
-            # The manager is one binary and the chart one artifact, so a shared
-            # helper (route.go, podspec.go, apply.go, internal/renderer), a chart
-            # or RBAC change, and a dependency bump land here without matching
-            # this filter. test-e2e still installs that chart and runs
-            # helm-e2e-devenv-verify on every operator change, and is the guard
-            # for those; this suite is the deep one, so it runs when its own
-            # subject moves — on a pull request and on a push to main alike.
+            # The manager is one binary and the chart one artifact, so shared
+            # code (route.go, podspec.go, apply.go, internal/renderer), a chart
+            # template or RBAC change, and a dependency bump land here without
+            # matching this filter. The DevEnvironment's own CRD and VAP are
+            # named because they are the contract the suite asserts. test-e2e
+            # still installs that chart and runs helm-e2e-devenv-verify on every
+            # operator change, and is the guard for the rest; this suite is the
+            # deep one, so it runs when its own subject moves — on a pull request
+            # and on a push to main alike.
             devenv:
               - 'operator/api/v1alpha1/devenvironment*'
               - 'operator/api/v1alpha1/conditions.go'
+              - 'operator/config/crd/bases/ai.cubestack.io_devenvironments.yaml'
+              - 'operator/config/vap/devenvironment_policy.yaml'
               - 'operator/internal/controller/devenvironment*'
               - 'operator/internal/controller/assets.go'
               - 'operator/internal/activity/**'
+              - 'operator/test/e2e/assets/devenvironment.yaml'
               - 'operator/test/e2e/devenv/**'
               - 'operator/test/e2e/devenv_*_test.go'
               - 'operator/test/e2e/e2e_suite_test.go'
