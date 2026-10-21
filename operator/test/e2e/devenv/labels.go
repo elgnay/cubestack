@@ -22,9 +22,15 @@ const LabelConformance = "devenv-conformance"
 
 // The tiers a case belongs to. Bare rather than "tier:p0" to match the labels
 // the design document already uses for its rows.
+//
+// p2 is not a row of that document: it is the CI shard for the cases declared
+// last in the conformance tree — isolation, the idle stop and the controller
+// restart. They are the suite's slowest and most disruptive, and giving them a
+// leg of their own keeps the other two shards short.
 const (
 	TierP0 = "p0"
 	TierP1 = "p1"
+	TierP2 = "p2"
 )
 
 // LabelFamily names the family a case belongs to — the A–S grouping of

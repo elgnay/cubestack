@@ -569,12 +569,13 @@ helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and S
 # backslash continuation would put one inside the filter.
 DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-pytorch-ssh && !image:maca-pytorch-jupyter && !image:cuda-pytorch-ssh && !image:cuda-pytorch-jupyter$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_PRIORITY))
 
-# Optional shard, `p0` or `p1`. Every spec in the selection above carries exactly
-# one of the two priority labels (96 and 87 of them today), so the two shards
-# partition it: CI runs one job per shard, in parallel, and the suite's wall time
-# is the longer half rather than the whole. Empty runs the selection in one pass.
-# A spec that carries neither priority belongs to no shard and would silently not
-# run, which is why the split is stated as a partition rather than a filter.
+# Optional shard, `p0`, `p1` or `p2`. Every spec in the selection above carries
+# exactly one of the three priority labels (96, 84 and 3 of them today), so the
+# shards partition it: CI runs one job per shard, in parallel, and the suite's
+# wall time is the longest leg rather than the whole. Empty runs the selection
+# in one pass. A spec that carries no priority belongs to no shard and would
+# silently not run, which is why the split is stated as a partition rather than
+# a filter.
 DEVENV_E2E_PRIORITY ?=
 # go test's hard stop for that selection, and how long one environment gets to
 # reach Running. The latter is well under the suite's 20m default because the
@@ -600,8 +601,8 @@ DEV_ENV_IMAGE_REGISTRY ?= $(firstword $(subst /, ,$(DEV_ENV_IMAGE)))
 # Without this the target would run against whichever cluster the caller happens
 # to be on.
 #
-# DEVENV_E2E_PRIORITY narrows the selection to one shard (`p0` or `p1`); empty
-# means the whole selection. CI sets it once per parallel job.
+# DEVENV_E2E_PRIORITY narrows the selection to one shard (`p0`, `p1` or `p2`);
+# empty means the whole selection. CI sets it once per parallel job.
 .PHONY: helm-e2e-devenv-conformance
 helm-e2e-devenv-conformance: ## Run the CPU-image conformance cases against the helm-e2e kind cluster
 	@config=$$(mktemp); trap 'rm -f "$$config"' EXIT; \
