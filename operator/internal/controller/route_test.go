@@ -213,10 +213,19 @@ func acceptOpenAIPathsRoute(name aiv1alpha1.AIGatewayRouterName) {
 		return
 	}
 	Expect(err).NotTo(HaveOccurred())
-	route.Status.Parents = gatewayRouteParents(gatewayv1.ParentReference{
+	// Report the status for the Gateway the route actually declares: the
+	// platform owns the attachment, and the private surface may name its own.
+	parent := gatewayv1.ParentReference{
 		Name:      gatewayv1.ObjectName(testGatewayName),
 		Namespace: ptrTo(gatewayv1.Namespace(testGatewayNamespace)),
-	}, route.Generation, true, "", "")
+	}
+	if len(route.Spec.ParentRefs) > 0 {
+		parent = route.Spec.ParentRefs[0]
+		if parent.Namespace == nil {
+			parent.Namespace = ptrTo(gatewayv1.Namespace(route.Namespace))
+		}
+	}
+	route.Status.Parents = gatewayRouteParents(parent, route.Generation, true, "", "")
 	Expect(k8sClient.Status().Update(ctx, route)).To(Succeed())
 }
 
@@ -434,6 +443,32 @@ var _ = Describe("checkRoute", func() {
 		// never created for this service.
 		publicHTTP := sharedHTTPRoute(testCatalogRoute)
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(publicHTTP), publicHTTP))).To(BeTrue())
+
+		acceptCatalogRoute(testPrivateCatalogRoute)
+		acceptAIServiceBackend(name)
+		check, err = r.checkRoute(ctx, mustGetISVC(ctx, name), routeProfile(name+"-prof"), readyEndpoint(name), testEngineModel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(check.Reason).To(BeEmpty())
+	})
+
+	It("accepts the private surface attached to a separate private Gateway", func() {
+		ensureCatalogRoutes()
+		name := "route-private-gateway"
+		isvc := routeISVC(name, false)
+		isvc.Spec.Route.AIGatewayRouter = aiv1alpha1.AIGatewayRouterPrivate
+		Expect(k8sClient.Create(ctx, isvc)).To(Succeed())
+		r := routeReconciler()
+		check, err := r.checkRoute(ctx, mustGetISVC(ctx, name), routeProfile(name+"-prof"), readyEndpoint(name), testEngineModel)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(check.Reason).To(Equal(RouteGatewayNotAccepted))
+
+		// The platform attaches the private surface to its own Gateway, which is
+		// not the configured public name. The operator owns only spec.rules, so
+		// the parent it has to verify is the one the route declares.
+		privateHTTP := sharedHTTPRoute(testPrivateCatalogRoute)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(privateHTTP), privateHTTP)).To(Succeed())
+		privateHTTP.Spec.ParentRefs = []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(testGatewayName + "-private")}}
+		Expect(k8sClient.Update(ctx, privateHTTP)).To(Succeed())
 
 		acceptCatalogRoute(testPrivateCatalogRoute)
 		acceptAIServiceBackend(name)
@@ -758,11 +793,61 @@ var _ = Describe("checkRoute", func() {
 		route = privateCatalogRoute()
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(route), route)).To(Succeed())
 		Expect(findCatalogRuleIndex(route.Spec.Rules, mustGetISVC(ctx, name))).To(Equal(-1))
-		// The OpenAI-paths HTTPRoute had this service as its only writer: with no
-		// rules left the surface is removed rather than left attached with the
-		// CRD's defaulted catch-all rule.
+		// The OpenAI-paths HTTPRoute here was created by the operator, which
+		// stamps its managed-by label on creation: with no rules left it is
+		// removed rather than left attached with the CRD's defaulted catch-all
+		// rule.
 		httpRoute := sharedHTTPRoute(testCatalogRoute)
 		Expect(apierrors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(httpRoute), httpRoute))).To(BeTrue())
+	})
+
+	It("leaves a platform-installed OpenAI-paths HTTPRoute in place when nothing is published", func() {
+		// The platform may install the shared surfaces itself. They carry no
+		// managed-by label, so their lifetime is not the operator's: an empty rule
+		// set — which the CRD cannot store — must not end in the object being
+		// deleted.
+		ensureSharedCatalogRoute()
+		platform := &gatewayv1.HTTPRoute{
+			ObjectMeta: metav1.ObjectMeta{Name: openAIPathsRouteName(testCatalogRoute), Namespace: testGatewayNamespace},
+			Spec: gatewayv1.HTTPRouteSpec{
+				CommonRouteSpec: gatewayv1.CommonRouteSpec{
+					ParentRefs: []gatewayv1.ParentReference{{Name: gatewayv1.ObjectName(testGatewayName)}},
+				},
+				// The rule the last published service left: it references the
+				// Backend cleanup deletes along with that service.
+				Rules: []gatewayv1.HTTPRouteRule{{
+					BackendRefs: []gatewayv1.HTTPBackendRef{{
+						BackendRef: gatewayv1.BackendRef{
+							BackendObjectReference: gatewayv1.BackendObjectReference{
+								Group: ptrTo(gatewayv1.Group(envoyGatewayAPIGroup)),
+								Kind:  ptrTo(gatewayv1.Kind(egBackendKind)),
+								Name:  "gone-endpoint",
+							},
+						},
+					}},
+				}},
+			},
+		}
+		Expect(k8sClient.Create(ctx, platform)).To(Succeed())
+
+		Expect(routeReconciler().syncSharedCatalogRoutes(ctx)).To(Succeed())
+
+		stored := sharedHTTPRoute(testCatalogRoute)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(stored), stored)).To(Succeed())
+		Expect(stored.Labels).NotTo(HaveKey(managedByLabelKey))
+		// The stale backendRefs are gone: the object is left with the CRD's
+		// default rule, which references nothing.
+		Expect(stored.Spec.Rules).To(HaveLen(1))
+		Expect(stored.Spec.Rules[0].BackendRefs).To(BeEmpty())
+		Expect(stored.Spec.Rules[0].Filters).To(BeEmpty())
+
+		// A second pass is a no-op: the neutralized object must not be rewritten
+		// on every reconcile.
+		before := stored.ResourceVersion
+		Expect(routeReconciler().syncSharedCatalogRoutes(ctx)).To(Succeed())
+		again := sharedHTTPRoute(testCatalogRoute)
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(again), again)).To(Succeed())
+		Expect(again.ResourceVersion).To(Equal(before))
 	})
 
 	It("removes the rule from both shared routes when a service is deleted", func() {
@@ -1176,6 +1261,40 @@ var _ = Describe("routeParentsAccepted", func() {
 
 	It("accepts a status that leaves observedGeneration unset", func() {
 		Expect(routeParentsAccepted(parentsAcceptedBy(0), 3, testGatewayName, testGatewayNamespace)).To(BeTrue())
+	})
+})
+
+var _ = Describe("routeParentsAcceptedForRef", func() {
+	refWithSection := func(section string) gatewayv1.ParentReference {
+		return gatewayv1.ParentReference{
+			Name:        gatewayv1.ObjectName(testGatewayName),
+			Namespace:   ptrTo(gatewayv1.Namespace(testGatewayNamespace)),
+			SectionName: ptrTo(gatewayv1.SectionName(section)),
+		}
+	}
+	statusFor := func(ref gatewayv1.ParentReference, accepted bool) gatewayv1.RouteParentStatus {
+		reason := ""
+		if !accepted {
+			reason = string(gatewayv1.RouteReasonNoMatchingParent)
+		}
+		return gatewayRouteParents(ref, 3, accepted, reason, "")[0]
+	}
+
+	It("reads the status of the listener it asked about", func() {
+		// Two listeners on one Gateway: the first status entry rejects another
+		// section, the second accepts this ref. Matching on name and namespace
+		// alone would return the rejection.
+		parents := []gatewayv1.RouteParentStatus{
+			statusFor(refWithSection("public"), false),
+			statusFor(refWithSection("private"), true),
+		}
+		Expect(routeParentsAcceptedForRef(parents, 3, refWithSection("private"), testGatewayNamespace)).To(BeTrue())
+		Expect(routeParentsAcceptedForRef(parents, 3, refWithSection("public"), testGatewayNamespace)).To(BeFalse())
+	})
+
+	It("does not borrow another listener's acceptance", func() {
+		parents := []gatewayv1.RouteParentStatus{statusFor(refWithSection("public"), true)}
+		Expect(routeParentsAcceptedForRef(parents, 3, refWithSection("private"), testGatewayNamespace)).To(BeFalse())
 	})
 })
 

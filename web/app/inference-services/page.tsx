@@ -929,31 +929,38 @@ function EndpointsCard({ s }: { s: InferenceServiceSummary }) {
   const { t } = useI18n();
   const internal = s.internalEndpoint ?? "—";
   // A service published to the private catalog route is not reachable through
-  // the platform's public listener, so its AI Gateway endpoint is the
-  // in-cluster Service address. The public route's address is the observed
-  // value the operator reports (the shared catalog host differs per cluster);
-  // fall back to "—" when it isn't published yet. The catalog host serves every
-  // published model, so the model name that selects this service is shown
-  // alongside it.
-  const external = (s.aigatewayRouter === AIGATEWAY_ROUTER_PRIVATE ? s.internalEndpoint : s.publicEndpoint) ?? "—";
+  // the platform's public listener. Its AI Gateway endpoint is therefore the
+  // private gateway's in-cluster Service address, not the cluster's public
+  // catalog host (`status.endpoint.public`, which the operator reports for
+  // either route). The public route's address is the observed value; fall back
+  // to "—" when it isn't published yet. The catalog host serves every published
+  // model, so the model name that selects this service is shown alongside it.
+  // The private address is discovered by the API route, not composed here: the
+  // dataplane Service name carries a generated suffix.
+  const isPrivate = s.aigatewayRouter === AIGATEWAY_ROUTER_PRIVATE;
+  const gatewayLabel = isPrivate ? t("inf.endpoints.gatewayInternal") : t("inf.endpoints.public");
+  const gateway = isPrivate ? (s.privateGatewayEndpoint ?? "—") : (s.publicEndpoint ?? "—");
   return (
     <Card title={t("inf.endpoints.title")}>
       {/* Stacked, not side by side: this card is a third of the panel's width
-          now, and two addresses across it would ellipsise both. */}
+          now, and two addresses across it would ellipsise both. The track's
+          minimum is 0, not the row's min-content: a long in-cluster gateway
+          address is one unbreakable token, and an `auto` minimum sized the
+          track past the card, pushing the copy button outside its border. */}
       <Box
         sx={{
           px: "18px",
           py: "14px",
           display: "grid",
-          gridTemplateColumns: "1fr",
+          gridTemplateColumns: "minmax(0, 1fr)",
           rowGap: "14px",
           alignItems: "start",
         }}
       >
         <EndpointRow label={t("inf.endpoints.internal")} value={internal} />
         <EndpointRow
-          label={t("inf.endpoints.public")}
-          value={external}
+          label={gatewayLabel}
+          value={gateway}
           hint={s.published && s.routeModelName ? t("inf.endpoints.publicModel", { model: s.routeModelName }) : undefined}
         />
       </Box>
@@ -1340,7 +1347,12 @@ function ParamsCard({ s }: { s: InferenceServiceSummary }) {
         ? t("inf.params.timeoutNone")
         : `${s.timeoutSeconds}s`;
   const idleTimeout = s.idleTimeoutSeconds === null ? "—" : `${s.idleTimeoutSeconds}s`;
-  const maxLen = s.overrideNums.maxModelLen !== undefined ? String(s.overrideNums.maxModelLen) : "—";
+  // maxModelLen is normally left at the profile's default, so the declared
+  // knob's effective value (user override, else default) is the value to show;
+  // spec.overrides only carries it when the user set it explicitly.
+  const declaredMaxLen = s.overrides.find((o) => o.name === "maxModelLen")?.current;
+  const maxLenValue = typeof declaredMaxLen === "number" ? declaredMaxLen : s.overrideNums.maxModelLen;
+  const maxLen = maxLenValue !== undefined ? String(maxLenValue) : "—";
   return (
     <Card title={t("inf.params.title")} meta={s.engine ?? "—"}>
       <Kvs
