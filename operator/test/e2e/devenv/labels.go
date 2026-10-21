@@ -43,13 +43,16 @@ const (
 //
 // The tier is a statement about the case; the shard is a statement about which
 // leg its wall time lands on, and the two are not the same question. Two groups
-// disagree today. Family K's six cases are P1 by the design document, but they
-// are self-contained — one environment per container and no state another
-// family shares — so they can run in p0, the leg with fewer environments, and
-// the two long legs come out about the same length. And the three cases
-// declared last in the tree, isolation, the idle stop and the controller
-// restart, are P1 as well, but they are the suite's slowest and most
-// disruptive, so a leg of their own keeps them from setting p1's wall time.
+// disagree today. The three cases declared last in the tree — isolation, the
+// idle stop and the controller restart — are P1, but they are the suite's
+// slowest and most disruptive, so a leg of their own keeps them from setting
+// p1's wall time. Family K's six cases are P1 by the design document and
+// self-contained — one environment per container and no state another family
+// shares — so they run in that leg too: it has the slack to take them, and
+// taking them off p0 is what keeps the matrix's leg from being the long one.
+// That is measured rather than counted: K's six cases add well over a minute to
+// whichever leg they are on, and p2's three finish several minutes before the
+// long one.
 //
 // A case carries this beside its tier, and the shard filter in operator/Makefile
 // reads it as an override: the case runs in the shard it names and in no other.

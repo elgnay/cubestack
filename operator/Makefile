@@ -577,7 +577,7 @@ DEVENV_E2E_SHARD_p2 = (p2 || shard:p2) && !shard:p0 && !shard:p1
 DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-pytorch-ssh && !image:maca-pytorch-jupyter && !image:cuda-pytorch-ssh && !image:cuda-pytorch-jupyter$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_SHARD_$(DEVENV_E2E_PRIORITY)))
 
 # Optional shard, `p0`, `p1` or `p2`. Every spec in the selection above runs in
-# exactly one of them (102, 78 and 3 of them today), so the shards partition
+# exactly one of them (96, 78 and 9 of them today), so the shards partition
 # it: CI runs one job per shard, in parallel, and the suite's wall time is the
 # longest leg rather than the whole. Empty runs the selection in one pass. A
 # spec that names no shard would silently not run, which is why the split is

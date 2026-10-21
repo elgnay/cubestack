@@ -278,16 +278,16 @@ jobs:
       # One shard failing must not cancel the other's diagnosis.
       fail-fast: false
       matrix:
-        # The suite's three shards, which partition the CPU selection (102, 78
-        # and 3 specs today). A case runs in its tier's shard unless it names
+        # The suite's three shards, which partition the CPU selection (96, 78
+        # and 9 specs today). A case runs in its tier's shard unless it names
         # another — see DEVENV_E2E_PRIORITY in operator/Makefile and
         # devenv.LabelShard. Three clusters rather than one: the suite's
         # namespace is per run, but the environments would share a node, and
-        # each leg already needs the whole operator install. p2 holds the
-        # last-declared, slowest cases (isolation, idle stop, controller
-        # restart) so they do not set the wall time of p1, and family K runs
-        # in p0 so the two long legs carry about the same number of
-        # environments.
+        # each leg already needs the whole operator install. p2 is the leg with
+        # slack: it holds the last-declared, slowest cases (isolation, idle
+        # stop, controller restart) so they do not set the wall time of p1, and
+        # family K runs there too, which keeps p0 — the leg the matrix fills —
+        # from being the long one.
         priority: [p0, p1, p2]
     steps:
       - name: Clone the code
