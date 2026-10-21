@@ -22,10 +22,41 @@ const LabelConformance = "devenv-conformance"
 
 // The tiers a case belongs to. Bare rather than "tier:p0" to match the labels
 // the design document already uses for its rows.
+//
+// A tier says what a case is worth. It is not the shard the case runs in — see
+// LabelShard — and the two are deliberately separate questions.
 const (
 	TierP0 = "p0"
 	TierP1 = "p1"
 )
+
+// The shards CI partitions the run into: one job per shard, each against the
+// cluster that job built. Named after the tiers because a case runs in its
+// tier's shard unless LabelShard moves it.
+const (
+	ShardP0 = "p0"
+	ShardP1 = "p1"
+	ShardP2 = "p2"
+)
+
+// LabelShard moves a case out of the shard its tier names and into another.
+//
+// The tier is a statement about the case; the shard is a statement about which
+// leg its wall time lands on, and the two are not the same question. Two groups
+// disagree today. The three cases declared last in the tree — isolation, the
+// idle stop and the controller restart — are P1, but they are the suite's
+// slowest and most disruptive, so a leg of their own keeps them from setting
+// p1's wall time. Family K's six cases are P1 by the design document and
+// self-contained — one environment per container and no state another family
+// shares — so they run in that leg too: it has the slack to take them, and
+// taking them off p0 is what keeps the matrix's leg from being the long one.
+// That is measured rather than counted: K's six cases add well over a minute to
+// whichever leg they are on, and p2's three finish several minutes before the
+// long one.
+//
+// A case carries this beside its tier, and the shard filter in operator/Makefile
+// reads it as an override: the case runs in the shard it names and in no other.
+func LabelShard(shard string) string { return "shard:" + shard }
 
 // LabelFamily names the family a case belongs to — the A–S grouping of
 // design/devenv/image-endpoint-test-plan.md §4. A family is a subject (bring-up,
@@ -34,12 +65,6 @@ const (
 // GPU and RDMA families, P is network isolation and S is the controller's own
 // restart — so this names the case's subject rather than pointing at a row.
 func LabelFamily(family string) string { return "family:" + family }
-
-// LabelCapability names a platform dependency a case needs the cluster to have,
-// and so a capability its cluster must supply for the case to run at all. It is
-// the counterpart of LabelDevice for everything that is not hardware: an image
-// the manager injects, say, which a hermetic e2e cluster has no way to pull.
-func LabelCapability(name string) string { return "capability:" + name }
 
 // LabelImage names one published image by its catalogue key.
 func LabelImage(key string) string { return "image:" + key }

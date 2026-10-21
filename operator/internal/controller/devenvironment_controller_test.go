@@ -1529,6 +1529,26 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(hash(runtime(func(rt *aiv1alpha1.RuntimeSpec) { rt.Sudo = false }))).To(Equal(plain))
 			Expect(hash(runtime(func(rt *aiv1alpha1.RuntimeSpec) { rt.Sudo = true }))).NotTo(Equal(plain))
 		})
+
+		// The sidecar's reference is baked into the manager, so a release that
+		// names a new one moves nothing in the spec. Without it in the digest the
+		// early return in applyStatefulSet would leave every environment that
+		// carries the sidecar on the reference its previous manager baked in.
+		It("digests the sidecar's image reference, for the environments that carry it", func() {
+			idle := func(env *aiv1alpha1.DevEnvironment) {
+				env.Spec.Lifecycle = &aiv1alpha1.LifecycleSpec{IdleTimeout: 3600}
+			}
+			withAgent, withoutAgent := hash(idle), hash(nil)
+			original := activityAgentImage
+			DeferCleanup(func() { activityAgentImage = original })
+			// The commit-addressed reference a release bakes in, in place of the
+			// default `latest` a from-source manager keeps.
+			activityAgentImage = "harbor.isuanova.com/suanova/cubestack-activity-agent:0123abc"
+			Expect(hash(idle)).NotTo(Equal(withAgent))
+			// An environment the sidecar does not reach is not rolled by an image
+			// it never runs.
+			Expect(hash(nil)).To(Equal(withoutAgent))
+		})
 	})
 
 	Describe("rdmaResource", func() {
@@ -3287,10 +3307,11 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			s := spec.Containers[1]
 			Expect(s.Name).To(Equal(activityAgentContainerName))
 			Expect(s.Image).To(Equal(activityAgentImage))
-			// The image is a mutable tag, so a node that cached an older layer
-			// would keep running an older agent: only the pull policy makes a
-			// rebuilt agent reach a node that already has the tag.
-			Expect(s.ImagePullPolicy).To(Equal(corev1.PullAlways))
+			// The manager's policy, so the e2e's kind-loaded copy of this image
+			// is used rather than pulled from a registry the cluster cannot
+			// reach. A released manager names the commit-addressed reference CI
+			// published, so only a from-source build's `latest` can go stale.
+			Expect(s.ImagePullPolicy).To(Equal(corev1.PullIfNotPresent))
 			Expect(s.Args).To(Equal([]string{"--ports=8080"}))
 			// A probe is the one thing a sidecar must not have: a failing one
 			// makes the pod NotReady, and the environment with it.

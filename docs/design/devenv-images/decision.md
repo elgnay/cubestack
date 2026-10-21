@@ -738,7 +738,7 @@ six-image set did not have.
   `images/hack/changed-images.sh`, the rule the operator workflow asks; `make -C images check-deps
   check-select` asserts the convention that answer is derived from, and runs its fixtures. Publishing
   is `ci-images.yml`, on a push to `main` that changes `images/**` or the CI that selects what a
-  change reaches — the workflows and the action they delegate to — as **one job per image**,
+  change reaches — the publish workflow and the action it delegates to — as **one job per image**,
   selected by that same rule — the selection *is* the job matrix, so an image the merge did not
   reach has no job at all rather than a skipped one. Each leg smokes the image it is about to
   publish, pushes the short-SHA tag with `PUSH_LATEST=0`, and moves its own mutable `:latest` only if

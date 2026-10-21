@@ -89,11 +89,12 @@ check "the shared jupyter launcher" "$ALL" "$ALL" images/common/jupyter/start-ju
 check "the Makefile" "$ALL" "$ALL" images/Makefile
 check "the context definition" "$ALL" "$ALL" images/.dockerignore
 check "the publish workflow" "$ALL" "$ALL" .github/workflows/ci-images.yml
-check "the smoke workflow" "$ALL" "$ALL" .github/workflows/ci-operator.yml
 check "the selection action" "$ALL" "$ALL" .github/actions/changed-images/action.yml
 
-# The two selections differ on this path and nowhere else.
+# The two selections differ on these paths and nowhere else: changes that rebuild nothing
+# but change how everything is verified.
 check "the smoke harness" "" "$ALL" images/hack/smoke.sh
+check "the smoke workflow" "" "$ALL" .github/workflows/ci-operator.yml
 
 # Deliberately a directory no image claims, and named so it reads that way: `cuda-pytorch` is a
 # real name now, and a fixture calling itself pytorch-cuda would look like a near-miss of an

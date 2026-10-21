@@ -45,7 +45,7 @@ func describeControllerRestart() {
 		Identity: devenv.NonRoot,
 		Cases: func(open func() *devenv.Environment) {
 			It("S1 converges the changes it could not see while it was down",
-				Label(devenv.TierP1, devenv.LabelFamily("S")), func(ctx SpecContext) {
+				Label(devenv.TierP1, devenv.LabelShard(devenv.ShardP2), devenv.LabelFamily("S")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
 

@@ -124,12 +124,11 @@ const (
 	activityAgentContainerName = "activity-agent"
 
 	// activityAgentVersion is a sentinel nothing reads. It is part of the
-	// StatefulSet hash so that it is a value which, when changed, rolls the
-	// environments running the sidecar: a mutable image tag does not change the
-	// pod template, so without something to bump, a rebuilt agent would reach a
-	// running environment only when that environment happened to restart for
-	// some other reason — the one case where an agent bug stays fixed on paper
-	// and broken in the cluster.
+	// StatefulSet hash so that changing it rolls the environments running the
+	// sidecar — the way a rebuilt agent that reached the nodes under an
+	// unchanged tag is picked up, since the sidecar's IfNotPresent policy
+	// reuses the node's copy rather than pulling it again. A changed image
+	// reference is in the hash by itself (::stsSpecHash) and needs no bump.
 	activityAgentVersion = "1"
 
 	// activityAgentNameSuffix names the three objects that authorize the sidecar

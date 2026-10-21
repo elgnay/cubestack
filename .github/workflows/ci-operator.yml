@@ -266,7 +266,7 @@ jobs:
     permissions:
       contents: read
     runs-on: ubuntu-latest
-    # One shard is the operator install plus half of the suite. go test's own
+    # One shard is the operator install plus one leg of the suite. go test's own
     # -timeout of 60m is the real stop, panicking with a useful message; this is
     # the job's release past that plus the ~5m of work before it.
     timeout-minutes: 90
@@ -278,13 +278,17 @@ jobs:
       # One shard failing must not cancel the other's diagnosis.
       fail-fast: false
       matrix:
-        # The suite's two priority labels, which partition the CPU selection
-        # (96 and 84 specs today). A spec carrying neither belongs to no leg,
-        # so the split is a partition — see DEVENV_E2E_PRIORITY in
-        # operator/Makefile. Two clusters rather than one: the suite's
+        # The suite's three shards, which partition the CPU selection (96, 78
+        # and 9 specs today). A case runs in its tier's shard unless it names
+        # another — see DEVENV_E2E_PRIORITY in operator/Makefile and
+        # devenv.LabelShard. Three clusters rather than one: the suite's
         # namespace is per run, but the environments would share a node, and
-        # each leg already needs the whole operator install.
-        priority: [p0, p1]
+        # each leg already needs the whole operator install. p2 is the leg with
+        # slack: it holds the last-declared, slowest cases (isolation, idle
+        # stop, controller restart) so they do not set the wall time of p1, and
+        # family K runs there too, which keeps p0 — the leg the matrix fills —
+        # from being the long one.
+        priority: [p0, p1, p2]
     steps:
       - name: Clone the code
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
