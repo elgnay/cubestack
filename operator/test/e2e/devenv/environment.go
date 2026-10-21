@@ -79,9 +79,29 @@ const (
 	// The phase's reason is the same string — both come from reasonStopped.
 	ReasonStopped = "Stopped"
 
+	// ReasonIdleTimeout is the reason on the phase and on Ready when the
+	// platform stopped the environment itself, after spec.lifecycle.idleTimeout
+	// elapsed with no activity. It is a different string from ReasonStopped
+	// because the user did not ask for this stop: spec.running is untouched, and
+	// only the annotations below say what happened.
+	ReasonIdleTimeout = "IdleTimeout"
+
 	// ReasonDeleting is the phase reason while the environment is being torn
 	// down. The phase name for that state is aiv1alpha1.PhaseTerminating.
 	ReasonDeleting = "Deleting"
+)
+
+// The annotations the controller writes on an environment it stopped itself,
+// restated for the case that reads them. The mark is the contract: it is what
+// tells an idle stop apart from one a user asked for, and what a start has to
+// clear before the environment can run again.
+const (
+	// AutoStoppedAnnotation is "true" on an environment the platform stopped
+	// for idleness.
+	AutoStoppedAnnotation = "ai.cubestack.io/auto-stopped"
+
+	// AutoStoppedAtAnnotation is when it stopped, RFC3339Nano.
+	AutoStoppedAtAnnotation = "ai.cubestack.io/auto-stopped-at"
 )
 
 // The environment-variable names the controller owns, restated for the cases

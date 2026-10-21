@@ -554,12 +554,20 @@ helm-e2e-devenv-verify: ## Create a real DevEnvironment and assert Jupyter and S
 # by this: E1 is refused before a workload is rendered and N4's pod is
 # unschedulable, so neither pulls.
 #
+# The idle-timeout case is excluded for a different reason, and by capability
+# rather than by image: an environment with a lifecycle.idleTimeout carries the
+# activity-agent sidecar, which the controller pulls by reference under
+# ImagePullPolicy=Always. Nothing here builds or loads that image and a preloaded
+# cluster has no credential for it, so the case would fail at the pull rather
+# than test the platform. It runs through devenv-e2e against a real cluster,
+# where the image is published and the suite copies the pull secret.
+#
 # One line, because Ginkgo's tokenizer skips spaces but not a newline: a
 # backslash continuation would put one inside the filter.
-DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-pytorch-ssh && !image:maca-pytorch-jupyter && !image:cuda-pytorch-ssh && !image:cuda-pytorch-jupyter$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_PRIORITY))
+DEVENV_E2E_CPU_LABELS ?= devenv-conformance && !image:maca-pytorch-ssh && !image:maca-pytorch-jupyter && !image:cuda-pytorch-ssh && !image:cuda-pytorch-jupyter && !capability:activity-agent$(if $(DEVENV_E2E_PRIORITY), && $(DEVENV_E2E_PRIORITY))
 
 # Optional shard, `p0` or `p1`. Every spec in the selection above carries exactly
-# one of the two priority labels (96 and 84 of them today), so the two shards
+# one of the two priority labels (96 and 86 of them today), so the two shards
 # partition it: CI runs one job per shard, in parallel, and the suite's wall time
 # is the longer half rather than the whole. Empty runs the selection in one pass.
 # A spec that carries neither priority belongs to no shard and would silently not

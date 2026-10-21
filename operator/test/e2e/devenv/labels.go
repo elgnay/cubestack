@@ -27,10 +27,19 @@ const (
 	TierP1 = "p1"
 )
 
-// LabelFamily names the family a case belongs to — the A–O grouping of
+// LabelFamily names the family a case belongs to — the A–S grouping of
 // design/devenv/image-endpoint-test-plan.md §4. A family is a subject (bring-up,
 // publication, the negative cases, …), not a priority; the tier carries that.
+// The letters here have grown past the document's in places — N and O are the
+// GPU and RDMA families, P is network isolation and S is the controller's own
+// restart — so this names the case's subject rather than pointing at a row.
 func LabelFamily(family string) string { return "family:" + family }
+
+// LabelCapability names a platform dependency a case needs the cluster to have,
+// and so a capability its cluster must supply for the case to run at all. It is
+// the counterpart of LabelDevice for everything that is not hardware: an image
+// the manager injects, say, which a hermetic e2e cluster has no way to pull.
+func LabelCapability(name string) string { return "capability:" + name }
 
 // LabelImage names one published image by its catalogue key.
 func LabelImage(key string) string { return "image:" + key }
