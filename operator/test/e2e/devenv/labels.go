@@ -23,15 +23,37 @@ const LabelConformance = "devenv-conformance"
 // The tiers a case belongs to. Bare rather than "tier:p0" to match the labels
 // the design document already uses for its rows.
 //
-// p2 is not a row of that document: it is the CI shard for the cases declared
-// last in the conformance tree — isolation, the idle stop and the controller
-// restart. They are the suite's slowest and most disruptive, and giving them a
-// leg of their own keeps the other two shards short.
+// A tier says what a case is worth. It is not the shard the case runs in — see
+// LabelShard — and the two are deliberately separate questions.
 const (
 	TierP0 = "p0"
 	TierP1 = "p1"
-	TierP2 = "p2"
 )
+
+// The shards CI partitions the run into: one job per shard, each against the
+// cluster that job built. Named after the tiers because a case runs in its
+// tier's shard unless LabelShard moves it.
+const (
+	ShardP0 = "p0"
+	ShardP1 = "p1"
+	ShardP2 = "p2"
+)
+
+// LabelShard moves a case out of the shard its tier names and into another.
+//
+// The tier is a statement about the case; the shard is a statement about which
+// leg its wall time lands on, and the two are not the same question. Two groups
+// disagree today. Family K's six cases are P1 by the design document, but they
+// are self-contained — one environment per container and no state another
+// family shares — so they can run in p0, the leg with fewer environments, and
+// the two long legs come out about the same length. And the three cases
+// declared last in the tree, isolation, the idle stop and the controller
+// restart, are P1 as well, but they are the suite's slowest and most
+// disruptive, so a leg of their own keeps them from setting p1's wall time.
+//
+// A case carries this beside its tier, and the shard filter in operator/Makefile
+// reads it as an override: the case runs in the shard it names and in no other.
+func LabelShard(shard string) string { return "shard:" + shard }
 
 // LabelFamily names the family a case belongs to — the A–S grouping of
 // design/devenv/image-endpoint-test-plan.md §4. A family is a subject (bring-up,

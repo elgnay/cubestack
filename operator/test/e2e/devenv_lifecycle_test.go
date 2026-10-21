@@ -615,7 +615,7 @@ func describeIdle() {
 		},
 		Cases: func(open func() *devenv.Environment) {
 			It("G9 stops an environment left idle, and marks it as the platform's stop",
-				Label(devenv.TierP2, devenv.LabelFamily("G")),
+				Label(devenv.TierP1, devenv.LabelShard(devenv.ShardP2), devenv.LabelFamily("G")),
 				func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)

@@ -65,7 +65,7 @@ func describeIsolation() {
 		},
 		Cases: func(open func() *devenv.Environment) {
 			It("P1 refuses a connection from another namespace, and admits the Gateway",
-				Label(devenv.TierP2, devenv.LabelFamily("P")), func(ctx SpecContext) {
+				Label(devenv.TierP1, devenv.LabelShard(devenv.ShardP2), devenv.LabelFamily("P")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
 
