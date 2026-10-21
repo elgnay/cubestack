@@ -61,16 +61,20 @@ ALL_IMAGES=()
 for _row in "${IMAGE_ROWS[@]}"; do ALL_IMAGES+=("${_row%%:*}"); done
 unset _row
 
-# The CI that decides how these images are built, smoked and published: the two workflows,
-# and the action both of them delegate the selection to. A change to any of them
-# republishes every image, so every image's gate watches all three. The action belongs
-# here as much as the workflows do, and for the same reason: it is what picks the diff
-# base the rule is asked about, and what turns the two selections into the matrices the jobs
-# expand from — a change to it alone changes what every selection below means.
+# The CI that decides how these images are built and published: the publish workflow and the
+# action both workflows delegate the selection to. A change to either republishes every
+# image, so every image's gate watches both. The action belongs here as much as the
+# workflow does, and for the same reason: it is what picks the diff base the rule is asked
+# about, and what turns the two selections into the matrices the jobs expand from — a change
+# to it alone changes what every selection below means.
+#
+# The smoke workflow is deliberately not here. It consumes these images and decides how they
+# are verified, never how they are built, so a change to it — a comment included — must not
+# rebuild, republish or move `:latest` for anything. SMOKE_ONLY_PATHS below is where it
+# belongs.
 CI_PATHS=(
   .github/actions/changed-images/action.yml
   .github/workflows/ci-images.yml
-  .github/workflows/ci-operator.yml
 )
 
 # Paths that reach every image. `images/common/` is COPYd by all three Dockerfiles;
@@ -92,11 +96,16 @@ SHARED_PATHS=(
   images/hack/check-dockerfile-copies.sh
 )
 
-# The smoke harness. Its own branch because it is verification rather than artifact
-# content: a change to it rebuilds nothing, since no image contains it, but every
-# image's verification is now different, so every image is re-smoked. Selecting nothing
-# would put off the new assertions until some later, unrelated merge.
-SMOKE_HARNESS=images/hack/smoke.sh
+# Paths that change no image but change how every image is verified: the smoke harness,
+# which is the assertion, and the workflow that runs it — which images each leg builds and
+# what it does with them. Their own branch because they are verification rather than
+# artifact content: a change to either rebuilds nothing, since no image contains it, but
+# every image's verification is now different, so every image is re-smoked. Selecting
+# nothing would put off the new assertions until some later, unrelated merge.
+SMOKE_ONLY_PATHS=(
+  images/hack/smoke.sh
+  .github/workflows/ci-operator.yml
+)
 
 usage() {
   cat >&2 <<'EOF'
@@ -258,7 +267,7 @@ emit_groups() {
 collect() {
   SELECT_BUILD=()
   SELECT_SMOKE=()
-  local unrecognised=0 path img dir p
+  local unrecognised=0 path img dir p smoke_only=0
 
   while IFS= read -r path || [ -n "$path" ]; do
     [ -n "$path" ] || continue
@@ -271,7 +280,12 @@ collect() {
       continue
     fi
 
-    if [[ "$path" == "$SMOKE_HARNESS" ]]; then
+    # Verification rather than content — see SMOKE_ONLY_PATHS.
+    smoke_only=0
+    for p in "${SMOKE_ONLY_PATHS[@]}"; do
+      if [[ "$path" == "$p" ]]; then smoke_only=1; break; fi
+    done
+    if [ "$smoke_only" = 1 ]; then
       SELECT_SMOKE=("${ALL_IMAGES[@]}")
       continue
     fi
@@ -348,7 +362,10 @@ case "$cmd" in
     for other in "${ALL_IMAGES[@]}"; do
       if [ "$other" != "$2" ]; then printf ':(exclude)images/%s\n' "$(own_dir "$other")"; fi
     done
-    printf '%s\n' ':(exclude)images/*.md' ":(exclude)$SMOKE_HARNESS"
+    printf '%s\n' ':(exclude)images/*.md'
+    for p in "${SMOKE_ONLY_PATHS[@]}"; do
+      printf ':(exclude)%s\n' "$p"
+    done
     ;;
 
   base)

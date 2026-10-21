@@ -162,15 +162,15 @@ so it builds a fresh one from the same source.
 hand-kept list: `hack/changed-images.sh` answers "which images does this diff reach", and
 `ci-operator.yml` asks it — in place of a paths filter — what a pull request must smoke. Each image
 depends on its own directory, on `common/`, on the `Makefile` and `.dockerignore`, and on the CI that
-builds, smokes and publishes it — the two workflows and the `changed-images` action both of them
-delegate to, which is what picks the diff base and the flags that size a publishing leg; a Dockerfile
+builds and publishes it — the publish workflow and the `changed-images` action both workflows delegate
+to, which is what picks the diff base and the flags that size a publishing leg; a Dockerfile
 never `COPY`s from a sibling image's directory, which is what makes the
 answer derivable from a changed path alone, and `make -C images check-deps` is what asserts that
 convention rather than assuming it. A changed path under `images/` the rule does not recognise
 selects **every** image and says so on stderr — over-selecting costs a rebuild, under-selecting
 ships a stale image — and markdown selects nothing. It returns two selections, not one: the images
-to smoke are a superset of the images to build, because a change to `hack/smoke.sh` rebuilds
-nothing while re-verifying everything. `make -C images check-select` runs the rule's fixtures, and
+to smoke are a superset of the images to build, because a change to `hack/smoke.sh` — or to the smoke
+workflow that runs it — rebuilds nothing while re-verifying everything. `make -C images check-select` runs the rule's fixtures, and
 `ci-operator.yml`'s `images-check` job runs both checks.
 
 `images-smoke` builds and smokes exactly that selection, on a pull request or a `release-*` push —
