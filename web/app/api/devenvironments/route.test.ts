@@ -283,10 +283,20 @@ describe("POST /api/devenvironments", () => {
     vi.restoreAllMocks();
   });
 
-  it("rejects a non-DNS-1123 name", async () => {
+  it("rejects a name that is not a DNS-1035 label", async () => {
     const { POST } = await importRoute();
     const res = await POST(await authedRequest({ method: "POST", body: JSON.stringify({ name: "Bad Name", namespace: "project-a", type: "jupyter", image: "img", accelerator: "nvidia", gpuCount: 1 }) }), undefined);
     expect(res.status).toBe(400);
+    expect(createNamespacedCustomObject).not.toHaveBeenCalled();
+  });
+
+  it("rejects a name starting with a digit", async () => {
+    // A DNS-1123 label admits it; a Service name does not, and the operator's
+    // admission policy follows the Service.
+    const { POST } = await importRoute();
+    const res = await POST(await authedRequest({ method: "POST", body: JSON.stringify({ name: "9lives", namespace: "project-a", type: "jupyter", image: "img", accelerator: "nvidia", gpuCount: 1 }) }), undefined);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "nameInvalid" });
     expect(createNamespacedCustomObject).not.toHaveBeenCalled();
   });
 

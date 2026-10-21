@@ -35,6 +35,9 @@ spec:
         description: |-
           DevEnvironment is the Schema for the devenvironments API.
 
+          metadata.name must be a DNS-1035 label: lowercase letters, digits and
+          hyphens, starting with a letter, at most 63 characters.
+
           An environment with spec.storage starts from an init container that takes
           ownership of its workspace claim, running as root with every capability
           dropped and CAP_CHOWN, CAP_FOWNER and CAP_FSETID added back, so a namespace

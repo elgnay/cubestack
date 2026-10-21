@@ -425,13 +425,15 @@ func (s *Suite) TearDown(ctx context.Context) {
 // is label-safe and the repo is not — a Kubernetes object name may not carry a
 // slash, and the registry's naming is not this suite's to constrain.
 //
-// The dots go too. A DevEnvironment's name is a DNS-1123 subdomain, which allows
-// them, but the controller names a Service after the environment and a Service
-// name is DNS-1035, which does not — so a catalogue key carrying one would fail
-// every reconcile with "a DNS-1035 label must consist of lower case
-// alphanumeric characters or '-'". Measured, not read: an image key with a dot
-// failed that way, while the same run's dot-free key came up first try. The
-// current keys have none, so this is the rule rather than a repair.
+// The dots go too. A DevEnvironment's name must be a DNS-1035 label — the
+// admission policy refuses any other at create time
+// (config/vap/devenvironment_policy.yaml), because the controller names
+// the environment's Service and its workload label value after it, and neither
+// accepts a dot. Measured, not read: before that policy existed, an image key
+// with a dot made every reconcile fail with "a DNS-1035 label must consist of
+// lower case alphanumeric characters or '-'", while the same run's dot-free key
+// came up first try. The current keys have none, so this is the rule rather
+// than a repair.
 func EnvName(img Image, id Identity) string {
 	return fmt.Sprintf("e2e-%s-%s", strings.ReplaceAll(img.Key, ".", "-"), id)
 }

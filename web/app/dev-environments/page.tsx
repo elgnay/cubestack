@@ -1636,7 +1636,10 @@ function DetailPanel({ e, onAct }: { e: DevEnvironmentSummary; onAct: (e: DevEnv
 
 // ── create wizard ────────────────────────────────────────────────────────────
 
-const DNS_LABEL_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+// A DNS-1035 label: the name is the environment's Service name, which must
+// start with a letter. Mirrored from the create route and the operator's
+// admission policy (config/vap/devenvironment_policy.yaml).
+const DNS_LABEL_RE = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 // spec.runtime.user's own validation, mirrored from the CRD's schema (Pattern
 // ^[a-z_][a-z0-9_-]*$ with MaxLength 32) and from the create route, so the
 // wizard cannot walk the user to a spec the API server would reject.

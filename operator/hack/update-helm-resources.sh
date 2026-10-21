@@ -33,7 +33,8 @@ mkdir -p "${TEMPLATES}"
 # YAML decoders helm uses, dropping whole documents).
 {
   cat "${OP}"/config/vap/modelversion_policy.yaml
-  for f in "${OP}"/config/vap/inferenceruntimeprofile_policy.yaml \
+  for f in "${OP}"/config/vap/devenvironment_policy.yaml \
+           "${OP}"/config/vap/inferenceruntimeprofile_policy.yaml \
            "${OP}"/config/vap/inferenceservice_policy.yaml; do
     printf -- '---\n'
     cat "${f}"

@@ -285,7 +285,11 @@ export const GET = withAuth(async () => {
 
 // ── create (POST) ────────────────────────────────────────────────────────────
 
-const DNS_LABEL_RE = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+// A DNS-1035 label, not a DNS-1123 one: name is the environment's Service name
+// and its workload label value, and the operator's admission policy refuses
+// anything a Service cannot be named (starting with a letter, at most 63
+// characters). Validating it here turns that refusal into a field error.
+const DNS_LABEL_RE = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
 // spec.runtime.user's own validation, mirrored from the CRD
 // (operator/api/v1alpha1/devenvironment_types.go: it is MaxLength=32 with
 // Pattern ^[a-z_][a-z0-9_-]*$, enforced by the API server and nothing else).
