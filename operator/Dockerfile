@@ -33,10 +33,9 @@ WORKDIR /workspace
 # Copy the Go Modules manifests
 COPY go.mod go.mod
 COPY go.sum go.sum
-# Download the modules behind a cache mount: the layer then does not depend on
-# the module contents at all, and the cache is shared with the activity agent's
-# build in the same job, which walks the same go.mod.
-RUN --mount=type=cache,target=/go/pkg/mod go mod download
+# cache deps before building and copying source so that we don't need to re-download as much
+# and so that source changes don't invalidate our downloaded layer
+RUN go mod download
 
 # Copy the Go source (relies on .dockerignore to filter)
 COPY . .
@@ -51,17 +50,11 @@ COPY . .
 # empty value would set the variable to the empty string and leave the manager
 # asking for an image called "", which is worse than the default it would
 # otherwise keep.
-#
-# The compile cache is mounted for the same reason the modules are: the agent
-# build reuses the standard library and dependency objects this one compiles.
-# -a would rebuild them every time and make that cache worthless, so it is gone.
-RUN --mount=type=cache,target=/go/pkg/mod \
-    --mount=type=cache,target=/root/.cache/go-build \
-    ldflags=""; \
+RUN ldflags=""; \
     if [ -n "${ACTIVITY_AGENT_IMAGE}" ]; then \
         ldflags="-X github.com/suanova/cubestack/internal/controller.activityAgentImage=${ACTIVITY_AGENT_IMAGE}"; \
     fi; \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -ldflags "${ldflags}" -o manager cmd/main.go
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -ldflags "${ldflags}" -o manager cmd/main.go
 
 # Use distroless as minimal base image to package the manager binary
 # Refer to https://github.com/GoogleContainerTools/distroless for more details
