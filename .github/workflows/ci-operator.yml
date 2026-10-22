@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       operator: ${{ steps.filter.outputs.operator }}
+      devenv: ${{ steps.filter.outputs.devenv }}
       build: ${{ steps.select.outputs.build }}
       smoke: ${{ steps.select.outputs.smoke }}
       smoke-groups-json: ${{ steps.select.outputs.smoke-groups-json }}
@@ -51,6 +52,39 @@ jobs:
               - 'operator/**'
               - 'Makefile'
               - '.github/**'
+            # The deep DevEnvironment suite is the expensive job: three kind
+            # clusters, each with a full operator install, ~15 minutes of CI per
+            # PR. It runs on the DevEnvironment's own sources — the API types,
+            # the controller, the activity agent it installs, the suite and the
+            # harness that gates it — plus the build and CI it needs, and not on
+            # a PR that only touches another controller.
+            #
+            # The manager is one binary and the chart one artifact, so shared
+            # code (route.go, podspec.go, apply.go, internal/renderer), a chart
+            # template or RBAC change, and a dependency bump land here without
+            # matching this filter. The DevEnvironment's own CRD and VAP are
+            # named because they are the contract the suite asserts. test-e2e
+            # still installs that chart and runs helm-e2e-devenv-verify on every
+            # operator change, and is the guard for the rest; this suite is the
+            # deep one, so it runs when its own subject moves — on a pull request
+            # and on a push to main alike.
+            devenv:
+              - 'operator/api/v1alpha1/devenvironment*'
+              - 'operator/api/v1alpha1/conditions.go'
+              - 'operator/config/crd/bases/ai.cubestack.io_devenvironments.yaml'
+              - 'operator/config/vap/devenvironment_policy.yaml'
+              - 'operator/internal/controller/devenvironment*'
+              - 'operator/internal/controller/assets.go'
+              - 'operator/internal/activity/**'
+              - 'operator/test/e2e/assets/devenvironment.yaml'
+              - 'operator/test/e2e/devenv/**'
+              - 'operator/test/e2e/devenv_*_test.go'
+              - 'operator/test/e2e/e2e_suite_test.go'
+              - 'operator/hack/**'
+              - 'operator/Makefile'
+              - 'operator/Dockerfile*'
+              - '.github/actions/**'
+              - '.github/workflows/ci-operator.yml'
       - name: Work out which images this change reaches
         id: select
         # Shared with ci-images.yml, which derives its `:latest` gate from the same
@@ -262,7 +296,10 @@ jobs:
 
   devenv-conformance:
     needs: changes
-    if: needs.changes.outputs.operator == 'true'
+    # Not `operator`: see the `devenv` filter, which names what this suite is
+    # about. A skipped run is a pass for `result` below; test-e2e still covers
+    # the happy path for every operator change.
+    if: needs.changes.outputs.devenv == 'true'
     permissions:
       contents: read
     runs-on: ubuntu-latest
