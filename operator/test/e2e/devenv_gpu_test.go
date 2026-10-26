@@ -132,6 +132,10 @@ var gpuVendors = []gpuVendor{
 // it beyond it being there.
 var nvidiaDeviceLine = regexp.MustCompile(`^GPU \d+: (.+) \(UUID: GPU-[0-9a-f-]+\)$`)
 
+// nvidiaReportedNames is the device names `nvidia-smi -L` reported, one per line.
+//
+// A line the pattern does not match contributes no name, so an answer that is not
+// a device listing counts as no device rather than as one.
 func nvidiaReportedNames(stdout string) []string {
 	var names []string
 	for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
@@ -181,6 +185,15 @@ func (v gpuVendor) reportedDevices(res devenv.SSHResult) int {
 // is a fresh process, so they are also the first real touch of the device: a
 // driver that cannot initialize says so here.
 const deviceOpenCommand = `python3 -c 'import torch; print(torch.cuda.device_count()); x = torch.randn(256, 256, device="cuda"); print(torch.cuda.is_available(), (x @ x).sum().item())'`
+
+// deviceStateCommand reports what the image's own torch sees, opening nothing.
+//
+// N5 runs where the device is supposed to be absent, and there `deviceOpenCommand`
+// is guaranteed to fail at the matmul: the exit code says nothing about what torch
+// reported on the way there, so a case built on it passes for an image whose torch
+// crashes for any reason at all. This command succeeds in that environment, and
+// has one right answer.
+const deviceStateCommand = `python3 -c 'import torch; print(torch.cuda.device_count(), torch.cuda.is_available())'`
 
 // int32Ptr is a pointer to n, for the optional spec fields that are pointers.
 func int32Ptr(n int64) *int32 {
@@ -478,16 +491,21 @@ func describeGPUVendorAbsent(v gpuVendor) {
 								"What the tool printed to stdout:\n%s",
 							v.tool, res.ExitCode, res.Stdout)
 
-						// N3's predicate, negated for the same reason: the torch
-						// in this image must not report a device it can open where
-						// none was allocated.
-						torch := sshRun(ctx, env, deviceOpenCommand)
-						fields := strings.Fields(torch.Stdout)
-						opened := torch.ExitCode == 0 && len(fields) >= 2 && fields[1] == "True"
-						Expect(opened).To(BeFalse(),
-							"the torch in %s opened a device in an environment that was allocated none "+
-								"(exit %d).\nWhat it printed to stdout:\n%s",
-							v.image, torch.ExitCode, torch.Stdout)
+						// N3's question — can the image's torch see and open
+						// a device? — asked where none was allocated, and
+						// asked without opening one: the open is meant to
+						// fail here, so its failing would say nothing about
+						// what torch reported. The state command succeeds,
+						// and has one right answer.
+						torch := sshRun(ctx, env, deviceStateCommand)
+						Expect(torch.ExitCode).To(BeZero(),
+							"the torch in %s could not report device state in an environment that was allocated none "+
+								"(exit %d).\nWhat it printed to stdout:\n%s\nWhat it printed to stderr:\n%s",
+							v.image, torch.ExitCode, torch.Stdout, torch.Stderr)
+						Expect(strings.TrimSpace(torch.Stdout)).To(Equal("0 False"),
+							"the torch in %s does not report zero devices and unavailable CUDA where none was "+
+								"allocated.\nWhat it printed to stdout:\n%s",
+							v.image, torch.Stdout)
 					})
 			},
 		}.declare()
