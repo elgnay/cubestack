@@ -627,9 +627,10 @@ type DevEnvironmentStatus struct {
 	// inside Address is not the same one under every dataplane: a Service
 	// recreated with different nodePorts renumbers it.
 	//
-	// The list is not keyed by name: the web address is named after the type and
-	// the ssh address is "ssh", and neither name is reserved from spec.ports, so
-	// two entries can carry one name.
+	// Entry names are unique, but the list is not keyed by name: it is the
+	// controller's own output, not user input, and a key would turn any future
+	// slip into a status write the API server refuses forever rather than one
+	// ambiguous entry.
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 

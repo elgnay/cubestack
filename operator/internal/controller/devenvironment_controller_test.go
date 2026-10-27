@@ -97,6 +97,7 @@ const (
 	// folded into a published entry, and one refused for its name.
 	ignoredPort0Clause   = "spec.ports[0]: ignored — "
 	ignoredPort1Clause   = "spec.ports[1]: ignored — "
+	nameTakenPort0Clause = "spec.ports[0].name: must be updated — "
 	nameTakenPort1Clause = "spec.ports[1].name: must be updated — "
 	// testAlphaPortName is the name the name-collision specs repeat on a port
 	// another entry already owns.
@@ -1745,6 +1746,13 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			env.Spec.SSH = &aiv1alpha1.SSHSpec{Enabled: true}
 			return env
 		}
+		// An ssh environment publishes no web endpoint, so its ssh address is the
+		// only built-in name it carries.
+		newSSH := func() *aiv1alpha1.DevEnvironment {
+			return &aiv1alpha1.DevEnvironment{Spec: aiv1alpha1.DevEnvironmentSpec{
+				Type: aiv1alpha1.DevEnvironmentTypeSSH, Image: testDevImage,
+			}}
+		}
 		// A GPU model the environment names, and a node label that contradicts it
 		// — the one case where the two sources of node selection disagree.
 		contradicting := func() *aiv1alpha1.DevEnvironment {
@@ -1853,13 +1861,35 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Entry("a spec name the platform's main port carries must be updated",
 				exposing(newJupyter(), aiv1alpha1.PortSpec{
 					Name: mainPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
-				}), 1, []string{"spec.ports[0].name: must be updated — "}),
+				}), 1, []string{nameTakenPort0Clause}),
 			// The ssh bridge's name is only published when the bridge is, and the key
 			// it uses (22/TCP) is free here, so this is the name rule on its own.
 			Entry("a spec name the platform's ssh bridge carries must be updated",
 				exposing(withSSH(newJupyter()), aiv1alpha1.PortSpec{
 					Name: sshPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshContainerPort,
-				}), 1, []string{"spec.ports[0].name: must be updated — "}),
+				}), 1, []string{nameTakenPort0Clause}),
+			// status.endpoints carries the platform's own addresses under names of
+			// their own, and every consumer reads that list by name, so a spec entry
+			// claiming one would publish a second endpoint under it
+			// (::buildEndpoints).
+			Entry("a spec name the platform's web endpoint carries must be updated",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: string(aiv1alpha1.DevEnvironmentTypeJupyter), Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
+				}), 1, []string{nameTakenPort0Clause}),
+			// The check runs before the fold: the web endpoint exists whatever the
+			// Service does with the entry.
+			Entry("a spec name the platform's web endpoint carries on its own port must be updated",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: string(aiv1alpha1.DevEnvironmentTypeJupyter), Type: aiv1alpha1.PortTypeHTTP,
+					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
+				}), 1, []string{nameTakenPort0Clause}),
+			// An ssh environment publishes no web endpoint and its ssh address is
+			// named `ssh`, which the Service does not carry, so only this rule
+			// reaches the name.
+			Entry("a spec name the platform's ssh endpoint carries must be updated",
+				exposing(newSSH(), aiv1alpha1.PortSpec{
+					Name: sshPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
+				}), 1, []string{nameTakenPort0Clause}),
 			// Repeating the entry that holds both the name and the (port, protocol)
 			// is the lossless fold, not a name collision.
 			Entry("a repeat of one entry's own name and port is ignored",
@@ -1990,6 +2020,23 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
 			Expect(blocking[0].field).To(Equal("ports[1].name"))
 			Expect(blocking[0].detail).To(ContainSubstring("ports[0] already declares this name"))
+			Expect(blocking[0].detail).To(ContainSubstring("Rename this exposure"))
+		})
+
+		// status.endpoints carries the platform's own addresses, and the name is
+		// the only handle a consumer has on an entry, so an exposure claiming one
+		// would make two endpoints answer to it.
+		It("names the platform endpoint an entry's name would duplicate", func() {
+			env := exposing(newJupyter(), aiv1alpha1.PortSpec{
+				Name: string(aiv1alpha1.DevEnvironmentTypeJupyter), Type: aiv1alpha1.PortTypeHTTP,
+				ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
+			})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+			Expect(blocking[0].field).To(Equal("ports[0].name"))
+			Expect(blocking[0].detail).To(ContainSubstring(fmt.Sprintf(
+				"web address as the endpoint %q", string(aiv1alpha1.DevEnvironmentTypeJupyter))))
 			Expect(blocking[0].detail).To(ContainSubstring("Rename this exposure"))
 		})
 
@@ -6664,6 +6711,37 @@ var _ = Describe("DevEnvironment controller", func() {
 
 			svc := &corev1.Service{}
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), svc))).To(BeTrue())
+			sts := &appsv1.StatefulSet{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
+		})
+
+		// The Service publishes this name happily — the platform's own port is
+		// `main` — so only the endpoint rule refuses it, and it has to refuse
+		// before the workload exists, or the status would advertise two endpoints
+		// under one name.
+		It("fails a spec port reusing a built-in endpoint name before applying anything", func() {
+			env := validDevEnvironment("de-svc-endpoint-name-collide")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: string(env.Spec.Type), Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonPortCollision))
+				accepted := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(accepted).NotTo(BeNil())
+				g.Expect(accepted.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(accepted.Reason).To(Equal(reasonPortCollision))
+				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[0].name: must be updated"))
+				g.Expect(accepted.Message).To(ContainSubstring(
+					fmt.Sprintf("web address as the endpoint %q", string(env.Spec.Type))))
+			}, "15s", "200ms").Should(Succeed())
+
 			sts := &appsv1.StatefulSet{}
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
 		})

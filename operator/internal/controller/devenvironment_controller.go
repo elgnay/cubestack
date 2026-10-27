@@ -2546,6 +2546,12 @@ func platformServicePorts(env *aiv1alpha1.DevEnvironment) []corev1.ServicePort {
 // declared it: the route path and the status endpoint are keyed by the name
 // whatever the Service folds the entry into, so a second entry claiming it
 // would publish a second identity under one name.
+//
+// The platform's own status endpoints are taken the same way: the web address,
+// named after the environment's type, and `ssh` when it is exposed. Those
+// entries precede the spec's in status.endpoints, and a tcp or udp entry reusing
+// `ssh` would also take the ssh entry's place in the name-keyed L4 maps
+// (::l4PortNames).
 func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	var findings []specFinding
 	// The entries that precede each spec.ports entry, in the order desiredService
@@ -2563,6 +2569,16 @@ func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 		key := servicePortKey(sp.Port, sp.Protocol)
 		taken[key] = sp
 		names[sp.Name] = key
+	}
+	// endpointKinds maps each name status.endpoints carries for the platform's
+	// own addresses to the address it names, so the finding can say which one an
+	// entry is claiming.
+	endpointKinds := map[string]string{}
+	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
+		endpointKinds[string(env.Spec.Type)] = "web"
+	}
+	if sshExposed(env) {
+		endpointKinds[sshPortName] = "ssh"
 	}
 	for i, p := range env.Spec.Ports {
 		protocol := portProtocol(p)
@@ -2582,6 +2598,16 @@ func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 				field:      field + ".name",
 				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, and a Service port name must be unique across the whole Service regardless of protocol, so this entry's name cannot be published. Rename this exposure",
 					nameOwner.Port, nameOwner.Protocol, nameOwner.Name),
+			})
+			continue
+		}
+		if kind, reserved := endpointKinds[p.Name]; reserved {
+			findings = append(findings, specFinding{
+				reason:     reasonPortCollision,
+				mustUpdate: true,
+				field:      field + ".name",
+				detail: fmt.Sprintf("the platform publishes this environment's %s address as the endpoint %q, so a port reusing that name would publish a second endpoint under it. Rename this exposure",
+					kind, p.Name),
 			})
 			continue
 		}
