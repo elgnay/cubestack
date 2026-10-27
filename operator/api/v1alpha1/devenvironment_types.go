@@ -477,7 +477,14 @@ type LifecycleSpec struct {
 
 // PortSpec is an extra application port.
 type PortSpec struct {
-	// Name is the port identifier (unique, used for sub path / status display).
+	// Name is the port identifier: it becomes the Service port's name, the route
+	// sub path and the status endpoint's name.
+	//
+	// A Service port name must be unique across the whole Service, whatever the
+	// protocol, so this name must be unique across spec.ports and must not reuse
+	// a name the platform publishes for this environment. The controller refuses
+	// a spec that repeats one (Accepted=False, phase Failed) rather than applying
+	// a Service the API server would reject.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 

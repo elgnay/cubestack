@@ -93,6 +93,14 @@ const (
 	// port the ssh bridge is published on declare: an exposure the bridge would
 	// answer for rather than the workload the entry named.
 	testCollidingPortName = "user-app"
+	// The clauses the spec.ports table repeats across its rows: one exposure
+	// folded into a published entry, and one refused for its name.
+	ignoredPort0Clause   = "spec.ports[0]: ignored — "
+	ignoredPort1Clause   = "spec.ports[1]: ignored — "
+	nameTakenPort1Clause = "spec.ports[1].name: must be updated — "
+	// testAlphaPortName is the name the name-collision specs repeat on a port
+	// another entry already owns.
+	testAlphaPortName = "alpha"
 	// testDevEnvKind is the kind as the API server writes it into an
 	// ownerReference.
 	testDevEnvKind = "DevEnvironment"
@@ -1797,14 +1805,14 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 				exposing(newJupyter(), aiv1alpha1.PortSpec{
 					Name: "notebook-again", Type: aiv1alpha1.PortTypeHTTP,
 					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
-				}), 0, []string{"spec.ports[0]: ignored — "}),
+				}), 0, []string{ignoredPort0Clause}),
 			// As does a repeat of an earlier exposure: the Service carries the number
 			// once, and both entries forward to the port they name.
 			Entry("a second exposure on one container port is ignored",
 				exposing(newJupyter(),
 					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
 					aiv1alpha1.PortSpec{Name: "metrics-again", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
-				), 0, []string{"spec.ports[1]: ignored — "}),
+				), 0, []string{ignoredPort1Clause}),
 			// The other side of the ssh bridge is not published, so an exposure on it
 			// is an entry of its own rather than a repeat.
 			Entry("an exposure on the port the ssh bridge forwards to",
@@ -1818,6 +1826,72 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Name: testSyslogPortName, Type: aiv1alpha1.PortTypeUDP,
 					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
 				}), 0, nil),
+			// A Service port name is unique across the whole Service, whatever the
+			// protocol, so a second entry claiming one is refused rather than folded:
+			// the API server in #392 refused the Service outright.
+			Entry("a repeated port name on another container port must be updated",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				), 1, []string{nameTakenPort1Clause}),
+			Entry("a repeated port name across protocols must be updated",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 9090},
+				), 1, []string{nameTakenPort1Clause}),
+			Entry("a repeated port name across an http and a tcp exposure must be updated",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeHTTP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				), 1, []string{nameTakenPort1Clause}),
+			// The platform's own names are taken before any spec entry is read, and
+			// the main port is the one every type publishes.
+			Entry("a spec name the platform's main port carries must be updated",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: mainPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
+				}), 1, []string{"spec.ports[0].name: must be updated — "}),
+			// The ssh bridge's name is only published when the bridge is, and the key
+			// it uses (22/TCP) is free here, so this is the name rule on its own.
+			Entry("a spec name the platform's ssh bridge carries must be updated",
+				exposing(withSSH(newJupyter()), aiv1alpha1.PortSpec{
+					Name: sshPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: sshContainerPort,
+				}), 1, []string{"spec.ports[0].name: must be updated — "}),
+			// Repeating the entry that holds both the name and the (port, protocol)
+			// is the lossless fold, not a name collision.
+			Entry("a repeat of one entry's own name and port is ignored",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				), 0, []string{ignoredPort1Clause}),
+			Entry("a repeat of the platform's own name and port is ignored",
+				exposing(newJupyter(), aiv1alpha1.PortSpec{
+					Name: mainPortName, Type: aiv1alpha1.PortTypeHTTP,
+					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
+				}), 0, []string{ignoredPort0Clause}),
+			// A folded entry is not published under the name it declared, so that
+			// name stays free for a later entry that does publish it.
+			Entry("a name only a folded entry declared stays free",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: "notebook", Type: aiv1alpha1.PortTypeHTTP,
+						ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)},
+					aiv1alpha1.PortSpec{Name: "notebook", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				), 0, []string{ignoredPort0Clause}),
+			// A third entry reusing a folded duplicate's name collides with the
+			// published owner, not with the folded copy.
+			Entry("a third entry reusing a folded entry's name must be updated",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				), 1, []string{"spec.ports[1]: ignored — ", "spec.ports[2].name: must be updated — "}),
+			// The name is reported before the port it also repeats: the exposure is
+			// refused for the name, and the port owner is the same entry.
+			Entry("a repeated name is reported once even when its port is also taken",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testAlphaPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+					aiv1alpha1.PortSpec{Name: "beta", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+					aiv1alpha1.PortSpec{Name: testAlphaPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				), 1, []string{"spec.ports[2].name: must be updated — "}),
 			// Both dispositions in one spec: the refusal is what the phase follows,
 			// and the resolved value is reported beside it rather than instead of it.
 			Entry("reports a refusal and a resolved value together",
@@ -1862,6 +1936,44 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			blocking := mustUpdateFindings(specFindings(env))
 			Expect(blocking).To(HaveLen(1))
 			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+		})
+
+		// The name rule names the entry that owns the name and points at the field
+		// to edit, because that is the only thing the user can change.
+		It("names the owning port and field of a repeated port name", func() {
+			env := exposing(newJupyter(),
+				aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+			Expect(blocking[0].field).To(Equal("ports[1].name"))
+			Expect(blocking[0].detail).To(ContainSubstring(
+				fmt.Sprintf("already publishes 9090/TCP as %q", testMetricsPortName)))
+			Expect(blocking[0].detail).To(ContainSubstring("Rename this exposure"))
+		})
+
+		It("does not add a name collision for an entry the Service folds away", func() {
+			env := exposing(newJupyter(),
+				aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				aiv1alpha1.PortSpec{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090})
+			Expect(mustUpdateFindings(specFindings(env))).To(BeEmpty())
+			message := findingsMessage(specFindings(env))
+			Expect(message).To(ContainSubstring("spec.ports[1]: ignored — "))
+			Expect(message).NotTo(ContainSubstring("ports[1].name"))
+		})
+
+		// Without the name rule first this would be the lossless port fold, and the
+		// duplicate name would reach the Service.
+		It("reports the name when an entry's port is also taken by another entry", func() {
+			env := exposing(newJupyter(),
+				aiv1alpha1.PortSpec{Name: testAlphaPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				aiv1alpha1.PortSpec{Name: "beta", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				aiv1alpha1.PortSpec{Name: testAlphaPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].field).To(Equal("ports[2].name"))
+			Expect(findingsMessage(specFindings(env))).NotTo(ContainSubstring("spec.ports[2]: ignored"))
 		})
 
 		It("fails the environment on the brand mismatch before any other refusal", func() {
@@ -6484,6 +6596,41 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(accepted.Message).To(ContainSubstring(fmt.Sprintf("container port %d", sshContainerPort)))
 			}, "15s", "200ms").Should(Succeed())
 
+			sts := &appsv1.StatefulSet{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
+		})
+
+		// The duplicate name is the one Service validation the controller can see
+		// before it writes: a Service carrying one name twice is refused outright,
+		// which used to leave the environment with no status at all (issue #392).
+		// The status being written at all is the proof the spec gate handled it.
+		It("fails duplicate Service port names before applying anything", func() {
+			env := validDevEnvironment("de-svc-name-collide")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{
+				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+			}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonPortCollision))
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
+				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+				accepted := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
+				g.Expect(accepted).NotTo(BeNil())
+				g.Expect(accepted.Reason).To(Equal(reasonPortCollision))
+				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[1].name: must be updated"))
+				g.Expect(accepted.Message).To(ContainSubstring(
+					fmt.Sprintf("9090/TCP as %q", testMetricsPortName)))
+			}, "15s", "200ms").Should(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), svc))).To(BeTrue())
 			sts := &appsv1.StatefulSet{}
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
 		})
