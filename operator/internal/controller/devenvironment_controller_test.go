@@ -974,6 +974,87 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 		})
 	})
 
+	// Only a failure is written on the object; the API server asking to be tried
+	// again is not one, or a running environment would read Failed for as long as
+	// the retry takes (::recordStepFailure).
+	DescribeTable("retryableAPIError",
+		func(err error, want bool) {
+			Expect(retryableAPIError(err)).To(Equal(want))
+		},
+		Entry("a conflict", apierrors.NewConflict(schema.GroupResource{Resource: "services"}, "svc", fmt.Errorf("conflict")), true),
+		Entry("a rate limit", apierrors.NewTooManyRequests("busy", 1), true),
+		Entry("a server timeout", apierrors.NewServerTimeout(schema.GroupResource{Resource: "services"}, "get", 1), true),
+		Entry("an unavailable server", apierrors.NewServiceUnavailable("unavailable"), true),
+		Entry("a write the API server refuses", apierrors.NewInvalid(schema.GroupKind{Kind: "Service"}, "svc", nil), false),
+		Entry("a step's own error", fmt.Errorf("no gateway"), false),
+		// The ownership refusal is deliberately not an API conflict: a conflict
+		// says "not now" and is retried, while a foreign owner never goes away,
+		// so classifying it as one would swallow the failure (#399).
+		Entry("a resource another controller owns", ensureDevEnvOwned(
+			&corev1.Service{ObjectMeta: metav1.ObjectMeta{
+				Name: "de-owned-elsewhere",
+				OwnerReferences: []metav1.OwnerReference{{
+					APIVersion: "apps/v1", Kind: "Deployment", Name: "elsewhere",
+					UID: types.UID("elsewhere"), Controller: ptrTo(true),
+				}},
+			}},
+			&aiv1alpha1.DevEnvironment{ObjectMeta: metav1.ObjectMeta{Name: "de-owner", UID: types.UID("de-owner")}},
+		), false),
+	)
+
+	// The Failed phase is a transition like any other, so the write that records
+	// it is followed by the emit the successful path does; an environment that
+	// fails before it was ever Ready would otherwise never announce why
+	// (::recordStepFailure).
+	Describe("recordStepFailure", func() {
+		// drain returns every Event the recorder holds, reduced to its text.
+		drain := func(fr *events.FakeRecorder) []string {
+			out := []string{}
+			for len(fr.Events) > 0 {
+				out = append(out, <-fr.Events)
+			}
+			return out
+		}
+
+		It("writes Failed and records the phase transition once", func() {
+			scheme := runtime.NewScheme()
+			Expect(aiv1alpha1.AddToScheme(scheme)).To(Succeed())
+
+			env := &aiv1alpha1.DevEnvironment{ObjectMeta: metav1.ObjectMeta{Name: "de-step-failed", Namespace: testNamespace}}
+			fr := events.NewFakeRecorder(8)
+			r := &DevEnvironmentReconciler{
+				Client:   fake.NewClientBuilder().WithScheme(scheme).WithObjects(env).WithStatusSubresource(env).Build(),
+				Recorder: fr,
+			}
+			cause := fmt.Errorf("the Service %q is invalid", env.Name)
+
+			_, err := r.recordStepFailure(context.Background(), env, env.DeepCopy(), cause)
+			Expect(err).To(MatchError(cause))
+
+			stored := &aiv1alpha1.DevEnvironment{}
+			Expect(r.Get(context.Background(), client.ObjectKeyFromObject(env), stored)).To(Succeed())
+			Expect(stored.Status.Phase).NotTo(BeNil())
+			Expect(stored.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+			ready := meta.FindStatusCondition(stored.Status.Conditions, aiv1alpha1.ConditionReady)
+			Expect(ready).NotTo(BeNil())
+			Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+			Expect(ready.Message).To(Equal(cause.Error()))
+
+			// FakeRecorder formats each emit as "<type> <reason> <note>".
+			emitted := drain(fr)
+			Expect(emitted).To(HaveLen(1))
+			Expect(emitted[0]).To(HavePrefix(corev1.EventTypeWarning + " " + eventReasonFailed))
+
+			// Repeating the same failure is not a transition, and the second pass
+			// must not append a second Event for it.
+			reloaded := &aiv1alpha1.DevEnvironment{}
+			Expect(r.Get(context.Background(), client.ObjectKeyFromObject(env), reloaded)).To(Succeed())
+			_, err = r.recordStepFailure(context.Background(), reloaded, reloaded.DeepCopy(), cause)
+			Expect(err).To(MatchError(cause))
+			Expect(drain(fr)).To(BeEmpty())
+		})
+	})
+
 	Describe("condition helper idempotency", func() {
 		It("preserves LastTransitionTime when an unchanged condition is re-set", func() {
 			conditions := []metav1.Condition{}
@@ -4874,6 +4955,79 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseRunning))
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+		})
+	})
+
+	// A step that fails is a pass that never reaches the status write at the end
+	// of the pipeline, so the failure has to be written on the way out
+	// (::recordStepFailure) or the object keeps whatever status it had (#399).
+	Context("a failed step", func() {
+		// The Service refuses this name — IANA_SVC_NAME has no underscore — and the
+		// CRD does not, so the spec is admitted and the step fails on it. That is
+		// the general shape a refusal at render time has, duplicate ports included.
+		It("reports the step error on the status instead of leaving it empty", func() {
+			env := validDevEnvironment("de-step-failed")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{{
+				Name: "my_app", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
+			}}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonReconcileFailed))
+				ready := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)
+				g.Expect(ready).NotTo(BeNil())
+				g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(ready.Reason).To(Equal(reasonReconcileFailed))
+				g.Expect(ready.Message).To(ContainSubstring("my_app"))
+				// The spec itself is applied as written: what failed is the write,
+				// not the spec, and Accepted says which of the two it is.
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), svc))).To(BeTrue())
+		})
+
+		// A same-name object another controller owns is refused for as long as
+		// that owner exists, so it is the one step failure a retry can never
+		// clear. Left out of the status it reads as a reconcile that spins
+		// forever with nothing on the object saying why (#399).
+		It("reports a same-name resource another controller owns", func() {
+			env := validDevEnvironment("de-step-foreign")
+			svc := &corev1.Service{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      env.Name,
+					Namespace: env.Namespace,
+					OwnerReferences: []metav1.OwnerReference{{
+						APIVersion: "apps/v1", Kind: "Deployment", Name: "elsewhere",
+						UID: types.UID("elsewhere"), Controller: ptrTo(true),
+					}},
+				},
+				Spec: corev1.ServiceSpec{Ports: []corev1.ServicePort{{Name: mainPortName, Port: 8888}}},
+			}
+			Expect(k8sClient.Create(ctx, svc)).To(Succeed())
+			defer func() { _ = k8sClient.Delete(ctx, svc) }()
+
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonReconcileFailed))
+				ready := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)
+				g.Expect(ready).NotTo(BeNil())
+				g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(ready.Message).To(ContainSubstring("is not controlled by DevEnvironment"))
+				g.Expect(ready.Message).To(ContainSubstring(env.Name))
 			}, "15s", "200ms").Should(Succeed())
 		})
 	})

@@ -467,13 +467,13 @@ func describeSSHWithdrawal() {
 //     back, and re-provisioning the workload over it would be an outage for a
 //     data change.
 //
-// What it also does not do — a finding rather than a contract — is report the
-// refusal anywhere a user can see: the reconcile returns the error from the
-// middle of its pipeline, so no condition is written and no phase changes. The
-// environment keeps running and keeps serving, and every later edit to it is
-// silently not applied. This case asserts the two properties above, which
-// survive a fix; the missing diagnosis is reported separately rather than
-// encoded here as the contract.
+// What it does **not** do is hide the refusal: the step that re-checks the
+// reference fails, and that failure is written to the status before the error is
+// returned (#399) — phase Failed / ReconcileFailed, Ready=False naming the entry
+// the Secret no longer carries. The report is a status write, not a
+// re-provision: the two properties above are about the workload, so the pod, its
+// routes and the key already mounted in it keep serving while the environment
+// reads Failed.
 //
 // The Secret's own watch is what makes this a real run of the path rather than a
 // vacuously quiet one: removing the data entry enqueues the environment, so the
@@ -513,6 +513,8 @@ func describeLiveRemovedEntry() {
 				Label(devenv.TierP1, devenv.LabelFamily("I")), func(ctx SpecContext) {
 					env := open()
 					running(ctx, env)
+					podBefore, err := env.PodUID(ctx)
+					Expect(err).NotTo(HaveOccurred())
 
 					// Delete the data entry the selector names. The Secret itself is
 					// left intact — the same name — so the only thing that changed is
@@ -521,26 +523,58 @@ func describeLiveRemovedEntry() {
 						delete(s.Data, dataKey)
 					})).To(Succeed())
 
-					// The consequence, over a window: the platform neither mints a
-					// replacement credential nor stops what it is running. The key is
-					// checked as the object rather than only through status — a key
-					// nothing names would still be one that logs in.
+					// The refusal is reported rather than left in the manager's log:
+					// the step that re-checks the reference fails on every pass, and
+					// the status says so — phase Failed / ReconcileFailed, Ready=False
+					// carrying the entry it could not find (#399).
+					Eventually(func() error {
+						if err := env.Refresh(ctx); err != nil {
+							return err
+						}
+						st := env.Object().Status
+						if st.Phase == nil || st.Phase.Name != aiv1alpha1.PhaseFailed {
+							return fmt.Errorf("the platform did not report the unusable reference: phase %v", st.Phase)
+						}
+						ready := env.Condition(aiv1alpha1.ConditionReady)
+						if ready == nil || ready.Status != metav1.ConditionFalse {
+							return fmt.Errorf("Ready does not report the unusable reference: %v", ready)
+						}
+						if !strings.Contains(ready.Message, dataKey) {
+							return fmt.Errorf("the report does not name the entry the Secret lost (%q): %q", dataKey, ready.Message)
+						}
+						return nil
+					}).WithTimeout(3*time.Minute).WithPolling(3*time.Second).
+						Should(Succeed(), "the environment after its keys Secret lost the mounted entry")
+
+					// And over a window, the other consequence: the platform neither
+					// mints a replacement credential nor stops running what it has.
+					// The key is checked as the object rather than only through
+					// status — a key nothing names would still be one that logs in.
 					Consistently(func() error {
 						if err := env.Refresh(ctx); err != nil {
 							return err
 						}
-						if ref := env.Object().Status.SSHClientKeySecret; ref != nil {
+						st := env.Object().Status
+						if ref := st.SSHClientKeySecret; ref != nil {
 							return fmt.Errorf("the platform minted %s when its user keys Secret lost its entry", ref.Name)
 						}
 						if secretExists(ctx, env.SSHClientKeySecretName()) {
 							return errors.New("the platform created a login key behind status's back")
 						}
-						if err := env.Ready(ctx); err != nil {
-							return fmt.Errorf("the environment stopped being ready: %w", err)
+						if st.Phase == nil || st.Phase.Name != aiv1alpha1.PhaseFailed {
+							return fmt.Errorf("the report of the unusable reference went away: phase %v", st.Phase)
 						}
 						return nil
 					}).WithTimeout(30*time.Second).WithPolling(3*time.Second).
 						Should(Succeed(), "the environment after its keys Secret lost the mounted entry")
+
+					// The workload was not replaced to get there: a re-provision
+					// would have re-mounted a Secret that no longer carries the
+					// entry, which is the outage the second property rules out.
+					podAfter, err := env.PodUID(ctx)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(podAfter).To(Equal(podBefore),
+						"the environment was re-provisioned over a Secret data change")
 
 					// The key the user had still works: whatever the platform decides
 					// about the reference, it cannot un-mount bytes that are already in
@@ -550,7 +584,7 @@ func describeLiveRemovedEntry() {
 					// names a keys Secret, which is the property the block above
 					// asserts.
 					sess := sshReadyWithKey(ctx, env, key.Signer)
-					_, err := sess.Run(ctx, "true")
+					_, err = sess.Run(ctx, "true")
 					Expect(err).NotTo(HaveOccurred(),
 						"the key already mounted in the environment stopped working")
 				})
