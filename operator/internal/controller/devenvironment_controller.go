@@ -2534,6 +2534,13 @@ func platformServicePorts(env *aiv1alpha1.DevEnvironment) []corev1.ServicePort {
 // exposure declaring container port 22 would have its route reach sshd rather
 // than the workload it named, and no other port carries it. Both refusals are
 // the user's to resolve by editing the spec.
+//
+// The API server refuses a name repeated within spec.ports itself — the list is
+// a map keyed by name, so such a spec never gets stored. This function still
+// answers for the objects that predate that key. It is the only answer for a
+// name the spec repeats from the platform, `main` or `ssh`: that is unique
+// within spec.ports, so no list key can see it, and it collides only once the
+// Service is rendered.
 func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	var findings []specFinding
 	// The entries that precede each spec.ports entry, in the order desiredService

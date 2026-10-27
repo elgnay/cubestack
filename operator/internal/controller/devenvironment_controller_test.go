@@ -6604,11 +6604,14 @@ var _ = Describe("DevEnvironment controller", func() {
 		// before it writes: a Service carrying one name twice is refused outright,
 		// which used to leave the environment with no status at all (issue #392).
 		// The status being written at all is the proof the spec gate handled it.
-		It("fails duplicate Service port names before applying anything", func() {
+		It("fails a spec port reusing a platform port name before applying anything", func() {
+			// A name repeated within spec.ports is refused by the API server (the
+			// list is a map keyed by name); a name the platform already publishes
+			// is unique within spec.ports, so only the controller can refuse it —
+			// and it must do so with a status, not with a refused Service write.
 			env := validDevEnvironment("de-svc-name-collide")
 			env.Spec.Ports = []aiv1alpha1.PortSpec{
-				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
-				{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9091},
+				{Name: mainPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
 			}
 			Expect(k8sClient.Create(ctx, env)).To(Succeed())
 			defer deleteEnv(env.Name)
@@ -6624,9 +6627,9 @@ var _ = Describe("DevEnvironment controller", func() {
 				accepted := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionAccepted)
 				g.Expect(accepted).NotTo(BeNil())
 				g.Expect(accepted.Reason).To(Equal(reasonPortCollision))
-				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[1].name: must be updated"))
+				g.Expect(accepted.Message).To(ContainSubstring("spec.ports[0].name: must be updated"))
 				g.Expect(accepted.Message).To(ContainSubstring(
-					fmt.Sprintf("9090/TCP as %q", testMetricsPortName)))
+					fmt.Sprintf("%d/TCP as %q", mainContainerPort(env.Spec.Type), mainPortName)))
 			}, "15s", "200ms").Should(Succeed())
 
 			svc := &corev1.Service{}
@@ -6634,6 +6637,39 @@ var _ = Describe("DevEnvironment controller", func() {
 			sts := &appsv1.StatefulSet{}
 			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), sts))).To(BeTrue())
 		})
+
+		DescribeTable("refuses a repeated list key at admission",
+			func(name string, field string, mutate func(*aiv1alpha1.DevEnvironment)) {
+				env := validDevEnvironment(name)
+				mutate(env)
+				err := k8sClient.Create(ctx, env)
+				Expect(err).To(HaveOccurred())
+				Expect(apierrors.IsInvalid(err)).To(BeTrue(), "want an Invalid admission error, got %v", err)
+				Expect(err.Error()).To(ContainSubstring("Duplicate value"))
+				Expect(err.Error()).To(ContainSubstring(field))
+			},
+			Entry("port name", "de-dup-port-name", "spec.ports",
+				func(env *aiv1alpha1.DevEnvironment) {
+					env.Spec.Ports = []aiv1alpha1.PortSpec{
+						{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+						{Name: testMetricsPortName, Type: aiv1alpha1.PortTypeUDP, ContainerPort: 9091},
+					}
+				}),
+			Entry("volume name", "de-dup-volume-name", "spec.volumes",
+				func(env *aiv1alpha1.DevEnvironment) {
+					env.Spec.Volumes = []aiv1alpha1.VolumeMount{
+						{Name: "scratch", PVCName: "pvc-a", MountPath: "/a"},
+						{Name: "scratch", PVCName: "pvc-b", MountPath: "/b"},
+					}
+				}),
+			Entry("env name", "de-dup-env-name", "spec.runtime.env",
+				func(env *aiv1alpha1.DevEnvironment) {
+					env.Spec.Runtime = &aiv1alpha1.RuntimeSpec{Env: []corev1.EnvVar{
+						{Name: "STAGE", Value: "a"},
+						{Name: "STAGE", Value: "b"},
+					}}
+				}),
+		)
 
 		It("holds a udp port and a tcp port on different numbers", func() {
 			// tcp and udp share one pool (design §8.3): a udp port takes its
