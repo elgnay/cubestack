@@ -51,6 +51,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"maps"
 	"net"
@@ -157,6 +158,9 @@ const (
 	reasonGatewayNotAccepted     = "GatewayNotAccepted"
 	reasonListenerNotAccepted    = "ListenerNotAccepted"
 	reasonRouteCreateFailed      = "RouteCreateFailed"
+	// reasonReconcileFailed is a pipeline step's own error, reported on a status
+	// written before the reconcile returns it (::recordStepFailure).
+	reasonReconcileFailed = "ReconcileFailed"
 
 	// Pod waiting reasons that fail the environment (design §4.2: image and
 	// crash failures surface as Failed rather than Pending).
@@ -443,7 +447,9 @@ type DevEnvironmentReconciler struct {
 
 // Reconcile runs the DevEnvironment pipeline: spec gate, SSH secret, core
 // resources, gateway routes (best-effort), then pod/PVC observation and
-// status aggregation.
+// status aggregation. A step that fails reports it on the status before it
+// returns the error (::recordStepFailure), so a failure is visible on the object
+// and not only in the manager's log.
 func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	var env aiv1alpha1.DevEnvironment
 	if err := r.Get(ctx, req.NamespacedName, &env); err != nil {
@@ -490,7 +496,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// StatefulSet and the phase below are derived from it, so one pass sees one
 	// state (::clearSupersededAutoStop).
 	if err := r.clearSupersededAutoStop(ctx, &env); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 
 	// 1. Spec gate: every place the controller resolves a field itself rather
@@ -503,10 +509,10 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	findings := specFindings(&env)
 	if blocking := mustUpdateFindings(findings); len(blocking) > 0 {
 		if err := r.stopCompute(ctx, &env); err != nil {
-			return ctrl.Result{}, err
+			return r.recordStepFailure(ctx, &env, desired, err)
 		}
 		if err := r.deleteRoutes(ctx, &env); err != nil {
-			return ctrl.Result{}, err
+			return r.recordStepFailure(ctx, &env, desired, err)
 		}
 		// The phase and Ready name the first finding, as each gate did on its own
 		// before they were folded together; Accepted carries every one of them.
@@ -533,7 +539,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if sshExposed(&env) {
 		keysSecret, digest, err := r.reconcileSSHSecrets(ctx, &env)
 		if err != nil {
-			return ctrl.Result{}, err
+			return r.recordStepFailure(ctx, &env, desired, err)
 		}
 		desired.Status.SSHClientKeySecret = keysSecret
 		// Carry the key revision to applyStatefulSet below, like the jupyter
@@ -557,7 +563,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	if env.Spec.Type == aiv1alpha1.DevEnvironmentTypeJupyter {
 		digest, err := r.reconcileJupyterTokenSecret(ctx, &env)
 		if err != nil {
-			return ctrl.Result{}, err
+			return r.recordStepFailure(ctx, &env, desired, err)
 		}
 		// Named through the same helper the workload's SecretKeyRef uses, so the
 		// status and the injected JUPYTER_TOKEN cannot point at different Secrets.
@@ -578,27 +584,27 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// ServiceAccount that does not exist yet never schedules, and the StatefulSet
 	// below names one for every idle-enabled environment.
 	if err := r.reconcileActivityAgentRBAC(ctx, &env); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 	if err := r.applyService(ctx, &env); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 	if err := r.applyNetworkPolicy(ctx, &env); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 	if err := r.applyStatefulSet(ctx, &env); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 
 	// 4. Gateway routes: best-effort, never fails the reconcile (design §6.2).
 	if err := r.reconcileGatewayRoutes(ctx, &env, &desired.Status); err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 
 	// 5. Observe the pod, aggregate conditions and phase.
 	pod, err := r.environmentPod(ctx, &env)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 	setPodScheduledCondition(&desired.Status.Conditions, pod)
 	r.setPhaseAndReady(&env, &desired.Status, pod)
@@ -613,7 +619,7 @@ func (r *DevEnvironmentReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 	// instant: the mark stops the environment, it does not report it stopped.
 	decision, err := r.reconcileIdleStop(ctx, &env, &desired.Status, pod)
 	if err != nil {
-		return ctrl.Result{}, err
+		return r.recordStepFailure(ctx, &env, desired, err)
 	}
 
 	if err := r.updateStatusIfChanged(ctx, &env, desired); err != nil {
@@ -648,6 +654,43 @@ func (r *DevEnvironmentReconciler) updateStatusIfChanged(ctx context.Context, en
 		return r.Status().Patch(ctx, desired, client.MergeFrom(env))
 	}
 	return nil
+}
+
+// recordStepFailure writes the status of a pass whose step returned cause, then
+// returns the cause: the failure is what the user reads on the object, and
+// returning the error is what makes the manager retry the pass. Without it the
+// only record is a line in the manager's log, and the object keeps whatever
+// status it had — status: {} for a new environment, which is the shape #253 and
+// #392 each hit once (#399).
+//
+// What the pass derived before the failing step is kept. Endpoints are not
+// touched: a step that failed says nothing about an address a running
+// environment is still serving.
+func (r *DevEnvironmentReconciler) recordStepFailure(ctx context.Context, env, desired *aiv1alpha1.DevEnvironment, cause error) (ctrl.Result, error) {
+	// A retryable API error is the server saying "not now", not a step having
+	// failed: the write lost a race or the server was busy, and the next pass
+	// derives the status as usual. Reporting one would flip a running environment
+	// to Failed for as long as the retry takes.
+	if retryableAPIError(cause) {
+		return ctrl.Result{}, cause
+	}
+	setPhase(&desired.Status, aiv1alpha1.PhaseFailed, reasonReconcileFailed)
+	setDevEnvironmentReadyCondition(&desired.Status.Conditions, metav1.ConditionFalse, reasonReconcileFailed, cause.Error())
+	if err := r.updateStatusIfChanged(ctx, env, desired); err != nil {
+		// Both are worth the log: the step's failure is the cause, and the failed
+		// write is why the object still does not show it.
+		return ctrl.Result{}, errors.Join(cause, err)
+	}
+	return ctrl.Result{}, cause
+}
+
+// retryableAPIError reports whether err is one the API server resolves by being
+// asked again, rather than a step that failed on its input or the cluster's
+// configuration.
+func retryableAPIError(err error) bool {
+	return apierrors.IsConflict(err) || apierrors.IsTooManyRequests(err) ||
+		apierrors.IsServerTimeout(err) || apierrors.IsTimeout(err) ||
+		apierrors.IsServiceUnavailable(err)
 }
 
 // stopCompute scales the environment's StatefulSet to zero so a Failed

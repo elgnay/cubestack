@@ -961,6 +961,21 @@ var _ = Describe("DevEnvironment resource helpers", func() {
 		})
 	})
 
+	// Only a failure is written on the object; the API server asking to be tried
+	// again is not one, or a running environment would read Failed for as long as
+	// the retry takes (::recordStepFailure).
+	DescribeTable("retryableAPIError",
+		func(err error, want bool) {
+			Expect(retryableAPIError(err)).To(Equal(want))
+		},
+		Entry("a conflict", apierrors.NewConflict(schema.GroupResource{Resource: "services"}, "svc", fmt.Errorf("conflict")), true),
+		Entry("a rate limit", apierrors.NewTooManyRequests("busy", 1), true),
+		Entry("a server timeout", apierrors.NewServerTimeout(schema.GroupResource{Resource: "services"}, "get", 1), true),
+		Entry("an unavailable server", apierrors.NewServiceUnavailable("unavailable"), true),
+		Entry("a write the API server refuses", apierrors.NewInvalid(schema.GroupKind{Kind: "Service"}, "svc", nil), false),
+		Entry("a step's own error", fmt.Errorf("no gateway"), false),
+	)
+
 	Describe("condition helper idempotency", func() {
 		It("preserves LastTransitionTime when an unchanged condition is re-set", func() {
 			conditions := []metav1.Condition{}
@@ -4686,6 +4701,42 @@ var _ = Describe("DevEnvironment controller", func() {
 				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionPodScheduled)).To(BeTrue())
 				g.Expect(meta.IsStatusConditionFalse(got.Status.Conditions, aiv1alpha1.ConditionReady)).To(BeTrue())
 			}, "15s", "200ms").Should(Succeed())
+		})
+	})
+
+	// A step that fails is a pass that never reaches the status write at the end
+	// of the pipeline, so the failure has to be written on the way out
+	// (::recordStepFailure) or the object keeps whatever status it had (#399).
+	Context("a failed step", func() {
+		// The Service refuses this name — IANA_SVC_NAME has no underscore — and the
+		// CRD does not, so the spec is admitted and the step fails on it. That is
+		// the general shape a refusal at render time has, duplicate ports included.
+		It("reports the step error on the status instead of leaving it empty", func() {
+			env := validDevEnvironment("de-step-failed")
+			env.Spec.Ports = []aiv1alpha1.PortSpec{{
+				Name: "my_app", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090,
+			}}
+			Expect(k8sClient.Create(ctx, env)).To(Succeed())
+			defer deleteEnv(env.Name)
+
+			Eventually(func(g Gomega) {
+				got := &aiv1alpha1.DevEnvironment{}
+				g.Expect(k8sClient.Get(ctx, envKey(env.Name), got)).To(Succeed())
+				g.Expect(got.Status.Phase).NotTo(BeNil())
+				g.Expect(got.Status.Phase.Name).To(Equal(aiv1alpha1.PhaseFailed))
+				g.Expect(got.Status.Phase.Reason).To(Equal(reasonReconcileFailed))
+				ready := meta.FindStatusCondition(got.Status.Conditions, aiv1alpha1.ConditionReady)
+				g.Expect(ready).NotTo(BeNil())
+				g.Expect(ready.Status).To(Equal(metav1.ConditionFalse))
+				g.Expect(ready.Reason).To(Equal(reasonReconcileFailed))
+				g.Expect(ready.Message).To(ContainSubstring("my_app"))
+				// The spec itself is applied as written: what failed is the write,
+				// not the spec, and Accepted says which of the two it is.
+				g.Expect(meta.IsStatusConditionTrue(got.Status.Conditions, aiv1alpha1.ConditionAccepted)).To(BeTrue())
+			}, "15s", "200ms").Should(Succeed())
+
+			svc := &corev1.Service{}
+			Expect(apierrors.IsNotFound(k8sClient.Get(ctx, envKey(env.Name), svc))).To(BeTrue())
 		})
 	})
 
