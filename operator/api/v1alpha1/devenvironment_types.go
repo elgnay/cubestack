@@ -626,8 +626,10 @@ type DevEnvironmentStatus struct {
 	// held — the endpoint's own ListenerPort, which is the allocation. The port
 	// inside Address is not the same one under every dataplane: a Service
 	// recreated with different nodePorts renumbers it.
-	// +listType=map
-	// +listMapKey=name
+	//
+	// The list is not keyed by name: the web address is named after the type and
+	// the ssh address is "ssh", and neither name is reserved from spec.ports, so
+	// two entries can carry one name.
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 

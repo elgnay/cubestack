@@ -825,6 +825,10 @@ spec:
                   held — the endpoint's own ListenerPort, which is the allocation. The port
                   inside Address is not the same one under every dataplane: a Service
                   recreated with different nodePorts renumbers it.
+
+                  The list is not keyed by name: the web address is named after the type and
+                  the ssh address is "ssh", and neither name is reserved from spec.ports, so
+                  two entries can carry one name.
                 items:
                   description: |-
                     Endpoint describes an access address of the environment: the web (Jupyter)
@@ -861,9 +865,6 @@ spec:
                   - name
                   type: object
                 type: array
-                x-kubernetes-list-map-keys:
-                - name
-                x-kubernetes-list-type: map
               jupyterTokenSecret:
                 description: |-
                   JupyterTokenSecret is the Secret the environment's Jupyter token comes from,
