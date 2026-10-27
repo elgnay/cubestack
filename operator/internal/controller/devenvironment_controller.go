@@ -681,6 +681,12 @@ func (r *DevEnvironmentReconciler) recordStepFailure(ctx context.Context, env, d
 		// write is why the object still does not show it.
 		return ctrl.Result{}, errors.Join(cause, err)
 	}
+	// The phase this records is a transition like any other, so it gets the
+	// event the successful path emits — otherwise an environment that fails
+	// before its first Ready never announces the failure. env still carries the
+	// persisted status (updateStatusIfChanged does not mutate it), which is the
+	// phase the transition is measured from.
+	r.emitLifecycleTransition(env, desired)
 	return ctrl.Result{}, cause
 }
 
@@ -4968,14 +4974,21 @@ func (r *DevEnvironmentReconciler) envLabels(envName string) map[string]string {
 	}
 }
 
+// errDevEnvNotOwned marks a same-name resource that something else controls.
+// It is deliberately not an apierrors conflict: a conflict is retryable — the
+// server is saying "not now" — while no retry makes a foreign owner go away, so
+// a conflict would be swallowed by retryableAPIError and the step would fail
+// silently, which is the shape #399 exists to remove.
+var errDevEnvNotOwned = errors.New("refusing a foreign resource")
+
 // ensureDevEnvOwned verifies that an existing resource is controlled by the
 // given DevEnvironment. A same-name resource owned by someone else — or not
-// owned at all — must never be updated or accepted; the caller returns a
-// conflict so the reconcile fails visibly instead of mutating foreign objects.
+// owned at all — must never be updated or accepted; the caller returns the
+// error so the reconcile fails visibly instead of mutating foreign objects.
 func ensureDevEnvOwned(existing client.Object, env *aiv1alpha1.DevEnvironment) error {
 	if owner := metav1.GetControllerOf(existing); owner == nil || owner.UID != env.UID {
-		return apierrors.NewConflict(schema.GroupResource{Group: "ai.cubestack.io", Resource: "devenvironments"},
-			existing.GetName(), fmt.Errorf("resource is not controlled by DevEnvironment %q", env.Name))
+		return fmt.Errorf("%w: %T %q is not controlled by DevEnvironment %q",
+			errDevEnvNotOwned, existing, existing.GetName(), env.Name)
 	}
 	return nil
 }
