@@ -101,6 +101,10 @@ const (
 	// testAlphaPortName is the name the name-collision specs repeat on a port
 	// another entry already owns.
 	testAlphaPortName = "alpha"
+	// testFoldedPortName is a name only an entry the Service folds away
+	// declares: the Service never carries it, but the routes and the status
+	// endpoints are keyed by it.
+	testFoldedPortName = "notebook"
 	// testDevEnvKind is the kind as the API server writes it into an
 	// ownerReference.
 	testDevEnvKind = "DevEnvironment"
@@ -1800,7 +1804,7 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			//
 			// A repeat of the type's own main port folds into an entry forwarding to
 			// the same container port, so the exposure is served exactly as declared
-			// and only the name it was declared under goes unused.
+			// and only the name it was declared under is left out of the Service.
 			Entry("a repeat of the notebook's own port is ignored",
 				exposing(newJupyter(), aiv1alpha1.PortSpec{
 					Name: "notebook-again", Type: aiv1alpha1.PortTypeHTTP,
@@ -1868,14 +1872,24 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 					Name: mainPortName, Type: aiv1alpha1.PortTypeHTTP,
 					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter),
 				}), 0, []string{ignoredPort0Clause}),
-			// A folded entry is not published under the name it declared, so that
-			// name stays free for a later entry that does publish it.
-			Entry("a name only a folded entry declared stays free",
+			// A folded entry is not published under the name it declared, but its
+			// route path and status endpoint are, so a later entry cannot take that
+			// name for a port of its own.
+			Entry("a name a folded entry declared must be updated when reused",
 				exposing(newJupyter(),
-					aiv1alpha1.PortSpec{Name: "notebook", Type: aiv1alpha1.PortTypeHTTP,
+					aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeHTTP,
 						ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)},
-					aiv1alpha1.PortSpec{Name: "notebook", Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
-				), 0, []string{ignoredPort0Clause}),
+					aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090},
+				), 1, []string{"spec.ports[1].name: must be updated — "}),
+			// Repeating the folded entry itself declares nothing new, so it is the
+			// lossless fold again rather than a second identity under one name.
+			Entry("a repeat of a folded entry's own name and port is ignored",
+				exposing(newJupyter(),
+					aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeHTTP,
+						ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)},
+					aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeHTTP,
+						ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)},
+				), 0, []string{ignoredPort0Clause, ignoredPort1Clause}),
 			// A third entry reusing a folded duplicate's name collides with the
 			// published owner, not with the folded copy.
 			Entry("a third entry reusing a folded entry's name must be updated",
@@ -1961,6 +1975,22 @@ var _ = Describe("DevEnvironment object rendering and publishing", func() {
 			message := findingsMessage(specFindings(env))
 			Expect(message).To(ContainSubstring("spec.ports[1]: ignored — "))
 			Expect(message).NotTo(ContainSubstring("ports[1].name"))
+		})
+
+		// A name the Service never carried is still this entry's on the routes and
+		// in the status, so a second entry claiming it would be published twice
+		// under one name even though the Service is happy.
+		It("names the folded entry that already declares a reused name", func() {
+			env := exposing(newJupyter(),
+				aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeHTTP,
+					ContainerPort: mainContainerPort(aiv1alpha1.DevEnvironmentTypeJupyter)},
+				aiv1alpha1.PortSpec{Name: testFoldedPortName, Type: aiv1alpha1.PortTypeTCP, ContainerPort: 9090})
+			blocking := mustUpdateFindings(specFindings(env))
+			Expect(blocking).To(HaveLen(1))
+			Expect(blocking[0].reason).To(Equal(reasonPortCollision))
+			Expect(blocking[0].field).To(Equal("ports[1].name"))
+			Expect(blocking[0].detail).To(ContainSubstring("ports[0] already declares this name"))
+			Expect(blocking[0].detail).To(ContainSubstring("Rename this exposure"))
 		})
 
 		// Without the name rule first this would be the lossless port fold, and the

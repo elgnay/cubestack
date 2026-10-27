@@ -2541,15 +2541,24 @@ func platformServicePorts(env *aiv1alpha1.DevEnvironment) []corev1.ServicePort {
 // name the spec repeats from the platform, `main` or `ssh`: that is unique
 // within spec.ports, so no list key can see it, and it collides only once the
 // Service is rendered.
+//
+// A name the Service did not publish is taken all the same when an entry
+// declared it: the route path and the status endpoint are keyed by the name
+// whatever the Service folds the entry into, so a second entry claiming it
+// would publish a second identity under one name.
 func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	var findings []specFinding
 	// The entries that precede each spec.ports entry, in the order desiredService
 	// adds them: the platform's own first, then the spec's. taken answers the
 	// (port, protocol) rule; names maps each published name to the same entry's
 	// key, so a repeat of that entry can be told apart from a second entry
-	// claiming the name for a port of its own.
+	// claiming the name for a port of its own. folded maps the name of an entry
+	// the Service folded away to that entry's index: the name never became a
+	// Service port, but the routes and the status endpoints are keyed by it all
+	// the same.
 	taken := map[string]corev1.ServicePort{}
 	names := map[string]string{}
+	folded := map[string]int{}
 	for _, sp := range platformServicePorts(env) {
 		key := servicePortKey(sp.Port, sp.Protocol)
 		taken[key] = sp
@@ -2577,18 +2586,33 @@ func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 			continue
 		}
 		if !collides {
+			// A name an earlier entry declared is taken even where the Service did
+			// not publish it: this entry would add a second route path and a second
+			// status endpoint under it.
+			if j, declared := folded[p.Name]; declared {
+				findings = append(findings, specFinding{
+					reason:     reasonPortCollision,
+					mustUpdate: true,
+					field:      field + ".name",
+					detail:     fmt.Sprintf("ports[%d] already declares this name. Its exposure is served by a port the Service already publishes, so the name never became a Service port, but it still identifies that entry's route path and status endpoint, and two entries cannot share one. Rename this exposure", j),
+				})
+				continue
+			}
 			taken[key] = corev1.ServicePort{
 				Name: p.Name, Port: p.ContainerPort, TargetPort: intstr.FromInt32(p.ContainerPort), Protocol: protocol,
 			}
-			// Only an entry the Service publishes reserves its name: an entry folded
-			// below is never carried under the name it declared.
 			names[p.Name] = key
 			continue
 		}
 		if owner.TargetPort.IntVal == p.ContainerPort {
+			// The name is still this entry's on the routes and in the status, so it
+			// is booked here as much as a published one is booked above.
+			if _, declared := folded[p.Name]; !declared {
+				folded[p.Name] = i
+			}
 			findings = append(findings, specFinding{
 				field: field,
-				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, which forwards to container port %d — the one this entry declares — so the exposure is served by that entry and the name %q goes unused",
+				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, which forwards to container port %d — the one this entry declares — so the exposure is served by that entry and the name %q is not published on the Service",
 					p.ContainerPort, protocol, owner.Name, owner.TargetPort.IntVal, p.Name),
 			})
 			continue
