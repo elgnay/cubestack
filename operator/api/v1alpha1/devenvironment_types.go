@@ -102,6 +102,11 @@ type DevEnvironmentSpec struct {
 	// environment's account can work with (spec.runtime.securityContext
 	// .runAsUser / runAsGroup) — the platform does not modify storage it merely
 	// references.
+	//
+	// Each mount is identified by its name, which must therefore be unique: a
+	// repeated one is refused by the API server.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	Volumes []VolumeMount `json:"volumes,omitempty"`
 
@@ -124,6 +129,11 @@ type DevEnvironmentSpec struct {
 	Lifecycle *LifecycleSpec `json:"lifecycle,omitempty"`
 
 	// Ports are extra application ports.
+	//
+	// Each exposure is identified by its name, which must therefore be unique: a
+	// repeated one is refused by the API server.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	Ports []PortSpec `json:"ports,omitempty"`
 }
@@ -392,6 +402,12 @@ type RuntimeSpec struct {
 	// of them. Each substitution is reported on the Accepted condition, which names
 	// the value the controller applied instead; the one entry it cannot substitute
 	// is a NOTEBOOK_ARGS fed by valueFrom, which refuses the environment instead.
+	//
+	// A variable is identified by its name, which must therefore be unique: a
+	// repeated one is refused by the API server rather than silently letting the
+	// last one win.
+	// +listType=map
+	// +listMapKey=name
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
 
@@ -477,7 +493,14 @@ type LifecycleSpec struct {
 
 // PortSpec is an extra application port.
 type PortSpec struct {
-	// Name is the port identifier (unique, used for sub path / status display).
+	// Name is the port identifier: it becomes the Service port's name, the route
+	// sub path and the status endpoint's name.
+	//
+	// A Service port name must be unique across the whole Service, whatever the
+	// protocol, so a name repeated across spec.ports is refused by the API server.
+	// A name the platform publishes for this environment is not covered by that
+	// rule: the controller refuses it instead (Accepted=False, phase Failed)
+	// rather than applying a Service the API server would reject.
 	// +kubebuilder:validation:MinLength=1
 	Name string `json:"name"`
 
@@ -603,6 +626,11 @@ type DevEnvironmentStatus struct {
 	// held — the endpoint's own ListenerPort, which is the allocation. The port
 	// inside Address is not the same one under every dataplane: a Service
 	// recreated with different nodePorts renumbers it.
+	//
+	// Entry names are unique, but the list is not keyed by name: it is the
+	// controller's own output, not user input, and a key would turn any future
+	// slip into a status write the API server refuses forever rather than one
+	// ambiguous entry.
 	// +optional
 	Endpoints []Endpoint `json:"endpoints,omitempty"`
 

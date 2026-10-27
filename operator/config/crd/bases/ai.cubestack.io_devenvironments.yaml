@@ -183,7 +183,11 @@ spec:
                   environment requests, and a selector cannot.
                 type: object
               ports:
-                description: Ports are extra application ports.
+                description: |-
+                  Ports are extra application ports.
+
+                  Each exposure is identified by its name, which must therefore be unique: a
+                  repeated one is refused by the API server.
                 items:
                   description: PortSpec is an extra application port.
                   properties:
@@ -194,8 +198,15 @@ spec:
                       minimum: 1
                       type: integer
                     name:
-                      description: Name is the port identifier (unique, used for sub
-                        path / status display).
+                      description: |-
+                        Name is the port identifier: it becomes the Service port's name, the route
+                        sub path and the status endpoint's name.
+
+                        A Service port name must be unique across the whole Service, whatever the
+                        protocol, so a name repeated across spec.ports is refused by the API server.
+                        A name the platform publishes for this environment is not covered by that
+                        rule: the controller refuses it instead (Accepted=False, phase Failed)
+                        rather than applying a Service the API server would reject.
                       minLength: 1
                       type: string
                     type:
@@ -237,6 +248,9 @@ spec:
                   - name
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               resources:
                 description: Resources is the compute / resource configuration.
                 properties:
@@ -342,6 +356,10 @@ spec:
                       of them. Each substitution is reported on the Accepted condition, which names
                       the value the controller applied instead; the one entry it cannot substitute
                       is a NOTEBOOK_ARGS fed by valueFrom, which refuses the environment instead.
+
+                      A variable is identified by its name, which must therefore be unique: a
+                      repeated one is refused by the API server rather than silently letting the
+                      last one win.
                     items:
                       description: EnvVar represents an environment variable present
                         in a Container.
@@ -500,6 +518,9 @@ spec:
                       - name
                       type: object
                     type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
                   securityContext:
                     description: |-
                       SecurityContext controls the container user: non-root by default
@@ -691,6 +712,9 @@ spec:
                   environment's account can work with (spec.runtime.securityContext
                   .runAsUser / runAsGroup) — the platform does not modify storage it merely
                   references.
+
+                  Each mount is identified by its name, which must therefore be unique: a
+                  repeated one is refused by the API server.
                 items:
                   description: VolumeMount is a data volume mount referencing an existing
                     PVC.
@@ -721,6 +745,9 @@ spec:
                   - pvcName
                   type: object
                 type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
             required:
             - image
             - resources
@@ -800,6 +827,11 @@ spec:
                   held — the endpoint's own ListenerPort, which is the allocation. The port
                   inside Address is not the same one under every dataplane: a Service
                   recreated with different nodePorts renumbers it.
+
+                  Entry names are unique, but the list is not keyed by name: it is the
+                  controller's own output, not user input, and a key would turn any future
+                  slip into a status write the API server refuses forever rather than one
+                  ambiguous entry.
                 items:
                   description: |-
                     Endpoint describes an access address of the environment: the web (Jupyter)

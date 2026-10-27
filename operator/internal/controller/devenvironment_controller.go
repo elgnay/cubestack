@@ -2521,42 +2521,126 @@ func platformServicePorts(env *aiv1alpha1.DevEnvironment) []corev1.ServicePort {
 }
 
 // portCollisionFindings reports every spec.ports entry the Service does not
-// publish under the name it was declared with, because a (port, protocol) it
-// names is already taken by an entry that precedes it (::desiredService).
+// publish as declared, because a (port, protocol) or a port name it declares is
+// already taken by an entry that precedes it (::desiredService).
 //
-// The two ways that can happen are separated rather than reported as one,
-// because what they cost the user differs in kind. An entry folded into one that
-// forwards to the same container port — every fold into a type's own main port,
-// and every repeat of an earlier spec.ports entry — is served exactly as
-// declared, so the environment runs and Accepted reports the fold. An entry
-// folded into one that forwards somewhere else is not served at all: the ssh
-// bridge is published at 22 and forwards to the sshd on 2222, so an exposure
-// declaring container port 22 would have its route reach sshd rather than the
-// workload it named, and no other port carries it. Only the user can choose
-// another one.
+// The API server enforces two uniqueness rules on a Service's port list: each
+// (port, protocol) once, and each name once across the whole list, whatever the
+// protocol. A repeated (port, protocol) can still leave the exposure served —
+// an earlier entry forwards to the same container port — and is reported as the
+// fold it is. A repeated name cannot: the Service carrying it twice is refused
+// outright, so it is always a refusal, except when the repeat is that lossless
+// fold — the entry holding both this name and this (port, protocol). The other
+// fold, into an entry that forwards somewhere else, is not served at all: the
+// ssh bridge is published at 22 and forwards to the sshd on 2222, so an
+// exposure declaring container port 22 would have its route reach sshd rather
+// than the workload it named, and no other port carries it. Both refusals are
+// the user's to resolve by editing the spec.
+//
+// The API server refuses a name repeated within spec.ports itself — the list is
+// a map keyed by name, so such a spec never gets stored. This function still
+// answers for the objects that predate that key. It is the only answer for a
+// name the spec repeats from the platform, `main` or `ssh`: that is unique
+// within spec.ports, so no list key can see it, and it collides only once the
+// Service is rendered.
+//
+// A name the Service did not publish is taken all the same when an entry
+// declared it: the route path and the status endpoint are keyed by the name
+// whatever the Service folds the entry into, so a second entry claiming it
+// would publish a second identity under one name.
+//
+// The platform's own status endpoints are taken the same way: the web address,
+// named after the environment's type, and `ssh` when it is exposed. Those
+// entries precede the spec's in status.endpoints, and a tcp or udp entry reusing
+// `ssh` would also take the ssh entry's place in the name-keyed L4 maps
+// (::l4PortNames).
 func portCollisionFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 	var findings []specFinding
 	// The entries that precede each spec.ports entry, in the order desiredService
-	// adds them: the platform's own first, then the spec's.
+	// adds them: the platform's own first, then the spec's. taken answers the
+	// (port, protocol) rule; names maps each published name to the same entry's
+	// key, so a repeat of that entry can be told apart from a second entry
+	// claiming the name for a port of its own. folded maps the name of an entry
+	// the Service folded away to that entry's index: the name never became a
+	// Service port, but the routes and the status endpoints are keyed by it all
+	// the same.
 	taken := map[string]corev1.ServicePort{}
+	names := map[string]string{}
+	folded := map[string]int{}
 	for _, sp := range platformServicePorts(env) {
-		taken[servicePortKey(sp.Port, sp.Protocol)] = sp
+		key := servicePortKey(sp.Port, sp.Protocol)
+		taken[key] = sp
+		names[sp.Name] = key
+	}
+	// endpointKinds maps each name status.endpoints carries for the platform's
+	// own addresses to the address it names, so the finding can say which one an
+	// entry is claiming.
+	endpointKinds := map[string]string{}
+	if env.Spec.Type != aiv1alpha1.DevEnvironmentTypeSSH {
+		endpointKinds[string(env.Spec.Type)] = "web"
+	}
+	if sshExposed(env) {
+		endpointKinds[sshPortName] = "ssh"
 	}
 	for i, p := range env.Spec.Ports {
 		protocol := portProtocol(p)
 		key := servicePortKey(p.ContainerPort, protocol)
 		owner, collides := taken[key]
+		nameKey, nameTaken := names[p.Name]
+		field := fmt.Sprintf("ports[%d]", i)
+		// A name the Service already carries cannot be published a second time,
+		// under any protocol. The exception is a repeat of the entry holding both
+		// this name and this key: that repeat is the fold below, and the name is
+		// the owner's already.
+		if nameTaken && (!collides || nameKey != key) {
+			nameOwner := taken[nameKey]
+			findings = append(findings, specFinding{
+				reason:     reasonPortCollision,
+				mustUpdate: true,
+				field:      field + ".name",
+				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, and a Service port name must be unique across the whole Service regardless of protocol, so this entry's name cannot be published. Rename this exposure",
+					nameOwner.Port, nameOwner.Protocol, nameOwner.Name),
+			})
+			continue
+		}
+		if kind, reserved := endpointKinds[p.Name]; reserved {
+			findings = append(findings, specFinding{
+				reason:     reasonPortCollision,
+				mustUpdate: true,
+				field:      field + ".name",
+				detail: fmt.Sprintf("the platform publishes this environment's %s address as the endpoint %q, so a port reusing that name would publish a second endpoint under it. Rename this exposure",
+					kind, p.Name),
+			})
+			continue
+		}
 		if !collides {
+			// A name an earlier entry declared is taken even where the Service did
+			// not publish it: this entry would add a second route path and a second
+			// status endpoint under it.
+			if j, declared := folded[p.Name]; declared {
+				findings = append(findings, specFinding{
+					reason:     reasonPortCollision,
+					mustUpdate: true,
+					field:      field + ".name",
+					detail:     fmt.Sprintf("ports[%d] already declares this name. Its exposure is served by a port the Service already publishes, so the name never became a Service port, but it still identifies that entry's route path and status endpoint, and two entries cannot share one. Rename this exposure", j),
+				})
+				continue
+			}
 			taken[key] = corev1.ServicePort{
 				Name: p.Name, Port: p.ContainerPort, TargetPort: intstr.FromInt32(p.ContainerPort), Protocol: protocol,
 			}
+			names[p.Name] = key
 			continue
 		}
-		field := fmt.Sprintf("ports[%d]", i)
 		if owner.TargetPort.IntVal == p.ContainerPort {
+			// The name is still this entry's on the routes and in the status, so it
+			// is booked here as much as a published one is booked above.
+			if _, declared := folded[p.Name]; !declared {
+				folded[p.Name] = i
+			}
 			findings = append(findings, specFinding{
 				field: field,
-				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, which forwards to container port %d — the one this entry declares — so the exposure is served by that entry and the name %q goes unused",
+				detail: fmt.Sprintf("the Service already publishes %d/%s as %q, which forwards to container port %d — the one this entry declares — so the exposure is served by that entry and the name %q is not published on the Service",
 					p.ContainerPort, protocol, owner.Name, owner.TargetPort.IntVal, p.Name),
 			})
 			continue
@@ -2613,6 +2697,10 @@ func nodeSelectorFindings(env *aiv1alpha1.DevEnvironment) []specFinding {
 // for is still published and a route still reaches it — by number rather than by
 // name (::serviceBackendRef). What that folding costs the exposure is not this
 // function's to decide and is reported on Accepted (::portCollisionFindings).
+//
+// The name a spec.ports entry declares is rendered as it is, so this function
+// assumes names are unique across the whole list: a spec that repeats one never
+// reaches here, because portCollisionFindings fails it first.
 func (r *DevEnvironmentReconciler) desiredService(env *aiv1alpha1.DevEnvironment) *corev1.Service {
 	// The seen set is keyed by port and protocol, as desiredContainerPorts keys
 	// its own: the same number under another protocol is a different Service
