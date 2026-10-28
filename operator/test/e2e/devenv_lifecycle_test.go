@@ -253,9 +253,20 @@ func describeStopStart() {
 					// route to it, are still live. G2 gives that same stop three minutes
 					// to take the workload away, and this is the same wait for what the
 					// workload was answering on.
-					Eventually(func() error { return sess.Ping(ctx) }).
-						WithTimeout(3*time.Minute).WithPolling(3*time.Second).
-						Should(HaveOccurred(), "a stopped environment answered ssh on %s", sess.Addr())
+					//
+					// Each attempt carries its own deadline, because the poll bounds the
+					// wait and not the ssh: the dialer bounds the dial and the handshake
+					// and leaves the command to the caller's context. An attempt that ran
+					// out of time is not an answer — a peer that stopped talking is not a
+					// peer that refused — so it is retried rather than believed, and only
+					// an error the server itself produced satisfies the wait.
+					Eventually(func() bool {
+						attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+						defer cancel()
+						err := sess.Ping(attempt)
+						return err != nil && attempt.Err() == nil
+					}).WithTimeout(3*time.Minute).WithPolling(3*time.Second).
+						Should(BeTrue(), "a stopped environment answered ssh on %s", sess.Addr())
 				})
 
 			It("G4 starts again on the port it held, with the workspace intact",
