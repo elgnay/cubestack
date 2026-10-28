@@ -258,13 +258,28 @@ func describeStopStart() {
 					// wait and not the ssh: the dialer bounds the dial and the handshake
 					// and leaves the command to the caller's context. An attempt that ran
 					// out of time is not an answer — a peer that stopped talking is not a
-					// peer that refused — so it is retried rather than believed, and only
-					// an error the server itself produced satisfies the wait.
+					// peer that refused — so it is retried rather than believed. The
+					// socket deadline and the context's timer fire independently, so both
+					// are read: an error that is itself a timeout, and an attempt that
+					// reached its deadline, are this case's clock and not the server's
+					// answer. The budget is the whole wait's and not only one
+					// attempt's: the poll cannot interrupt a callback, so an attempt
+					// begun near the end would otherwise run on for another full one.
+					wait, cancelWait := context.WithTimeout(ctx, 3*time.Minute)
+					defer cancelWait()
 					Eventually(func() bool {
-						attempt, cancel := context.WithTimeout(ctx, 30*time.Second)
+						attempt, cancel := context.WithTimeout(wait, 30*time.Second)
 						defer cancel()
+						deadline, _ := attempt.Deadline()
 						err := sess.Ping(attempt)
-						return err != nil && attempt.Err() == nil
+						if err == nil {
+							return false
+						}
+						var timedOut interface{ Timeout() bool }
+						if errors.As(err, &timedOut) && timedOut.Timeout() {
+							return false
+						}
+						return time.Now().Before(deadline) && attempt.Err() == nil
 					}).WithTimeout(3*time.Minute).WithPolling(3*time.Second).
 						Should(BeTrue(), "a stopped environment answered ssh on %s", sess.Addr())
 				})
