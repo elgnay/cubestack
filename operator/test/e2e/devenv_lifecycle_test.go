@@ -245,8 +245,43 @@ func describeStopStart() {
 					// And what the stop changes for a user: nothing is behind the
 					// address any more. A reservation is only defensible while what
 					// it leads to refuses.
-					Expect(sess.Ping(ctx)).To(HaveOccurred(),
-						"a stopped environment answered ssh on %s", sess.Addr())
+					//
+					// Waited for, not sampled. The phase is derived from the desired
+					// running state and not from the pod, so Stopped is recorded by the
+					// reconcile that asks for the scale-down; the pod then runs out its
+					// termination grace while its Service endpoint, and the gateway's
+					// route to it, are still live. G2 gives that same stop three minutes
+					// to take the workload away, and this is the same wait for what the
+					// workload was answering on.
+					//
+					// Each attempt carries its own deadline, because the poll bounds the
+					// wait and not the ssh: the dialer bounds the dial and the handshake
+					// and leaves the command to the caller's context. An attempt that ran
+					// out of time is not an answer — a peer that stopped talking is not a
+					// peer that refused — so it is retried rather than believed. The
+					// socket deadline and the context's timer fire independently, so both
+					// are read: an error that is itself a timeout, and an attempt that
+					// reached its deadline, are this case's clock and not the server's
+					// answer. The budget is the whole wait's and not only one
+					// attempt's: the poll cannot interrupt a callback, so an attempt
+					// begun near the end would otherwise run on for another full one.
+					wait, cancelWait := context.WithTimeout(ctx, 3*time.Minute)
+					defer cancelWait()
+					Eventually(func() bool {
+						attempt, cancel := context.WithTimeout(wait, 30*time.Second)
+						defer cancel()
+						deadline, _ := attempt.Deadline()
+						err := sess.Ping(attempt)
+						if err == nil {
+							return false
+						}
+						var timedOut interface{ Timeout() bool }
+						if errors.As(err, &timedOut) && timedOut.Timeout() {
+							return false
+						}
+						return time.Now().Before(deadline) && attempt.Err() == nil
+					}).WithTimeout(3*time.Minute).WithPolling(3*time.Second).
+						Should(BeTrue(), "a stopped environment answered ssh on %s", sess.Addr())
 				})
 
 			It("G4 starts again on the port it held, with the workspace intact",
