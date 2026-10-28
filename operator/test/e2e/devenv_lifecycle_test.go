@@ -245,8 +245,17 @@ func describeStopStart() {
 					// And what the stop changes for a user: nothing is behind the
 					// address any more. A reservation is only defensible while what
 					// it leads to refuses.
-					Expect(sess.Ping(ctx)).To(HaveOccurred(),
-						"a stopped environment answered ssh on %s", sess.Addr())
+					//
+					// Waited for, not sampled. The phase is derived from the desired
+					// running state and not from the pod, so Stopped is recorded by the
+					// reconcile that asks for the scale-down; the pod then runs out its
+					// termination grace while its Service endpoint, and the gateway's
+					// route to it, are still live. G2 gives that same stop three minutes
+					// to take the workload away, and this is the same wait for what the
+					// workload was answering on.
+					Eventually(func() error { return sess.Ping(ctx) }).
+						WithTimeout(3*time.Minute).WithPolling(3*time.Second).
+						Should(HaveOccurred(), "a stopped environment answered ssh on %s", sess.Addr())
 				})
 
 			It("G4 starts again on the port it held, with the workspace intact",
