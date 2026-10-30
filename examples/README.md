@@ -40,9 +40,9 @@ node's `/mnt/cephfs`, then copy.
 # inside a Pod that mounts the workspace PVC at /workspace and /mnt/cephfs at /ceph.
 # This is the tiny-gpt-training copy; the LoRA example uses qwen25-05b-lora-demo.
 # No -p: mkdir fails when the directory exists, which is the right outcome -- a
-# ModelVersion may already point there.
-mkdir /ceph/models/tiny-gpt-demo-v1
-cp -a /workspace/runs/<run-id>/serving/. /ceph/models/tiny-gpt-demo-v1/
+# ModelVersion may already point there -- and && keeps the copy from running.
+mkdir /ceph/models/tiny-gpt-demo-v1 &&
+  cp -a /workspace/runs/<run-id>/serving/. /ceph/models/tiny-gpt-demo-v1/
 ```
 
 Each export gets its own directory, named for the version it will be registered as.
