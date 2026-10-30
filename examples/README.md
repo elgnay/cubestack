@@ -39,9 +39,17 @@ node's `/mnt/cephfs`, then copy.
 ```bash
 # inside a Pod that mounts the workspace PVC at /workspace and /mnt/cephfs at /ceph.
 # This is the tiny-gpt-training copy; the LoRA example uses qwen25-05b-lora-demo.
-mkdir -p /ceph/models/tiny-gpt-demo-v1
+# No -p: mkdir fails when the directory exists, which is the right outcome -- a
+# ModelVersion may already point there.
+mkdir /ceph/models/tiny-gpt-demo-v1
 cp -a /workspace/runs/<run-id>/serving/. /ceph/models/tiny-gpt-demo-v1/
 ```
+
+Each export gets its own directory, named for the version it will be registered as.
+A `ModelVersion`'s `spec` is immutable, so a later training run must not overwrite the
+directory it points at: copy to a new one (`tiny-gpt-demo-v2`, …) and register a new
+`ModelVersion`. If the directory already exists, that artifact has been staged — deploy
+the `ModelVersion` that references it, or stage the new export under another name.
 
 `config.json` and the weight files must sit directly in the target directory — the
 engine loads that directory itself and does not look into subdirectories.
@@ -313,7 +321,12 @@ In the console, **Inference Services → Deploy Model**:
   to the gateway's shared route, and `/v1/messages` also makes the model appear twice
   in `/v1/models`.
 
-Once the service is `Ready`, the gateway publishes it under the catalog model name:
+`Ready` covers the workload, not the catalog. Publication is a separate condition,
+`RouteReady`: it stays `False` while the shared route has not accepted the backend
+(`GatewayNotAccepted`), when another service on the same route already holds the
+catalog name (`ModelNameConflict`), or when the route's rule slots are full
+(`CatalogFull`). Call the gateway once `Ready` and `RouteReady` are both `True`; the
+model is then published under the catalog model name:
 
 ```bash
 curl -s http://<gateway>/v1/chat/completions \
