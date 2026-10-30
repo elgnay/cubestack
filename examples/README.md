@@ -134,10 +134,10 @@ spec:
     description: Replicas of this service.
   - name: maxModelLen
     type: integer
-    default: 1024
+    default: 512
     min: 128
     max: 2048
-    description: Maximum context length in tokens. The tiny demo model was trained with 512.
+    description: Maximum context length in tokens. The default matches the example checkpoint, whose position table ends at 512; a longer limit only works for a checkpoint that was trained for it.
   - name: nodeSelector
     type: stringList
     default: []
@@ -207,7 +207,9 @@ In the console, **Inference Services → Deploy Model**:
 
 - fill in **Service name** and **Target namespace**, and pick a **Runtime profile** and
   **Model version**;
-- set the `maxModelLen` override to the context the model was trained with or shorter;
+- set the `maxModelLen` override to the context the model was trained with — 512 for
+  both examples. vLLM refuses to start when the limit is longer than the checkpoint's
+  position table, which is 512 for the Tiny GPT export;
 - choose the **Catalog model name** (the `model` field clients send);
 - under **Published APIs**, select only `/v1/chat/completions` — extra paths add rules
   to the gateway's shared route, and `/v1/messages` also makes the model appear twice
