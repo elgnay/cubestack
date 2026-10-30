@@ -29,16 +29,18 @@ one artifact lives). The `InferenceService` itself is created from the console:
 
 ### 1. Copy the artifact into model storage
 
-`ModelVersion` uses `HostPath` storage, pointing at a shared directory on the node —
-by convention `/mnt/cephfs/models/<model>-<version>`. The DevEnvironment workspace
-volume and that directory are different volumes, and the console has no "publish
-artifact" action, so the copy is a cluster-side operation: run a temporary Pod that
-mounts the workspace PVC (RWX) and the node's `/mnt/cephfs`, then copy.
+`ModelVersion` uses `HostPath` storage, pointing at a shared directory on the node,
+under `/mnt/cephfs/models/`. The two examples use `tiny-gpt-demo-v1` and
+`qwen25-05b-lora-demo`. That directory and the DevEnvironment workspace volume are
+different volumes, and the console has no "publish artifact" action, so the copy is a
+cluster-side operation: run a temporary Pod that mounts the workspace PVC (RWX) and the
+node's `/mnt/cephfs`, then copy.
 
 ```bash
-# inside a Pod that mounts the workspace PVC at /workspace and /mnt/cephfs at /ceph
-mkdir -p /ceph/models/<model>-<version>
-cp -a /workspace/runs/<run-id>/serving/. /ceph/models/<model>-<version>/
+# inside a Pod that mounts the workspace PVC at /workspace and /mnt/cephfs at /ceph.
+# This is the tiny-gpt-training copy; the LoRA example uses qwen25-05b-lora-demo.
+mkdir -p /ceph/models/tiny-gpt-demo-v1
+cp -a /workspace/runs/<run-id>/serving/. /ceph/models/tiny-gpt-demo-v1/
 ```
 
 `config.json` and the weight files must sit directly in the target directory — the
@@ -77,11 +79,12 @@ spec:
   storage:
     strategy: HostPath
     hostPath:
-      path: /mnt/cephfs/models/qwen25-05b-demo-v1
+      path: /mnt/cephfs/models/qwen25-05b-lora-demo
 ```
 
 `metadata.name` must equal `<model>-<version>`, and the `storage.hostPath.path` must
-name the directory from step 1. `spec` is immutable: to change the artifact or its
+name the directory from step 1. Both blocks are complete: save the one for your
+example as `modelversion.yaml`. `spec` is immutable: to change the artifact or its
 attributes, create a new `ModelVersion` with a different name.
 
 ```bash
@@ -99,7 +102,8 @@ usually ship two:
 | `metax-vllm-gpt2-v027` | MetaX C550, vLLM 0.27.0, single-card LWS | `architecture: gpt2`, `quantization: fp16` |
 | `metax-vllm-qwen2-v027` | MetaX C550, vLLM 0.27.0, single-card LWS | `architecture: qwen2`, `quantization: fp16` |
 
-If they are missing on another cluster, create them from this manifest:
+If they are missing on another cluster, save this file as `runtime-profiles.yaml` — it
+creates both:
 
 ```yaml
 apiVersion: ai.cubestack.io/v1alpha1
@@ -195,11 +199,105 @@ spec:
           timeoutSeconds: 5
           failureThreshold: 120
       terminationGracePeriodSeconds: 30
+---
+apiVersion: ai.cubestack.io/v1alpha1
+kind: InferenceRuntimeProfile
+metadata:
+  name: metax-vllm-qwen2-v027
+  annotations:
+    ai.cubestack.io/description: MetaX C550 + vLLM 0.27.0, single-card Qwen2 models (merged LoRA exports)
+spec:
+  accelerator:
+    vendor: metax
+    models:
+    - MXC550
+  engine:
+    name: vllm
+    version: 0.27.0-maca.ai3.8.2.302
+  modelRequirements:
+    architectures:
+    - qwen2
+    quantization:
+    - fp16
+  endpoint:
+    role: vllm
+    portName: http
+  nodeSelector: '{{ overrides.nodeSelector }}'
+  overrides:
+  - name: replicas
+    type: integer
+    default: 1
+    min: 1
+    max: 1
+    description: Replicas of this service.
+  - name: maxModelLen
+    type: integer
+    default: 4096
+    min: 512
+    max: 32768
+    description: Maximum context length in tokens. Qwen2.5-0.5B supports 32768; lower it to serve more concurrent requests.
+  - name: nodeSelector
+    type: stringList
+    default: []
+    description: Nodes every role runs on; empty lets the scheduler choose.
+  readinessPolicy:
+    requireAllRoles: true
+  roles:
+  - name: vllm
+    workload:
+      kind: LeaderWorkerSet
+      replicas: '{{ overrides.replicas }}'
+      group:
+        size: 1
+        startupPolicy: LeaderCreated
+    service:
+      ports:
+      - name: http
+        port: 8000
+        targetPort: http
+    podTemplate:
+      image: registry.cubestack.io:5000/suanova/vllm-metax:0.27.0-maca.ai3.8.2.302-torch2.10-py312-ubuntu22.04-amd64
+      imagePullPolicy: IfNotPresent
+      command: ["/bin/bash", "-c"]
+      args:
+      - exec /opt/conda/bin/vllm serve "{{ model.path }}" --served-model-name "{{ model.name }}" --dtype float16 --max-model-len {{ overrides.maxModelLen }} --gpu-memory-utilization 0.45 --host 0.0.0.0 --port 8000
+      env:
+      - name: MODEL_PATH
+        value: '{{ model.path }}'
+      ports:
+      - name: http
+        containerPort: 8000
+      mounts:
+      - model: main
+        at: /models
+        readOnly: true
+      volumes:
+      - name: dshm
+        at: /dev/shm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 2Gi
+      resources:
+        cpu: "4"
+        memory: 16Gi
+        gpuPerPod: "1"
+      nodeSelector:
+        metax-tech.com/gpu.product: MXC550
+      probes:
+        readiness:
+          httpGet:
+            path: /health
+            port: http
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 120
+      terminationGracePeriodSeconds: 30
 ```
 
-The Qwen profile is the same manifest with `metadata.name: metax-vllm-qwen2-v027`,
-`modelRequirements.architectures: [qwen2]`, and the `maxModelLen` override set to
-default 4096 / min 512 / max 32768.
+```bash
+kubectl apply -f runtime-profiles.yaml
+```
 
 ### 4. Deploy and call
 
