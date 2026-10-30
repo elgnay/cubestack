@@ -205,18 +205,20 @@ default 4096 / min 512 / max 32768.
 
 In the console, **Inference Services → Deploy Model**:
 
-- pick the service name, namespace, Profile and ModelVersion;
-- set `Max Model Len` to the context the model was trained with or shorter;
-- choose the directory model name (the `model` field clients send);
-- publish only `/v1/chat/completions` — extra paths add rules to the gateway's shared
-  route, and `/v1/messages` also makes the model appear twice in `/v1/models`.
+- fill in **Service name** and **Target namespace**, and pick a **Runtime profile** and
+  **Model version**;
+- set the `maxModelLen` override to the context the model was trained with or shorter;
+- choose the **Catalog model name** (the `model` field clients send);
+- under **Published APIs**, select only `/v1/chat/completions` — extra paths add rules
+  to the gateway's shared route, and `/v1/messages` also makes the model appear twice
+  in `/v1/models`.
 
-Once the service is `Ready`, the gateway publishes it under the directory model name:
+Once the service is `Ready`, the gateway publishes it under the catalog model name:
 
 ```bash
 curl -s http://<gateway>/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model": "<directory model name>",
+  -d '{"model": "<catalog model name>",
        "messages": [{"role": "user", "content": "你好"}],
        "max_tokens": 100}'
 ```
