@@ -23,7 +23,7 @@ than in a cell.
 The platform objects in between are cluster-scoped: an `InferenceRuntimeProfile` (how
 to run an engine on this hardware, reused across models) and a `ModelVersion` (where
 one artifact lives). The `InferenceService` itself is created from the console:
-**推理服务 → 部署模型**.
+**Inference Services → Deploy Model**.
 
 ## Serving a model
 
@@ -203,7 +203,7 @@ default 4096 / min 512 / max 32768.
 
 ### 4. Deploy and call
 
-In the console, **推理服务 → 部署模型**:
+In the console, **Inference Services → Deploy Model**:
 
 - pick the service name, namespace, Profile and ModelVersion;
 - set `Max Model Len` to the context the model was trained with or shorter;
